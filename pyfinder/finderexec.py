@@ -9,8 +9,8 @@ from typing import List
 from datetime import datetime
 from utils import customlogger
 import pyfinderconfig
-from clients.services.peakmotion_data import PeakMotionData
-from clients.services.shakemap_data import ShakeMapStationAmplitudes
+from paramws.clients.services.peakmotion_data import PeakMotionData
+from paramws.clients.services.shakemap_data import ShakeMapStationAmplitudes
 from finderutils import (FinderChannelList, FinderChannel, 
                          FinderSolution, FinderRupture,
                          FinderEvent)

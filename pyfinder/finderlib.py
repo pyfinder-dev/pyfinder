@@ -1,5 +1,5 @@
 # *-* coding: utf-8 -*-
-from clients import PeakMotionData
+from paramws.clients import PeakMotionData
 
 try:
     from seiscomp.datamodel import Origin

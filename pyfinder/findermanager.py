@@ -14,10 +14,10 @@ import sys
 import logging
 from pyfinderconfig import pyfinderconfig
 from utils import customlogger
-from clients import (RRSMPeakMotionClient, 
-                     RRSMShakeMapClient,
-                     EMSCFeltReportClient,
-                     ESMShakeMapClient)
+from paramws.clients import (RRSMPeakMotionClient, 
+                             RRSMShakeMapClient,
+                             EMSCFeltReportClient,
+                             ESMShakeMapClient)
 from finderutils import (FinderChannelList, FinderSolution)
 from utils.dataformatter import (RRSMPeakMotionDataFormatter,
                                  ESMShakeMapDataFormatter,

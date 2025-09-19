@@ -10,8 +10,8 @@ import fnmatch
 from typing import Union
 from .calculator import Calculator
 from pyfinderconfig import pyfinderconfig
-from clients.services.shakemap_data import ShakeMapEventData, ShakeMapStationAmplitudes
-from clients.services.peakmotion_data import PeakMotionData
+from paramws.clients.services.shakemap_data import ShakeMapEventData, ShakeMapStationAmplitudes
+from paramws.clients.services.peakmotion_data import PeakMotionData
 from finderutils import FinderChannelList
 from pyfinder.utils.station_merger import RawStationMeasurement
 
