@@ -104,7 +104,7 @@ def send_email_with_attachment(subject=None, body=None, attachments=None, finder
 
                 plain_body += (
                     f"\nFinDer Event Summary:\n"
-                    f"Origin Time: {origin_time}\n"
+                    f"Origin (processing) Time: {origin_time}\n"
                     f"Latitude: {lat}\n"
                     f"Longitude: {lon}\n"
                     f"Depth: {depth} km\n"
@@ -122,11 +122,11 @@ def send_email_with_attachment(subject=None, body=None, attachments=None, finder
                 next_update = int(metadata['minutes_until_next_update'])
 
                 if next_update <= 60:
-                    metadata['time_until_next_update'] = str(next_update) + "m"
+                    metadata['next_update_after_origin_time'] = str(next_update) + "m"
                 else:
                     hours = int(next_update // 60)
                     minutes = int(next_update % 60)
-                    metadata['time_until_next_update'] = f"{hours}h {minutes}m"
+                    metadata['next_update_after_origin_time'] = f"{hours}h {minutes}m"
                     
                 # Remove the old field from metadata
                 del metadata['minutes_until_next_update']
