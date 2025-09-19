@@ -17,27 +17,67 @@ import threading
 from services import seismiclistener
 from services.scheduler import FollowUpScheduler
 from utils.customlogger import file_logger
+import signal
+import atexit
+import time
+_scheduler = None
+_listener_thread = None
+
+
+def _graceful_shutdown(signum=None, frame=None):
+    try:
+        logger = file_logger("monitoring.log", module_name="ServiceLauncher")
+        logger.info(f"Received signal {signum}; shutting down...")
+    except Exception:
+        pass
+    global _scheduler, _listener_thread
+    # Stop scheduler if present
+    try:
+        if _scheduler is not None:
+            _scheduler.shutdown()
+    except Exception:
+        pass
+    # Give threads a moment to finish
+    try:
+        if _listener_thread is not None and _listener_thread.is_alive():
+            _listener_thread.join(timeout=5.0)
+    except Exception:
+        pass
+    # Small delay to allow any subprocess cleanup by children
+    try:
+        time.sleep(0.1)
+    except Exception:
+        pass
+    # Exit cleanly
+    try:
+        sys.exit(0)
+    except SystemExit:
+        raise
+
 
 def start_services():
     logger = file_logger("monitoring.log", module_name="ServiceLauncher")
 
-    # Start the seismic listener in a thread so it doesn't block
     def start_listener():
         logger.info("Starting seismic listener...")
         seismiclistener.start_emsc_listener()
-    
-    listener_thread = threading.Thread(target=start_listener, daemon=True)
-    listener_thread.start()
 
-    # Start the follow-up scheduler in the main thread
+    global _listener_thread, _scheduler
+    _listener_thread = threading.Thread(target=start_listener, daemon=False)
+    _listener_thread.start()
+
     logger.info("Starting FollowUpScheduler...")
-    scheduler = FollowUpScheduler()
+    _scheduler = FollowUpScheduler()
     try:
-        scheduler.run_forever()
+        _scheduler.run_forever()
     except KeyboardInterrupt:
-        scheduler.shutdown()
+        _graceful_shutdown()
 
 """ The main execution module for the pyfinder module. """
 if __name__ == "__main__":
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    atexit.register(_graceful_shutdown)
     # Start the services
     start_services()
