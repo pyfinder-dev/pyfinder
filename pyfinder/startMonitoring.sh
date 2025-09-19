@@ -5,8 +5,5 @@
 
 PYTHON_VERSION=${1:-3.9}
 
-# Run the script with specified Python version
-python$PYTHON_VERSION start_monitoring.py > /dev/null 2>&1 &
-
-# Detach from terminal
-disown
+# Run the script with specified Python version in background, detaching cleanly
+nohup python$PYTHON_VERSION start_monitoring.py >/dev/null 2>&1 &
