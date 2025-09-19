@@ -25,6 +25,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+make_rupturejson_and_allxmlinput_fromdb_call_shake.py
+gmt.conf
+gmt.history
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

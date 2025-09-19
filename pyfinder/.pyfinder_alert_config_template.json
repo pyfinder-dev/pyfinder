@@ -1,0 +1,13 @@
+{
+    "address": "alert_service@someserver.com",
+    "password": "somepassword",
+    "smtp_server": "smtp.someserver.com",
+    "smtp_port": 587,
+
+    "to": [
+        "recipient@example.com",
+        "second_recipient@example.com"
+    ],
+    "from": "alert_service@someserver.com",
+    "subject": "PyFinder event alert"
+}
