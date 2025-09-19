@@ -97,7 +97,7 @@ class EventTracker:
 
     def get_all_pending_events(self):
         """Retrieve all pending or failed events across all services."""
-        return self._db.get_all_pending_events()
+        return self._db.fetch_due_events()
 
     def get_event_meta(self, event_id, service, current_delay_time):
         """Retrieve full metadata for a specific event and service."""
