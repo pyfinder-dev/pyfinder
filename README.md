@@ -6,6 +6,7 @@ Python wrapper for the FinDer executable and its library.
 
 `pyfinder` provides a convenient Python interface to the FinDer seismic event detection software, allowing for easy integration and automation within Python workflows. It can run **standalone (no Docker required)** or inside the provided **Docker** environment for a fully reproducible setup.
 
+We recommend the [dokerized pyFinder](https://github.com/pyfinder-dev/pyfinder-docker) since it comes with shakemap and FinDer already installed.
 ---
 
 - [Quick Start](#quick-start)
@@ -17,7 +18,7 @@ Python wrapper for the FinDer executable and its library.
 
 ### Option A — Standalone (no Docker)
 
-No installation is required for basic use. However, pyfinder requires `ShakeMap`. The dockerized version already comes with all needed dependancies.
+No installation is required for basic use. Note that **pyfinder** requires `ShakeMap` and `FinDer`. 
 
 1. Open a terminal and navigate to the project folder:
    ```bash
