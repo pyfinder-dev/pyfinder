@@ -207,6 +207,7 @@ class EventAlertWSPlaybackManager:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EMSC Event Alert Playback Tool")
     parser.add_argument("--event-id", type=str, nargs='+', help="Inject one or more specific events by ID.")
+    parser.add_argument("--list", action='store_true', help="List all available events for the playback.")
     args = parser.parse_args()
 
     def handle_shutdown(signum, frame):
@@ -218,6 +219,14 @@ if __name__ == "__main__":
 
     # The predefined list of events to be played back
     event_list = generate_event_list()
+
+    # If --list is specified, print available event IDs, the regions and exit
+    if args.list:
+        print("Available events for playback:")
+        for event in event_list:
+            print(f"Event ID: {event['unid']}, M{event['mag']}, Region: {event['flynn_region']}")
+        sys.exit(0)
+
     if args.event_id:
         event_list = [e for e in event_list if e['unid'] in args.event_id]
     # Make sure we have events to play back
