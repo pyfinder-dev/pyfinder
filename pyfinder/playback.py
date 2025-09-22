@@ -83,6 +83,16 @@ def generate_event_list():
             'evtype': 'ke', 'auth': 'SCSN', 'mag': 4.2, 'magtype': 'ML',
             'unid': '20250520_0000201', 'action': 'create'
         },
+
+        {
+            'source_id': '00000007', 'source_catalog': 'EMSC-RTS',
+            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
+            'time': (base_time + timedelta(seconds=0)).isoformat(),
+            'flynn_region': 'WESTERN TURKEY',
+            'lat': 39.1855, 'lon': 28.1637, 'depth': 12.2,
+            'evtype': 'ke', 'auth': 'SCSN', 'mag': 4.5, 'magtype': 'ML',
+            'unid': '20250922_0000172', 'action': 'create'
+        },    
     ]
 
 class EventAlertWSPlaybackManager:
