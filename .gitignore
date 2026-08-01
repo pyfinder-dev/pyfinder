@@ -6,6 +6,15 @@ __pycache__/
 # C extensions
 *.so
 
+# Repo specific
+*.svg
+.pyfinder_alert_config.json
+AGENTS.md
+.agent/
+
+# MacOS
+.DS_Store
+
 # Distribution / packaging
 .Python
 build/
