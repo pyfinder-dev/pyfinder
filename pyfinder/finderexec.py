@@ -7,7 +7,7 @@ import sys
 import json
 from typing import List
 from datetime import datetime
-from utils import customlogger
+from pyfinder.utils import customlogger
 import pyfinderconfig
 from paramws.clients.services.peakmotion_data import PeakMotionData
 from paramws.clients.services.shakemap_data import ShakeMapStationAmplitudes

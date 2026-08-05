@@ -14,7 +14,7 @@ import logging
 import json
 from pyfinderconfig import pyfinderconfig
 from services.eventtracker import EventTracker
-from utils.customlogger import file_logger
+from pyfinder.utils.customlogger import file_logger
 from services.querypolicy import RRSMQueryPolicy
 from utils.timeutils import parse_normalized_iso8601
 

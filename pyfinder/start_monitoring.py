@@ -16,7 +16,7 @@ if not os.path.abspath("../") in sys.path:
 import threading
 from services import seismiclistener
 from services.scheduler import FollowUpScheduler
-from utils.customlogger import file_logger
+from pyfinder.utils.customlogger import file_logger
 import signal
 import atexit
 import time

@@ -15,7 +15,7 @@ from pyfinder.services.database import (
 )
 from datetime import datetime, timedelta, timezone
 import logging
-from utils.customlogger import file_logger
+from pyfinder.utils.customlogger import file_logger
 from utils.timeutils import parse_normalized_iso8601
 
 

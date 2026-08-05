@@ -13,7 +13,7 @@ import os
 import sys
 import logging
 from pyfinderconfig import pyfinderconfig
-from utils import customlogger
+from pyfinder.utils import customlogger
 from paramws.clients import (RRSMPeakMotionClient, 
                              RRSMShakeMapClient,
                              EMSCFeltReportClient,
