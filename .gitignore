@@ -11,6 +11,7 @@ __pycache__/
 .pyfinder_alert_config.json
 AGENTS.md
 .agent/
+assets
 
 # MacOS
 .DS_Store
