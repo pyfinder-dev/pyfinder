@@ -11,8 +11,7 @@ import sqlite3
 import threading
 import hashlib
 import logging
-from datetime import datetime, timedelta, timezone
-from utils.timeutils import parse_normalized_iso8601
+from datetime import datetime, timezone
 
 
 STATUS_PENDING = "pending"
@@ -114,6 +113,48 @@ class ThreadSafeDB:
         with self._lock:
             self.cursor.execute(query, params)
             return self.cursor.fetchall()
+
+    def event_service_exists(self, event_id, service):
+        """Return whether any scheduled row exists for an event and service."""
+        with self._lock:
+            self.cursor.execute('''
+                SELECT 1
+                FROM event_tracker
+                WHERE event_id = ? AND service = ?
+                LIMIT 1
+            ''', (event_id, service))
+            return self.cursor.fetchone() is not None
+
+    def update_pending_emsc_metadata(
+        self,
+        event_id,
+        service,
+        origin_time,
+        last_update_time,
+        emsc_alert_json,
+        last_modified,
+    ):
+        """Refresh EMSC metadata on every matching pending scheduled row."""
+        with self._lock:
+            self.cursor.execute('''
+                UPDATE event_tracker
+                SET origin_time = ?,
+                    last_update_time = ?,
+                    emsc_alert_json = ?,
+                    last_modified = ?
+                WHERE event_id = ? AND service = ? AND status = ?
+            ''', (
+                origin_time,
+                last_update_time,
+                emsc_alert_json,
+                last_modified,
+                event_id,
+                service,
+                STATUS_PENDING,
+            ))
+            updated_rows = self.cursor.rowcount
+            self.conn.commit()
+            return updated_rows
 
     def mark_event_completed(self, event_id, service, current_delay_time):
         """Mark an event as completed with timestamp."""

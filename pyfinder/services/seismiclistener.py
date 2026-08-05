@@ -1,224 +1,348 @@
 # -*- coding: utf-8 -*-
-# !/usr/bin/env python
-""" 
-Listener for the Seismic Portal WebSocket. This module listens to the Seismic Portal WebSocket 
-and processes incoming messages. It filters messages based on region and magnitude criteria. 
-The module uses Tornado for asynchronous I/O and logging for debugging and information purposes.    
-"""
+#!/usr/bin/env python
+"""Listen for EMSC alerts and hand eligible messages to the workflow."""
 
 from __future__ import unicode_literals
-from tornado.websocket import websocket_connect
-from tornado.ioloop import IOLoop
-from tornado import gen
-import logging
+
+from collections.abc import Collection, Mapping
 import json
-from pyfinderconfig import pyfinderconfig
-from services.eventtracker import EventTracker
-from pyfinder.utils.customlogger import file_logger
-from services.querypolicy import RRSMQueryPolicy
-from utils.timeutils import parse_normalized_iso8601
+import logging
+import math
 
-# WebSocket URI for Seismic Portal
-echo_uri = pyfinderconfig["seismic-portal-listener"]["echo-uri"]
+from pyfinder.utils.timeutils import parse_normalized_iso8601
 
-# Interval to ping the server to keep the connection alive
-PING_INTERVAL = pyfinderconfig["seismic-portal-listener"]["ping-interval"]
 
-# Logger
-logger = file_logger(
-    module_name="SeismicListener",
-    log_file="seismiclistener.log",
-    rotate=True,
-    overwrite=False,
-    level=logging.DEBUG
+_DEFAULT_MIN_MAGNITUDE = 3.0
+_WORLDWIDE_REGION_VALUES = frozenset(("", "all", "world"))
+_REQUIRED_PROPERTIES = (
+    "unid",
+    "mag",
+    "time",
+    "lastupdate",
+    "flynn_region",
 )
+_SUPPORTED_ACTIONS = frozenset(("create", "update"))
 
-# Database tracker for event management
-tracker = EventTracker("event_update_follow_up.db", logger=logger)
 
-# Filter for region
-def is_event_in_region(event, target_regions):
-    if isinstance(target_regions, str):
-        target_regions = [target_regions]
-    
-    # Check if the target regions include 'all', 'world' or empty string
-    for region in target_regions:
-        if region.lower().strip() in ['all', 'world', '']:
-            return True
-        
-    region = event.get('flynn_region', '')
+def normalize_target_regions(configured_regions=None):
+    """Validate and normalize one startup region-filter configuration."""
+    if configured_regions is None:
+        return ()
+    if isinstance(configured_regions, str):
+        region_values = (configured_regions,)
+    elif isinstance(configured_regions, Collection) and not isinstance(
+        configured_regions, (bytes, bytearray, Mapping)
+    ):
+        region_values = configured_regions
+    else:
+        raise ValueError(
+            "Target regions must be a string or a collection of strings"
+        )
 
-    # Make all case-insensitive
-    region = region.lower()
-    target_regions = [r.lower() for r in target_regions]
+    normalized_regions = []
+    for region in region_values:
+        if not isinstance(region, str):
+            raise ValueError("Every target region must be a string")
+        normalized_region = region.strip().casefold()
+        if normalized_region in _WORLDWIDE_REGION_VALUES:
+            return ()
+        if normalized_region not in normalized_regions:
+            normalized_regions.append(normalized_region)
+    return tuple(normalized_regions)
 
-    # Check if the region is in the target regions
-    return any(target_region in region for target_region in target_regions)
 
-# Filter for magnitude
-def is_magnitude_above_threshold(event, min_magnitude):
-    magnitude = event.get('mag', 0)
-    
-    if isinstance(magnitude, str):
+def normalize_min_magnitude(configured_magnitude=None):
+    """Validate and normalize the minimum magnitude once during startup."""
+    if configured_magnitude is None:
+        return _DEFAULT_MIN_MAGNITUDE
+    if isinstance(configured_magnitude, bool):
+        raise ValueError("Minimum magnitude must be a finite number")
+
+    if isinstance(configured_magnitude, (int, float, str)):
         try:
-            magnitude = float(magnitude)
-        except ValueError:
-            logger.error(f"Invalid magnitude value: {magnitude}")
-            return False
+            magnitude = float(configured_magnitude)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Minimum magnitude must be a finite number") from error
+    else:
+        raise ValueError("Minimum magnitude must be a finite number")
 
-    return magnitude >= min_magnitude
+    if not math.isfinite(magnitude):
+        raise ValueError("Minimum magnitude must be a finite number")
+    return magnitude
 
-# Function to process incoming messages, applying filters
-def myprocessing(message, target_regions=None, min_magnitude=0):
+
+def _normalize_alert_magnitude(value):
+    """Return one finite alert magnitude or raise for malformed input."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("Alert magnitude must be a finite number")
     try:
-        data = json.loads(message)
-        info = data['data']['properties']
-        info['action'] = data['action']
+        magnitude = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Alert magnitude must be a finite number") from error
+    if not math.isfinite(magnitude):
+        raise ValueError("Alert magnitude must be a finite number")
+    return magnitude
 
-        required_keys = ['unid', 'mag', 'time', 'lastupdate', 'flynn_region']
-        if not all(k in info for k in required_keys):
-            logger.warning(f"Malformed event received: missing keys in {info}")
-            return
 
-        # Set default region filter if not provided
-        if target_regions is None:
-            target_regions = []
+def _decode_alert(message):
+    """Decode and validate one message without mutating its source mapping."""
+    if isinstance(message, bytes):
+        message = message.decode("utf-8")
+    elif not isinstance(message, str):
+        raise ValueError("The inbound message must be JSON text or UTF-8 bytes")
 
-        logger.info(f"Received message: {info['unid']} with action: {info['action']}")
-        logger.debug(f"Message data: {info}")
+    envelope = json.loads(message)
+    if not isinstance(envelope, Mapping):
+        raise ValueError("The alert root must be a mapping")
+    if "action" not in envelope:
+        raise ValueError("The alert action is missing")
 
-        # Check if event matches the region and magnitude criteria
-        if not is_event_in_region(info, target_regions):
-            logger.info(f"|- Decision SKIP: Event {info['unid']} is outside the target regions, skipping...")
-            return
-        else:
-            logger.info(f"|- Decision KEEP: Event {info['unid']} is in the target regions: {target_regions}")
+    data = envelope.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError("The alert data member must be a mapping")
+    properties = data.get("properties")
+    if not isinstance(properties, Mapping):
+        raise ValueError("The alert properties member must be a mapping")
 
-        if not is_magnitude_above_threshold(info, min_magnitude):
-            logger.info(f"|- Decision SKIP: Event {info['unid']} has magnitude {info['mag']} below threshold, skipping...")
-            return
-        else:
-            logger.info(f"|- Decision KEEP: Event {info['unid']} has magnitude {info['mag']} above threshold: {min_magnitude}")        
-        
-        logger.info(f"|- Final Decision: PROCESS: Event {info['unid']} with action: {info['action']}")
-
-        # Process new events
-        if info['action'] == 'create':
-            logger.info(f"New event: {info['unid']} at {info['time']}, Magnitude: {info['mag']}, Region: {info['flynn_region']}")
-            logger.info(f"Starting to register event {info['unid']} with RRSM policy for future updates...")
-            policy = RRSMQueryPolicy()
-            origin_time = parse_normalized_iso8601(info['time']).isoformat(timespec='microseconds')
-            last_update_time = parse_normalized_iso8601(info['lastupdate']).isoformat(timespec='seconds')
-            try:
-                emsc_alert_json = json.dumps(info)
-            except Exception as e:
-                logger.warning(f"Could not serialize alert JSON for event {info['unid']}: {e}")
-                emsc_alert_json = None
-
-            tracker.batch_register_from_policy(
-                event_id=info['unid'],
-                policy=policy,
-                origin_time=origin_time,
-                last_update_time=last_update_time,
-                emsc_alert_json=emsc_alert_json,
+    missing = [key for key in _REQUIRED_PROPERTIES if key not in properties]
+    if missing:
+        raise ValueError(
+            "The alert is missing required properties: {0}".format(
+                ", ".join(missing)
             )
+        )
 
-        # Process event updates
-        elif info['action'] == 'update':
-            logger.info(f"Updated event: {info['unid']} at {info['time']}, Magnitude: {info['mag']}, Region: {info['flynn_region']}")
-            origin_time = parse_normalized_iso8601(info['time']).isoformat(timespec='microseconds')
-            last_update_time = parse_normalized_iso8601(info['lastupdate']).isoformat(timespec='seconds')
-            try:
-                emsc_alert_json = json.dumps(info)
-            except Exception as e:
-                logger.warning(f"Could not serialize alert JSON for event {info['unid']}: {e}")
-                emsc_alert_json = None
+    # The copied mapping is the handoff value. Normalized fields and the
+    # authoritative envelope action must never alter json.loads' mapping.
+    information = dict(properties)
+    event_id = information["unid"]
+    if not isinstance(event_id, str) or not event_id.strip():
+        raise ValueError("The alert event identifier must be a non-empty string")
+    information["unid"] = event_id.strip()
 
-            tracker.refresh_metadata_after_emsc_update(
-                event_id=info['unid'],
-                service="RRSM",
-                new_last_update_time=last_update_time,
-                origin_time=origin_time,
-                emsc_alert_json=emsc_alert_json
-            )
+    if not isinstance(information["flynn_region"], str):
+        raise ValueError("The alert Flynn region must be a string")
+    information["mag"] = _normalize_alert_magnitude(information["mag"])
+    information["action"] = envelope["action"]
 
+    # Timestamp behavior is deliberately retained for this transitional pass.
+    # The existing parser and isoformat precision remain unchanged until X3a.
+    origin_time = parse_normalized_iso8601(
+        information["time"]
+    ).isoformat(timespec="microseconds")
+    last_update_time = parse_normalized_iso8601(
+        information["lastupdate"]
+    ).isoformat(timespec="seconds")
+    return information, origin_time, last_update_time
+
+
+def _matches_region(flynn_region, normalized_regions):
+    """Apply case-insensitive substring matching to normalized regions."""
+    if not normalized_regions:
+        return True
+    event_region = flynn_region.casefold()
+    return any(region in event_region for region in normalized_regions)
+
+
+def process_emsc_message(
+    message,
+    target_regions,
+    min_magnitude,
+    handoff,
+    logger,
+):
+    """Validate, filter, and hand off one EMSC message at most once."""
+    try:
+        information, origin_time, last_update_time = _decode_alert(message)
+    except Exception as error:
+        logger.warning("Malformed EMSC message: %s", error)
+        return
+
+    action = information["action"]
+    if not isinstance(action, str) or action not in _SUPPORTED_ACTIONS:
+        logger.info(
+            "Unsupported EMSC action for event %s: %r",
+            information["unid"],
+            action,
+        )
+        return
+
+    if not _matches_region(information["flynn_region"], target_regions):
+        logger.info(
+            "EMSC filter rejection for event %s: region %r did not match %r",
+            information["unid"],
+            information["flynn_region"],
+            target_regions,
+        )
+        return
+    if information["mag"] < min_magnitude:
+        logger.info(
+            "EMSC filter rejection for event %s: magnitude %s is below %s",
+            information["unid"],
+            information["mag"],
+            min_magnitude,
+        )
+        return
+
+    try:
+        handoff(information, origin_time, last_update_time)
     except Exception:
-        logger.exception("Unable to process message")
+        logger.exception(
+            "EMSC handoff failure for event %s with action %s",
+            information["unid"],
+            action,
+        )
+        return
 
-@gen.coroutine
-def listen(ws, target_regions=None, min_magnitude=0):
+    logger.info(
+        "Accepted EMSC handoff for event %s with action %s",
+        information["unid"],
+        action,
+    )
+
+
+def _make_eventtracker_handoff(tracker, policy, logger):
+    """Bind accepted listener alerts to the EventTracker-owned operation."""
+
+    def handoff(information, origin_time, last_update_time):
+        action = information["action"]
+        logger.info(
+            "Received accepted EMSC %s alert for event %s at %s, "
+            "Magnitude: %s, Region: %s",
+            action,
+            information["unid"],
+            information["time"],
+            information["mag"],
+            information["flynn_region"],
+        )
+
+        try:
+            emsc_alert_json = json.dumps(information)
+        except Exception as error:
+            logger.warning(
+                "Could not serialize alert JSON for event %s: %s",
+                information["unid"],
+                error,
+            )
+            emsc_alert_json = None
+
+        tracker.apply_emsc_alert(
+            event_id=information["unid"],
+            policy=policy,
+            origin_time=origin_time,
+            last_update_time=last_update_time,
+            emsc_alert_json=emsc_alert_json,
+        )
+
+    return handoff
+
+
+def listen(ws, processor, logger):
+    """Read messages from one open WebSocket until it closes."""
     while True:
-        msg = yield ws.read_message()  # Read the message from WebSocket
-        if msg is None:
+        message = yield ws.read_message()
+        if message is None:
             logger.info("WebSocket closed")
             break
-        myprocessing(msg, target_regions=target_regions, min_magnitude=min_magnitude)  # Process the received message
+        processor(message)
 
-@gen.coroutine
-def launch_client(target_regions=None, min_magnitude=0):
+
+def launch_client(
+    echo_uri,
+    ping_interval,
+    processor,
+    logger,
+    websocket_connect,
+    listen_coroutine,
+    sleep,
+):
+    """Maintain the existing reconnect loop around the EMSC WebSocket."""
     while True:
         try:
             logger.info("Opening WebSocket connection to %s", echo_uri)
-            ws = yield websocket_connect(echo_uri, ping_interval=PING_INTERVAL)  # Establish WebSocket connection
-
-            logger.info("WebSocket connection established. Waiting for messages...")
-            yield listen(ws, target_regions=target_regions, min_magnitude=min_magnitude)  # Start listening for messages
+            ws = yield websocket_connect(echo_uri, ping_interval=ping_interval)
+            logger.info(
+                "WebSocket connection established. Waiting for messages..."
+            )
+            yield listen_coroutine(ws, processor=processor, logger=logger)
         except Exception:
             logger.exception("Connection error")
             logger.info("Retrying connection in 5 seconds...")
-            yield gen.sleep(5)
+            yield sleep(5)
 
 
 def start_emsc_listener():
-    """ Start the Seismic Portal WebSocket listener service. """
-    # Define the regions of interest and minimum magnitude
-    if "seismic-portal-listener" not in pyfinderconfig:
-        target_regions = ['world']
-        min_magnitude = 3.0
-    else:
-        # Target region defaults to 'world' if not specified
-        if "target-regions" not in pyfinderconfig["seismic-portal-listener"] or \
-            not pyfinderconfig["seismic-portal-listener"]["target-regions"]:
-            target_regions = ['world']
-        else:
-            target_regions = pyfinderconfig["seismic-portal-listener"]["target-regions"]
-        
-        # Minimum magnitude defaults to 3.0 if not specified
-        if "min-magnitude" not in pyfinderconfig["seismic-portal-listener"] or \
-            not pyfinderconfig["seismic-portal-listener"]["min-magnitude"]:
-            min_magnitude = 3.0
-        else:
-            min_magnitude = pyfinderconfig["seismic-portal-listener"]["min-magnitude"]
+    """Start the Seismic Portal WebSocket listener service."""
+    # Runtime-only imports keep package import free of logger, database,
+    # tracker, policy, configuration, and external service construction.
+    from functools import partial
 
-    # Log the configuration
+    from tornado import gen
+    from tornado.ioloop import IOLoop
+    from tornado.websocket import websocket_connect
+
+    from pyfinder.pyfinderconfig import pyfinderconfig
+    from pyfinder.services.eventtracker import EventTracker
+    from pyfinder.services.querypolicy import RRSMQueryPolicy
+    from pyfinder.utils.customlogger import file_logger
+
+    listener_config = pyfinderconfig.get("seismic-portal-listener", {})
+    target_regions = normalize_target_regions(
+        listener_config.get("target-regions")
+    )
+    min_magnitude = normalize_min_magnitude(
+        listener_config.get("min-magnitude")
+    )
+    echo_uri = listener_config["echo-uri"]
+    ping_interval = listener_config["ping-interval"]
+
+    logger = file_logger(
+        module_name="SeismicListener",
+        log_file="seismiclistener.log",
+        rotate=True,
+        overwrite=False,
+        level=logging.DEBUG,
+    )
+    tracker = EventTracker("event_update_follow_up.db", logger=logger)
+    policy = RRSMQueryPolicy()
+    handoff = _make_eventtracker_handoff(tracker, policy, logger)
+    processor = partial(
+        process_emsc_message,
+        target_regions=target_regions,
+        min_magnitude=min_magnitude,
+        handoff=handoff,
+        logger=logger,
+    )
+    listen_coroutine = gen.coroutine(listen)
+    launch_coroutine = gen.coroutine(launch_client)
+
     logger.info(" ===== Starting Seismic Portal WebSocket listener =====")
     logger.info("Configuration:")
-    logger.info("|- Target regions: %s", target_regions)
+    logger.info("|- Target regions: %s", target_regions or ("world",))
     logger.info("|- Minimum magnitude: %s", min_magnitude)
     logger.info("|- WebSocket URI: %s", echo_uri)
-    
 
-    # Start Tornado IOLoop
     logger.info("Starting Tornado IOLoop")
     ioloop = IOLoop.instance()
-
-    # Launch WebSocket client with filters
     logger.info("Launching WebSocket client")
-    # launch_client(target_regions=target_regions, min_magnitude=min_magnitude)
-    ioloop.add_callback(launch_client, target_regions=target_regions, min_magnitude=min_magnitude)
+    ioloop.add_callback(
+        launch_coroutine,
+        echo_uri=echo_uri,
+        ping_interval=ping_interval,
+        processor=processor,
+        logger=logger,
+        websocket_connect=websocket_connect,
+        listen_coroutine=listen_coroutine,
+        sleep=gen.sleep,
+    )
 
     try:
-        # Start the Tornado IOLoop
         logger.info("Starting the IOLoop ...")
-        ioloop.start()  
-
+        ioloop.start()
     except KeyboardInterrupt:
-        # Handle keyboard interrupt to stop the IOLoop
         logger.info("Closing WebSocket")
-        ioloop.stop()  
+        ioloop.stop()
 
 
-# Main function to start the service directly from this script
-if __name__ == '__main__':
-    # Start the service
-    start_emsc_listener()    
+if __name__ == "__main__":
+    start_emsc_listener()

@@ -15,11 +15,14 @@ from pyfinder.services.database import (
 )
 from datetime import datetime, timedelta, timezone
 import logging
-from pyfinder.utils.customlogger import file_logger
-from utils.timeutils import parse_normalized_iso8601
+from pyfinder.utils.timeutils import parse_normalized_iso8601
 
 
 class EventTracker:
+    RESULT_REGISTERED = "registered"
+    RESULT_REFRESHED = "refreshed"
+    RESULT_NO_PENDING = "no_pending_rows"
+
     class Field:
         event_id = "event_id"
         service = "service"
@@ -197,30 +200,69 @@ class EventTracker:
         self, event_id, service, new_last_update_time, origin_time=None, emsc_alert_json=None
     ):
         """
-        Update EMSC metadata for all active delay stages of an event (same event_id + service).
+        Update EMSC metadata for all pending stages of an event and service.
         """
         now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        fields_to_update = {
-            self.Field.last_update_time: new_last_update_time,
-            self.Field.last_modified: now,
-        }
-        if origin_time:
-            fields_to_update[self.Field.origin_time] = origin_time
-        if emsc_alert_json:
-            fields_to_update[self.Field.emsc_alert_json] = emsc_alert_json
+        return self._db.update_pending_emsc_metadata(
+            event_id=event_id,
+            service=service,
+            origin_time=origin_time,
+            last_update_time=new_last_update_time,
+            emsc_alert_json=emsc_alert_json,
+            last_modified=now,
+        )
 
-        all_rows = self.get_all_pending_events()
-        for meta in all_rows:
-            if (
-                meta[self.Field.event_id] == event_id and
-                meta[self.Field.service] == service
-            ):
-                self.db_update_event_fields(
-                    event_id=event_id,
-                    service=service,
-                    current_delay_time=meta[self.Field.current_delay_time],
-                    **fields_to_update
-                )
+    def apply_emsc_alert(
+        self,
+        event_id,
+        policy,
+        origin_time,
+        last_update_time,
+        emsc_alert_json=None,
+        expiration_days=5,
+    ):
+        """Register a new event or refresh its existing pending metadata."""
+        service = policy.service_name
+        if not self._db.event_service_exists(event_id, service):
+            self.batch_register_from_policy(
+                event_id=event_id,
+                policy=policy,
+                origin_time=origin_time,
+                last_update_time=last_update_time,
+                emsc_alert_json=emsc_alert_json,
+                expiration_days=expiration_days,
+            )
+            registered_rows = len(policy.QUERY_SCHEDULE_MINUTES)
+            self.logger.info(
+                "Registered event %s for service %s with %s scheduled rows",
+                event_id,
+                service,
+                registered_rows,
+            )
+            return self.RESULT_REGISTERED, registered_rows
+
+        refreshed_rows = self.refresh_metadata_after_emsc_update(
+            event_id=event_id,
+            service=service,
+            new_last_update_time=last_update_time,
+            origin_time=origin_time,
+            emsc_alert_json=emsc_alert_json,
+        )
+        if refreshed_rows:
+            self.logger.info(
+                "Refreshed EMSC metadata for %s pending rows of event %s and service %s",
+                refreshed_rows,
+                event_id,
+                service,
+            )
+            return self.RESULT_REFRESHED, refreshed_rows
+
+        self.logger.info(
+            "Event %s and service %s exist with no pending rows to refresh",
+            event_id,
+            service,
+        )
+        return self.RESULT_NO_PENDING, 0
 
         
     def defer_event(self, event_id, service, current_delay_time, minutes=10):
