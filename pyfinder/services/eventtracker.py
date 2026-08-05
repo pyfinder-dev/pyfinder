@@ -18,6 +18,26 @@ import logging
 from pyfinder.utils.timeutils import parse_normalized_iso8601
 
 
+class ScheduleRegistrationError(RuntimeError):
+    """Report failed delay stages after all schedule inserts were attempted."""
+
+    def __init__(self, event_id, service, successful_rows, failures):
+        self.event_id = event_id
+        self.service = service
+        self.successful_rows = successful_rows
+        self.failures = tuple(failures)
+        self.failed_delays = tuple(delay for delay, _ in self.failures)
+        super().__init__(
+            "Schedule registration failed for event {0} and service {1}; "
+            "{2} rows persisted and delay stages {3} failed".format(
+                event_id,
+                service,
+                successful_rows,
+                list(self.failed_delays),
+            )
+        )
+
+
 class EventTracker:
     RESULT_REGISTERED = "registered"
     RESULT_REFRESHED = "refreshed"
@@ -171,30 +191,55 @@ class EventTracker:
 
         The policy instance must define:
         - policy.service_name (str)
-        - policy.schedule_delays (List[float]) in minutes
+        - policy.QUERY_SCHEDULE_MINUTES (List[float]) in minutes
 
         Each delay will create a separate row entry with a calculated next_query_time.
         """
         now = datetime.now(timezone.utc)
         delays = policy.QUERY_SCHEDULE_MINUTES
-        # print(f"Registering event {event_id} for service {policy.service_name} with delays: {delays}")
+        successful_rows = 0
+        failures = []
         for i, delay in enumerate(delays):
-            # print(f"Registering event {event_id} for service {policy.service_name} with delay {delay} minutes")
-            
             next_delay = delays[i + 1] if i + 1 < len(delays) else None
-            next_query_time = (now + timedelta(minutes=delay)).isoformat(timespec='seconds')
-            self.register_new_schedule(
-                event_id=event_id,
-                service=policy.service_name,
-                origin_time=origin_time,
-                last_update_time=last_update_time,
-                current_delay_time=delay,
-                next_delay_time=next_delay,
-                next_query_time=next_query_time,
-                emsc_alert_json=emsc_alert_json,
-                expiration_days=expiration_days,
-                **kwargs
+            next_query_time = (
+                now + timedelta(minutes=delay)
+            ).isoformat(timespec='seconds')
+            try:
+                self.register_new_schedule(
+                    event_id=event_id,
+                    service=policy.service_name,
+                    origin_time=origin_time,
+                    last_update_time=last_update_time,
+                    current_delay_time=delay,
+                    next_delay_time=next_delay,
+                    next_query_time=next_query_time,
+                    emsc_alert_json=emsc_alert_json,
+                    expiration_days=expiration_days,
+                    **kwargs
+                )
+                successful_rows += 1
+            except Exception as error:
+                failures.append((delay, error))
+
+        if failures:
+            failed_delays = [delay for delay, _ in failures]
+            self.logger.error(
+                "Schedule registration incomplete for event %s and service %s: "
+                "%s rows persisted; failed delay stages: %s",
+                event_id,
+                policy.service_name,
+                successful_rows,
+                failed_delays,
             )
+            registration_error = ScheduleRegistrationError(
+                event_id,
+                policy.service_name,
+                successful_rows,
+                failures,
+            )
+            raise registration_error from failures[0][1]
+
+        return successful_rows
     
     def refresh_metadata_after_emsc_update(
         self, event_id, service, new_last_update_time, origin_time=None, emsc_alert_json=None
@@ -224,7 +269,7 @@ class EventTracker:
         """Register a new event or refresh its existing pending metadata."""
         service = policy.service_name
         if not self._db.event_service_exists(event_id, service):
-            self.batch_register_from_policy(
+            registered_rows = self.batch_register_from_policy(
                 event_id=event_id,
                 policy=policy,
                 origin_time=origin_time,
@@ -232,7 +277,6 @@ class EventTracker:
                 emsc_alert_json=emsc_alert_json,
                 expiration_days=expiration_days,
             )
-            registered_rows = len(policy.QUERY_SCHEDULE_MINUTES)
             self.logger.info(
                 "Registered event %s for service %s with %s scheduled rows",
                 event_id,

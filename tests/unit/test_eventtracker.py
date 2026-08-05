@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 import importlib
+import io
 import json
 import logging
 import logging.handlers
@@ -28,8 +29,9 @@ class EventTrackerMetadataTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temporary_directory.name) / "events.db"
+        self.log_stream = io.StringIO()
         self.logger = logging.Logger(self.id(), level=logging.DEBUG)
-        self.logger.addHandler(logging.NullHandler())
+        self.logger.addHandler(logging.StreamHandler(self.log_stream))
         self.tracker = eventtracker.EventTracker(
             str(self.db_path), logger=self.logger
         )
@@ -112,8 +114,20 @@ class EventTrackerMetadataTests(unittest.TestCase):
     def test_absent_create_and_update_use_existing_policy_registration(self):
         expected_delays = self.policy.QUERY_SCHEDULE_MINUTES
         expected_next_delays = expected_delays[1:] + [None]
+        expected_origin_time = "2026-08-05T10:00:00.000000"
+        expected_last_update_time = "2026-08-05T10:01:00"
+        registration_time = datetime(
+            2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc
+        )
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return registration_time
 
         with mock.patch.object(
+            eventtracker, "datetime", FixedDateTime
+        ), mock.patch.object(
             self.tracker,
             "batch_register_from_policy",
             wraps=self.tracker.batch_register_from_policy,
@@ -143,15 +157,184 @@ class EventTrackerMetadataTests(unittest.TestCase):
                     self.assertTrue(
                         all(row["status"] == database.STATUS_PENDING for row in rows)
                     )
-                    self.assertTrue(
-                        all(
-                            json.loads(row["emsc_alert_json"])["action"]
-                            == action
-                            for row in rows
-                        )
+                    self.assertEqual(
+                        [row["next_query_time"] for row in rows],
+                        [
+                            (registration_time + timedelta(minutes=delay))
+                            .isoformat(timespec="seconds")
+                            for delay in expected_delays
+                        ],
                     )
+                    expected_expiration = (
+                        registration_time + timedelta(days=5)
+                    ).isoformat(timespec="seconds")
+                    for row in rows:
+                        self.assertEqual(row["origin_time"], expected_origin_time)
+                        self.assertEqual(
+                            row["last_update_time"], expected_last_update_time
+                        )
+                        self.assertEqual(row["expiration_time"], expected_expiration)
+                        self.assertEqual(
+                            json.loads(row["emsc_alert_json"])["action"],
+                            action,
+                        )
 
         self.assertEqual(register.call_count, 2)
+
+    def test_partial_registration_attempts_all_stages_and_is_not_reconstructed(self):
+        event_id = "partial-event"
+        failed_delay = 60
+        attempted_delays = []
+        original_register = self.tracker.register_new_schedule
+        registration_time = datetime(
+            2026, 8, 5, 13, 0, 0, tzinfo=timezone.utc
+        )
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return registration_time
+
+        def register_with_failure(*args, **kwargs):
+            delay = kwargs["current_delay_time"]
+            attempted_delays.append(delay)
+            if delay == failed_delay:
+                raise sqlite3.OperationalError("middle delay failed")
+            return original_register(*args, **kwargs)
+
+        with mock.patch.object(
+            eventtracker, "datetime", FixedDateTime
+        ), mock.patch.object(
+            self.tracker,
+            "register_new_schedule",
+            side_effect=register_with_failure,
+        ):
+            with self.assertRaises(
+                eventtracker.ScheduleRegistrationError
+            ) as raised:
+                self.apply(event_id, action="create")
+
+        self.assertEqual(attempted_delays, self.policy.QUERY_SCHEDULE_MINUTES)
+        error = raised.exception
+        self.assertEqual(error.successful_rows, 7)
+        self.assertEqual(error.failed_delays, (failed_delay,))
+        self.assertEqual(len(error.failures), 1)
+        self.assertIsInstance(error.failures[0][1], sqlite3.OperationalError)
+        self.assertIs(error.__cause__, error.failures[0][1])
+
+        rows = self.fetch_rows(event_id, "RRSM")
+        persisted_delays = [row["current_delay_time"] for row in rows]
+        self.assertEqual(
+            persisted_delays,
+            [
+                delay
+                for delay in self.policy.QUERY_SCHEDULE_MINUTES
+                if delay != failed_delay
+            ],
+        )
+        self.assertTrue(
+            all(row["status"] == database.STATUS_PENDING for row in rows)
+        )
+        self.assertNotIn(failed_delay, persisted_delays)
+        self.assertIn(180, persisted_delays)
+
+        diagnostic = self.log_stream.getvalue()
+        self.assertIn("Schedule registration incomplete", diagnostic)
+        self.assertIn(event_id, diagnostic)
+        self.assertIn("RRSM", diagnostic)
+        self.assertIn("7 rows persisted", diagnostic)
+        self.assertIn("[60]", diagnostic)
+        self.assertNotIn("Registered event partial-event", diagnostic)
+
+        schedule_before_refresh = {
+            row["current_delay_time"]: (
+                row["next_query_time"],
+                row["next_delay_time"],
+                row["expiration_time"],
+                row["status"],
+            )
+            for row in rows
+        }
+        new_origin = "2026-08-05T14:00:00.000000"
+        new_last_update = "2026-08-05T14:01:00"
+        new_snapshot = json.dumps({"action": "update", "version": "new"})
+        with mock.patch.object(
+            self.tracker,
+            "batch_register_from_policy",
+            wraps=self.tracker.batch_register_from_policy,
+        ) as register:
+            result = self.apply(
+                event_id,
+                action="update",
+                origin_time=new_origin,
+                last_update_time=new_last_update,
+                emsc_alert_json=new_snapshot,
+            )
+
+        register.assert_not_called()
+        self.assertEqual(result, (eventtracker.EventTracker.RESULT_REFRESHED, 7))
+        refreshed_rows = self.fetch_rows(event_id, "RRSM")
+        self.assertEqual(len(refreshed_rows), 7)
+        self.assertNotIn(
+            failed_delay,
+            [row["current_delay_time"] for row in refreshed_rows],
+        )
+        for row in refreshed_rows:
+            self.assertEqual(row["origin_time"], new_origin)
+            self.assertEqual(row["last_update_time"], new_last_update)
+            self.assertEqual(row["emsc_alert_json"], new_snapshot)
+            self.assertEqual(
+                (
+                    row["next_query_time"],
+                    row["next_delay_time"],
+                    row["expiration_time"],
+                    row["status"],
+                ),
+                schedule_before_refresh[row["current_delay_time"]],
+            )
+
+    def test_total_registration_failure_attempts_every_stage_and_raises(self):
+        event_id = "total-failure-event"
+        attempted_delays = []
+
+        def fail_every_insert(*args, **kwargs):
+            delay = kwargs["current_delay_time"]
+            attempted_delays.append(delay)
+            raise sqlite3.OperationalError(
+                "insert failed for delay {0}".format(delay)
+            )
+
+        with mock.patch.object(
+            self.tracker,
+            "register_new_schedule",
+            side_effect=fail_every_insert,
+        ):
+            with self.assertRaises(
+                eventtracker.ScheduleRegistrationError
+            ) as raised:
+                self.apply(event_id)
+
+        self.assertEqual(attempted_delays, self.policy.QUERY_SCHEDULE_MINUTES)
+        error = raised.exception
+        self.assertEqual(error.successful_rows, 0)
+        self.assertEqual(
+            error.failed_delays,
+            tuple(self.policy.QUERY_SCHEDULE_MINUTES),
+        )
+        self.assertEqual(
+            len(error.failures),
+            len(self.policy.QUERY_SCHEDULE_MINUTES),
+        )
+        self.assertIs(error.__cause__, error.failures[0][1])
+        self.assertEqual(self.fetch_rows(event_id, "RRSM"), [])
+
+        diagnostic = self.log_stream.getvalue()
+        self.assertIn("Schedule registration incomplete", diagnostic)
+        self.assertIn(event_id, diagnostic)
+        self.assertIn("RRSM", diagnostic)
+        self.assertIn("0 rows persisted", diagnostic)
+        self.assertIn(str(self.policy.QUERY_SCHEDULE_MINUTES), diagnostic)
+        self.assertNotIn("Registered event total-failure-event", diagnostic)
 
     def test_repeated_delivery_does_not_duplicate_scheduled_rows(self):
         event_id = "repeated-event"

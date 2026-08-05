@@ -7,15 +7,12 @@ This module is the main entry point for the pyfinder module. It starts the
 listeners to manage the whole workflow from a new event detection to running 
 the FinDer with the parametric datasets.
 """
-import os
 import sys
-# Add the parent directory to the system path
-if not os.path.abspath("../") in sys.path:
-    sys.path.insert(0, os.path.abspath("../"))
-
 import threading
-from services import seismiclistener
-from services.scheduler import FollowUpScheduler
+
+from pyfinder.services import seismiclistener
+from pyfinder.services.querypolicy import build_service_policies
+from pyfinder.services.scheduler import FollowUpScheduler
 from pyfinder.utils.customlogger import file_logger
 import signal
 import atexit
@@ -58,16 +55,25 @@ def _graceful_shutdown(signum=None, frame=None):
 def start_services():
     logger = file_logger("monitoring.log", module_name="ServiceLauncher")
 
+    try:
+        service_policies = build_service_policies()
+        rrsm_policy = service_policies["RRSM"]
+    except Exception:
+        logger.exception(
+            "Policy validation failed; aborting PyFinder startup"
+        )
+        raise
+
     def start_listener():
         logger.info("Starting seismic listener...")
-        seismiclistener.start_emsc_listener()
+        seismiclistener.start_emsc_listener(policy=rrsm_policy)
 
     global _listener_thread, _scheduler
     _listener_thread = threading.Thread(target=start_listener, daemon=False)
     _listener_thread.start()
 
     logger.info("Starting FollowUpScheduler...")
-    _scheduler = FollowUpScheduler()
+    _scheduler = FollowUpScheduler(service_policies=service_policies)
     try:
         _scheduler.run_forever()
     except KeyboardInterrupt:

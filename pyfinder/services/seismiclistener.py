@@ -271,20 +271,41 @@ def launch_client(
             yield sleep(5)
 
 
-def start_emsc_listener():
+def start_emsc_listener(policy=None):
     """Start the Seismic Portal WebSocket listener service."""
-    # Runtime-only imports keep package import free of logger, database,
-    # tracker, policy, configuration, and external service construction.
+    # The listener logger must exist before standalone startup validates its
+    # policy. Parent startup may supply the already-validated policy instead.
     from functools import partial
 
+    from pyfinder.utils.customlogger import file_logger
+
+    logger = file_logger(
+        module_name="SeismicListener",
+        log_file="seismiclistener.log",
+        rotate=True,
+        overwrite=False,
+        level=logging.DEBUG,
+    )
+
+    if policy is None:
+        try:
+            from pyfinder.services.querypolicy import RRSMQueryPolicy
+
+            policy = RRSMQueryPolicy()
+        except Exception:
+            logger.exception(
+                "RRSM policy validation failed; aborting listener startup"
+            )
+            raise
+
+    # Operational runtime imports and construction occur only after policy
+    # validation has succeeded at this startup boundary.
     from tornado import gen
     from tornado.ioloop import IOLoop
     from tornado.websocket import websocket_connect
 
     from pyfinder.pyfinderconfig import pyfinderconfig
     from pyfinder.services.eventtracker import EventTracker
-    from pyfinder.services.querypolicy import RRSMQueryPolicy
-    from pyfinder.utils.customlogger import file_logger
 
     listener_config = pyfinderconfig.get("seismic-portal-listener", {})
     target_regions = normalize_target_regions(
@@ -296,15 +317,7 @@ def start_emsc_listener():
     echo_uri = listener_config["echo-uri"]
     ping_interval = listener_config["ping-interval"]
 
-    logger = file_logger(
-        module_name="SeismicListener",
-        log_file="seismiclistener.log",
-        rotate=True,
-        overwrite=False,
-        level=logging.DEBUG,
-    )
     tracker = EventTracker("event_update_follow_up.db", logger=logger)
-    policy = RRSMQueryPolicy()
     handoff = _make_eventtracker_handoff(tracker, policy, logger)
     processor = partial(
         process_emsc_message,

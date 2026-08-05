@@ -301,6 +301,21 @@ class SeismicListenerProcessingTests(unittest.TestCase):
         failing_handoff.assert_called_once()
         self.assertIn("EMSC handoff failure", self.log_stream.getvalue())
 
+    def test_accepted_messages_do_not_construct_or_validate_policies(self):
+        from pyfinder.services import querypolicy
+
+        with mock.patch.object(
+            querypolicy, "RRSMQueryPolicy", autospec=True
+        ) as policy_constructor, mock.patch.object(
+            querypolicy, "build_service_policies", autospec=True
+        ) as registry_builder:
+            self.process(self.make_message(action="create"))
+            self.process(self.make_message(action="update"))
+
+        self.assertEqual(self.handoff.call_count, 2)
+        policy_constructor.assert_not_called()
+        registry_builder.assert_not_called()
+
     def test_both_actions_use_the_same_eventtracker_operation_once(self):
         policy = object()
         for action, outcome in (
@@ -350,9 +365,16 @@ class SeismicListenerProcessingTests(unittest.TestCase):
                 self.assertNotIn("Updated event", diagnostic)
 
     def test_eventtracker_failure_is_contained_and_later_alert_continues(self):
+        from pyfinder.services import eventtracker
+
         tracker = mock.Mock()
         tracker.apply_emsc_alert.side_effect = (
-            RuntimeError("persistence failed"),
+            eventtracker.ScheduleRegistrationError(
+                "event-1",
+                "RRSM",
+                7,
+                [(60, RuntimeError("persistence failed"))],
+            ),
             ("refreshed", 1),
         )
         handoff = seismiclistener._make_eventtracker_handoff(

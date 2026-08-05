@@ -7,11 +7,9 @@ handles the results.
 """
 from concurrent.futures import ThreadPoolExecutor
 
-from pyfinder.findermanager import FinDerManager
 from pyfinder.services.eventtracker import EventTracker
-from pyfinder.services.querypolicy import SERVICE_POLICIES
+from pyfinder.services.querypolicy import build_service_policies
 from pyfinder.utils.customlogger import file_logger
-from pyfinder.utils.config_fetcher import ensure_shakemap_config
 from pyfinder.services.database import (
     STATUS_PENDING,
     STATUS_PROCESSING,
@@ -25,13 +23,28 @@ class FollowUpScheduler:
     FollowUpScheduler is responsible for managing the scheduling of follow-up queries.
     It uses a thread pool to handle multiple events concurrently and logs the process.
     The scheduler checks for due events and processes them according to the defined 
-    policies via dedicated policy instances in the SERVICE_POLICIES.
+    policies via dedicated policy instances supplied during construction.
     """
 
-    def __init__(self, tracker: EventTracker=None):
+    def __init__(self, tracker: EventTracker=None, service_policies=None):
         # Create a logger for the FollowUpScheduler and its sub-tasks
         self.logger = self._setup_file_logger()
         self._welcome_message(self.logger)
+
+        if service_policies is None:
+            try:
+                service_policies = build_service_policies()
+            except Exception:
+                self.logger.exception(
+                    "Policy validation failed; aborting scheduler startup"
+                )
+                raise
+        self.service_policies = service_policies
+
+        # FinDer is needed only after startup policy validation has succeeded.
+        from pyfinder.findermanager import FinDerManager
+
+        self._finder_manager_class = FinDerManager
 
         # Initialize the EventTracker for managing event updates
         if tracker is None:
@@ -47,6 +60,8 @@ class FollowUpScheduler:
 
         # Ensure the shakemap configuration is available
         try:
+            from pyfinder.utils.config_fetcher import ensure_shakemap_config
+
             self.logger.info("Ensuring ShakeMap configuration is available...")
             ensure_shakemap_config()
             self.logger.info("ShakeMap configuration cloned successfully.")
@@ -124,7 +139,10 @@ class FollowUpScheduler:
 
             # Create FinDerManager instance and run it
             try:
-                finder_manager = FinDerManager(options=finder_options, metadata=solution_metadata)
+                finder_manager = self._finder_manager_class(
+                    options=finder_options,
+                    metadata=solution_metadata,
+                )
                 finder_solution = finder_manager.run(event_id=event_id)
             except Exception as e:
                 self.logger.error(f"FinDerManager failed for event {event_id} and service {service}: {e}")
@@ -209,7 +227,7 @@ class FollowUpScheduler:
             if not event_meta:
                 continue
 
-            policy = SERVICE_POLICIES.get(service)
+            policy = self.service_policies.get(service)
             self.logger.info(f"Policy for service {service}: {policy}")
 
             if not policy:
