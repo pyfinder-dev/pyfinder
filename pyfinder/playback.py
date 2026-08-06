@@ -12,7 +12,6 @@ if not os.path.abspath("../") in sys.path:
 import threading
 import time
 from time import sleep
-from services.database import ThreadSafeDB
 from services.scheduler import FollowUpScheduler
 from services.eventtracker import EventTracker
 from services.querypolicy import RRSMQueryPolicy
@@ -105,7 +104,7 @@ class EventAlertWSPlaybackManager:
     def __init__(self, event_list, event_tracker, speedup_factor=1.0, default_services=None):
         """
         event_list: List of events to be played back, in the same JSON structure as the alerts from EMSC
-        event_tracker: Instance of ThreadSafeDB
+        event_tracker: EventTracker instance used to persist playback schedules
         scheduler: Instance of FollowUpScheduler
         speedup_factor: Speed multiplier for playback
         default_services: Default services if event doesn't specify
@@ -180,8 +179,6 @@ class EventAlertWSPlaybackManager:
 
     def _inject_event(self, event):
         """Internal helper to inject an event into system."""
-        scaled_expiration = max(0.01, 5.0 / self.speedup_factor)
-
         # Override the event's lastupdate and time to current time
         now = datetime.now(timezone.utc).isoformat()
         event['lastupdate'] = now
@@ -193,8 +190,7 @@ class EventAlertWSPlaybackManager:
             origin_time=parse_normalized_iso8601(event['time']),
             last_update_time=parse_normalized_iso8601(event['lastupdate']).isoformat(timespec='seconds'),
             emsc_alert_json=json.dumps(event),
-            policy=RRSMQueryPolicy(),
-            expiration_days=scaled_expiration
+            policy=RRSMQueryPolicy()
         )
         
     def reset(self):

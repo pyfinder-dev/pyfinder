@@ -186,15 +186,12 @@ class EventTrackerMetadataTests(unittest.TestCase):
                             for delay in expected_delays
                         ],
                     )
-                    expected_expiration = (
-                        registration_time + timedelta(days=5)
-                    ).isoformat(timespec="seconds")
                     for row in rows:
                         self.assertEqual(row["origin_time"], expected_origin_time)
                         self.assertEqual(
                             row["last_update_time"], expected_last_update_time
                         )
-                        self.assertEqual(row["expiration_time"], expected_expiration)
+                        self.assertIsNone(row["expiration_time"])
                         self.assertEqual(
                             json.loads(row["emsc_alert_json"])["action"],
                             action,
@@ -436,6 +433,27 @@ class EventTrackerMetadataTests(unittest.TestCase):
                 last_update_time="2026-08-06T10:01:00+00:00",
                 priority=99,
             )
+        with self.assertRaises(TypeError):
+            self.tracker.register_new_schedule(
+                **common_registration,
+                expiration_days=5,
+            )
+        with self.assertRaises(TypeError):
+            self.tracker.batch_register_from_policy(
+                event_id="batch-expiration-event",
+                policy=self.policy,
+                origin_time="2026-08-06T10:00:00+00:00",
+                last_update_time="2026-08-06T10:01:00+00:00",
+                expiration_days=5,
+            )
+        with self.assertRaises(TypeError):
+            self.tracker.apply_emsc_alert(
+                event_id="alert-expiration-event",
+                policy=self.policy,
+                origin_time="2026-08-06T10:00:00+00:00",
+                last_update_time="2026-08-06T10:01:00+00:00",
+                expiration_days=5,
+            )
 
         self.assertEqual(self.fetch_rows(), [])
 
@@ -449,22 +467,21 @@ class EventTrackerMetadataTests(unittest.TestCase):
             next_delay_time=5,
             next_query_time="2026-08-06T10:00:00+00:00",
             emsc_alert_json='{"action": "create"}',
-            expiration_days=5,
         )
 
         rows = self.fetch_rows("named-event", "RRSM")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], database.STATUS_PENDING)
         self.assertEqual(rows[0]["current_delay_time"], 0)
+        self.assertIsNone(rows[0]["expiration_time"])
+        self.assertFalse(
+            hasattr(eventtracker.EventTracker.Field, "expiration_time")
+        )
 
     def test_obsolete_all_pending_wrapper_is_absent(self):
         self.assertFalse(
             hasattr(eventtracker.EventTracker, "get_all_pending_events")
         )
-
-    def test_failed_is_exported_while_incomplete_remains_compatible(self):
-        self.assertEqual(eventtracker.STATUS_FAILED, "failed")
-        self.assertEqual(eventtracker.STATUS_INCOMPLETE, "incomplete")
 
     def test_due_discovery_keeps_expired_pending_catch_up_only(self):
         now = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
@@ -593,17 +610,119 @@ class EventTrackerMetadataTests(unittest.TestCase):
             else:
                 self.assertEqual(current, previous)
 
-    def test_existing_event_without_pending_rows_is_not_reopened(self):
-        event_id = "completed-event"
-        self.seed_row(
-            event_id,
-            "RRSM",
-            0,
+    def test_retained_terminal_events_without_pending_rows_are_not_reopened(self):
+        for status in (
             database.STATUS_COMPLETED,
-            "2000-01-01T00:00:00",
-        )
-        before = self.fetch_rows(event_id, "RRSM")
+            database.STATUS_FAILED,
+            database.STATUS_INCOMPLETE,
+        ):
+            with self.subTest(status=status):
+                event_id = f"retained-{status}"
+                self.seed_row(
+                    event_id,
+                    "RRSM",
+                    0,
+                    status,
+                    "2000-01-01T00:00:00",
+                    expiration_time="2000-01-01T00:00:00+00:00",
+                )
+                before = self.fetch_rows(event_id, "RRSM")
 
+                with mock.patch.object(
+                    self.tracker,
+                    "batch_register_from_policy",
+                    wraps=self.tracker.batch_register_from_policy,
+                ) as register:
+                    result = self.apply(event_id, action="update")
+
+                register.assert_not_called()
+                self.assertEqual(
+                    result,
+                    (eventtracker.EventTracker.RESULT_NO_PENDING, 0),
+                )
+                self.assertEqual(self.fetch_rows(event_id, "RRSM"), before)
+
+    def test_explicit_cleanup_removes_identity_and_allows_fresh_registration(self):
+        event_id = "cleaned-and-reregistered"
+        first_result = self.apply(event_id, action="create")
+        self.assertEqual(
+            first_result,
+            (eventtracker.EventTracker.RESULT_REGISTERED, 8),
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE event_tracker
+                SET status = CASE
+                        WHEN current_delay_time = 0 THEN ?
+                        WHEN current_delay_time = 5 THEN ?
+                        ELSE ?
+                    END,
+                    expiration_time = CASE
+                        WHEN current_delay_time = 0 THEN ?
+                        WHEN current_delay_time = 5 THEN ?
+                        ELSE NULL
+                    END
+                WHERE event_id = ?
+                """,
+                (
+                    database.STATUS_COMPLETED,
+                    database.STATUS_FAILED,
+                    database.STATUS_INCOMPLETE,
+                    "2000-01-01T00:00:00+00:00",
+                    "2099-01-01T00:00:00+00:00",
+                    event_id,
+                ),
+            )
+
+        self.assertEqual(self.tracker.cleanup_terminal_events(), 8)
+        self.assertEqual(self.fetch_rows(event_id, "RRSM"), [])
+
+        with mock.patch.object(
+            self.tracker,
+            "batch_register_from_policy",
+            wraps=self.tracker.batch_register_from_policy,
+        ) as register:
+            second_result = self.apply(event_id, action="update")
+
+        register.assert_called_once()
+        self.assertEqual(
+            second_result,
+            (eventtracker.EventTracker.RESULT_REGISTERED, 8),
+        )
+        rows = self.fetch_rows(event_id, "RRSM")
+        self.assertEqual(len(rows), 8)
+        self.assertTrue(
+            all(row["status"] == database.STATUS_PENDING for row in rows)
+        )
+        self.assertTrue(all(row["expiration_time"] is None for row in rows))
+
+    def test_cleanup_blocked_event_retains_identity_and_is_not_reregistered(self):
+        event_id = "blocked-cleanup-identity"
+        self.apply(event_id, action="create")
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE event_tracker
+                SET status = ?, expiration_time = ?
+                WHERE event_id = ?
+                """,
+                (
+                    database.STATUS_COMPLETED,
+                    "2000-01-01T00:00:00+00:00",
+                    event_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE event_tracker
+                SET status = ?
+                WHERE event_id = ? AND service = ? AND current_delay_time = 0
+                """,
+                (database.STATUS_PENDING, event_id, "RRSM"),
+            )
+
+        self.assertEqual(self.tracker.cleanup_terminal_events(), 0)
         with mock.patch.object(
             self.tracker,
             "batch_register_from_policy",
@@ -614,9 +733,19 @@ class EventTrackerMetadataTests(unittest.TestCase):
         register.assert_not_called()
         self.assertEqual(
             result,
-            (eventtracker.EventTracker.RESULT_NO_PENDING, 0),
+            (eventtracker.EventTracker.RESULT_REFRESHED, 1),
         )
-        self.assertEqual(self.fetch_rows(event_id, "RRSM"), before)
+        self.assertEqual(len(self.fetch_rows(event_id, "RRSM")), 8)
+
+    def test_registration_never_invokes_explicit_terminal_cleanup(self):
+        with mock.patch.object(
+            self.tracker._db,
+            "cleanup_terminal_events",
+            wraps=self.tracker._db.cleanup_terminal_events,
+        ) as cleanup:
+            self.apply("explicit-cleanup-only")
+
+        cleanup.assert_not_called()
 
     def test_database_failures_propagate(self):
         with mock.patch.object(
@@ -650,11 +779,7 @@ class EventTrackerMetadataTests(unittest.TestCase):
             "mark_event_completed",
             autospec=True,
             return_value=1,
-        ) as mark_completed, mock.patch.object(
-            self.tracker,
-            "db_update_event_fields",
-            autospec=True,
-        ) as generic_update:
+        ) as mark_completed:
             result = self.tracker.mark_completed("event-1", "RRSM", 15)
 
         self.assertEqual(result, 1)
@@ -663,8 +788,6 @@ class EventTrackerMetadataTests(unittest.TestCase):
             service="RRSM",
             current_delay_time=15,
         )
-        generic_update.assert_not_called()
-
     def test_lifecycle_boundaries_forward_named_values_and_results(self):
         transition_time = datetime(
             2026,

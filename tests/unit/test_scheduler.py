@@ -4,6 +4,7 @@ import ast
 from datetime import datetime, timezone
 import inspect
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -12,6 +13,7 @@ import unittest
 from unittest import mock
 
 from pyfinder.services import eventtracker as eventtracker_module
+from pyfinder.services import database as database_module
 from pyfinder.services import scheduler as scheduler_module
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.services.querypolicy import RRSMQueryPolicy
@@ -528,12 +530,19 @@ class SchedulerRetryPersistenceTests(unittest.TestCase):
             next_query_time="2000-01-01T00:00:00+00:00",
         )
         if starting_count:
-            tracker.db_update_event_fields(
-                event_id=EVENT_ID,
-                service=SERVICE,
-                current_delay_time=DELAY,
-                retry_count=starting_count,
-            )
+            with sqlite3.connect(
+                Path(temporary_directory.name) / "scheduler.sqlite"
+            ) as connection:
+                connection.execute(
+                    """
+                    UPDATE event_tracker
+                    SET retry_count = ?
+                    WHERE event_id = ?
+                        AND service = ?
+                        AND current_delay_time = ?
+                    """,
+                    (starting_count, EVENT_ID, SERVICE, DELAY),
+                )
 
         instance = make_scheduler(
             tracker,
@@ -813,6 +822,10 @@ class SchedulerBoundaryTests(unittest.TestCase):
         source = inspect.getsource(scheduler_module)
 
         self.assertNotIn("db_update_event_fields", source)
+        self.assertFalse(hasattr(EventTracker, "db_update_event_fields"))
+        self.assertFalse(
+            hasattr(database_module.ThreadSafeDB, "_update_event_fields")
+        )
 
 
 if __name__ == "__main__":

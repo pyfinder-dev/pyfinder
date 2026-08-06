@@ -9,7 +9,6 @@ updates and follow-ups.
 
 import sqlite3
 import threading
-import hashlib
 from datetime import datetime, timezone
 
 
@@ -30,19 +29,11 @@ class ThreadSafeDB:
         "next_query_time",
         "status",
         "retry_count",
-        "expiration_time",
         "current_delay_time",
         "next_delay_time",
         "emsc_alert_json",
         "last_data_snapshot",
     )
-    _MUTABLE_EVENT_FIELDS = frozenset({
-        "status",
-        "last_query_time",
-        "last_error",
-        "retry_count",
-        "next_query_time",
-    })
 
     def __init__(self, db_path="event_update_follow_up.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -82,10 +73,6 @@ class ThreadSafeDB:
             ''')
             self.conn.commit()
 
-    def calculate_hash(self, data):
-        """Calculate a hash of the provided data for change detection."""
-        return hashlib.sha256(data.encode('utf-8')).hexdigest()
-
     def _execute_write(self, statement, parameters):
         """Execute one write while preserving its primary failure on rollback."""
         with self._lock:
@@ -107,8 +94,8 @@ class ThreadSafeDB:
 
     def insert_scheduled_item(
             self, event_id, service, origin_time, last_update_time,
-            next_query_time, expiration_time=None, current_delay_time=None,
-            next_delay_time=None, emsc_alert_json=None):
+            next_query_time, current_delay_time=None, next_delay_time=None,
+            emsc_alert_json=None):
         """Persist one scheduled item and commit it independently."""
         if next_query_time is None:
             raise ValueError("A scheduled item requires next_query_time")
@@ -120,9 +107,8 @@ class ThreadSafeDB:
                 INSERT INTO event_tracker (
                     event_id, service, status, origin_time, last_update_time,
                     last_query_time, next_query_time, retry_count,
-                    expiration_time,
                     current_delay_time, next_delay_time, emsc_alert_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             parameters=(
                 event_id,
@@ -133,7 +119,6 @@ class ThreadSafeDB:
                 None,
                 next_query_time,
                 0,
-                expiration_time,
                 current_delay_time,
                 next_delay_time,
                 emsc_alert_json,
@@ -378,15 +363,33 @@ class ThreadSafeDB:
             ),
         )
 
-    def cleanup_expired_events(self):
-        """Remove or mark expired events as inactive."""
-        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        with self._lock:
-            self.cursor.execute('''
-            DELETE FROM event_tracker
-            WHERE expiration_time <= ?
-            ''', (now,))
-            self.conn.commit()
+    def cleanup_terminal_events(self):
+        """Delete every row belonging to fully terminal event groups."""
+        # Scheduled rows are also the durable registration identity. The
+        # grouping boundary must therefore be the whole event, not one service
+        # or delay stage. A NULL or unfamiliar status falls into ELSE and
+        # protects every row for that event from deletion.
+        return self._execute_write(
+            statement='''
+                DELETE FROM event_tracker
+                WHERE event_id IN (
+                    SELECT event_id
+                    FROM event_tracker
+                    GROUP BY event_id
+                    HAVING SUM(
+                        CASE
+                            WHEN status IN (?, ?, ?) THEN 0
+                            ELSE 1
+                        END
+                    ) = 0
+                )
+            ''',
+            parameters=(
+                STATUS_COMPLETED,
+                STATUS_FAILED,
+                STATUS_INCOMPLETE,
+            ),
+        )
 
     def close(self):
         """Close the database connection."""
@@ -406,45 +409,3 @@ class ThreadSafeDB:
             if row:
                 return dict(zip(self.SCHEDULER_METADATA_FIELDS, row))
             return None
-
-
-    def query_by_priority(self, min_priority=1):
-        """Get events with priority greater than or equal to a given value."""
-        with self._lock:
-            self.cursor.execute('''
-                SELECT event_id, service, priority, next_query_time
-                FROM event_tracker
-                WHERE priority >= ?
-                ORDER BY priority DESC, next_query_time ASC
-            ''', (min_priority,))
-            return self.cursor.fetchall()
-
-    def _update_event_fields(self, event_id, service, current_delay_time, **kwargs):
-        """
-        Update the narrow lifecycle fields still required by the scheduler.
-        """
-        invalid_fields = set(kwargs) - self._MUTABLE_EVENT_FIELDS
-        if invalid_fields:
-            raise ValueError(
-                "Unsupported mutable event fields: {0}".format(
-                    ", ".join(sorted(invalid_fields))
-                )
-            )
-
-        columns = []
-        values = []
-        for key, value in kwargs.items():
-            if value is not None:
-                columns.append(f"{key} = ?")
-                values.append(value)
-        if not columns:
-            return
-        values.extend([event_id, service, current_delay_time])
-        self._execute_write(
-            statement=f'''
-                UPDATE event_tracker
-                SET {", ".join(columns)}
-                WHERE event_id = ? AND service = ? AND current_delay_time = ?
-            ''',
-            parameters=values,
-        )

@@ -7,17 +7,9 @@ events, including registering, updating, and querying.
 """
 
 from pyfinder.services.database import ThreadSafeDB
-from pyfinder.services.database import (
-    STATUS_PENDING,
-    STATUS_PROCESSING,
-    STATUS_COMPLETED,
-    STATUS_FAILED,
-    STATUS_INCOMPLETE
-)
 from datetime import datetime, timedelta, timezone
 import json
 import logging
-from pyfinder.utils.timeutils import parse_normalized_iso8601
 
 
 class ScheduleRegistrationError(RuntimeError):
@@ -56,7 +48,6 @@ class EventTracker:
         current_delay_time = "current_delay_time"
         next_delay_time = "next_delay_time"
         retry_count = "retry_count"
-        expiration_time = "expiration_time"
         priority = "priority"
         last_error = "last_error"
         last_data_hash = "last_data_hash"
@@ -98,22 +89,13 @@ class EventTracker:
             last_query_time=now,
         )
 
-    def cleanup_expired(self):
-        """Clean up expired events from the database."""
-        self._db.cleanup_expired_events()
+    def cleanup_terminal_events(self):
+        """Explicitly remove rows for events whose work is fully terminal."""
+        return self._db.cleanup_terminal_events()
 
     def close(self):
         """Close database connection."""
         self._db.close()
-
-    def db_update_event_fields(self, event_id, service, current_delay_time, **fields):
-        """Update selected fields for an event (status, next_query_time, etc.)."""
-        self._db._update_event_fields(
-            event_id=event_id,
-            service=service,
-            current_delay_time=current_delay_time,
-            **fields
-        )
 
     def get_event_meta(self, event_id, service, current_delay_time):
         """Return scheduler-facing metadata with an EMSC-derived region."""
@@ -192,28 +174,22 @@ class EventTracker:
             last_query_time=now,
         )
 
-    def query_by_priority(self, min_priority=1):
-        """Get events with priority greater than or equal to a given value."""
-        return self._db.query_by_priority(min_priority)
-        
     def register_new_schedule(
             self, event_id, service, origin_time, last_update_time,
             current_delay_time=None, next_delay_time=None,
-            next_query_time=None, emsc_alert_json=None, expiration_days=5):
+            next_query_time=None, emsc_alert_json=None):
         """
         Register a new scheduled service update for a specific event.
 
         This method will attempt to insert a new row. If the row already exists,
         it will raise an exception and will NOT fallback to updating.
         """
-        expiration_time = (datetime.now(timezone.utc) + timedelta(days=expiration_days)).isoformat(timespec='seconds')
         self._db.insert_scheduled_item(
             event_id=event_id,
             service=service,
             origin_time=origin_time,
             last_update_time=last_update_time,
             next_query_time=next_query_time,
-            expiration_time=expiration_time,
             current_delay_time=current_delay_time,
             next_delay_time=next_delay_time,
             emsc_alert_json=emsc_alert_json,
@@ -221,7 +197,7 @@ class EventTracker:
 
     def batch_register_from_policy(
         self, event_id, policy, origin_time, last_update_time,
-        emsc_alert_json=None, expiration_days=5):
+        emsc_alert_json=None):
         """
         Register multiple scheduled service updates using a policy instance.
 
@@ -250,7 +226,6 @@ class EventTracker:
                     next_delay_time=next_delay,
                     next_query_time=next_query_time,
                     emsc_alert_json=emsc_alert_json,
-                    expiration_days=expiration_days,
                 )
                 successful_rows += 1
             except Exception as error:
@@ -299,7 +274,6 @@ class EventTracker:
         origin_time,
         last_update_time,
         emsc_alert_json=None,
-        expiration_days=5,
     ):
         """Register a new event or refresh its existing pending metadata."""
         service = policy.service_name
@@ -313,7 +287,6 @@ class EventTracker:
                 origin_time=origin_time,
                 last_update_time=last_update_time,
                 emsc_alert_json=emsc_alert_json,
-                expiration_days=expiration_days,
             )
             self.logger.info(
                 "Registered event %s for service %s with %s scheduled rows",
@@ -345,26 +318,3 @@ class EventTracker:
             service,
         )
         return self.RESULT_NO_PENDING, 0
-
-        
-    def defer_event(self, event_id, service, current_delay_time, minutes=10):
-        """Postpone the next query time by N minutes for a specific event and service."""
-        meta = self.get_event_meta(
-            event_id=event_id,
-            service=service,
-            current_delay_time=current_delay_time,
-        )
-        if not meta or not meta.get(self.Field.next_query_time):
-            return  # Nothing to defer
-
-        current_time = parse_normalized_iso8601(meta[self.Field.next_query_time])
-        new_time = current_time + timedelta(minutes=minutes)
-
-        self.db_update_event_fields(
-            event_id=event_id,
-            service=service,
-            current_delay_time=current_delay_time,
-            **{
-                self.Field.next_query_time: new_time.isoformat(timespec='seconds'),
-            },
-        )

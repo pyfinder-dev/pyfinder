@@ -27,7 +27,6 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
             "origin_time": "2026-08-06T10:00:00.000000+00:00",
             "last_update_time": "2026-08-06T10:01:00+00:00",
             "next_query_time": "2026-08-06T10:05:00+00:00",
-            "expiration_time": "2026-08-11T10:00:00+00:00",
             "current_delay_time": 5,
             "next_delay_time": 15,
             "emsc_alert_json": '{"action": "create"}',
@@ -85,6 +84,37 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                 ),
             )
 
+    def seed_cleanup_item(
+        self,
+        event_id,
+        service,
+        current_delay_time,
+        status,
+        expiration_time=None,
+    ):
+        """Create cleanup state through fixture-only direct schema setup."""
+        self.insert_item(
+            event_id=event_id,
+            service=service,
+            current_delay_time=current_delay_time,
+            next_delay_time=current_delay_time + 1,
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE event_tracker
+                SET status = ?, expiration_time = ?
+                WHERE event_id = ? AND service = ? AND current_delay_time = ?
+                """,
+                (
+                    status,
+                    expiration_time,
+                    event_id,
+                    service,
+                    current_delay_time,
+                ),
+            )
+
     def test_failed_is_intended_while_incomplete_remains_legacy(self):
         self.assertEqual(database.STATUS_FAILED, "failed")
         self.assertEqual(database.STATUS_INCOMPLETE, "incomplete")
@@ -109,12 +139,17 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
             row["next_query_time"], "2026-08-06T10:05:00+00:00"
         )
         self.assertEqual(row["retry_count"], 0)
-        self.assertEqual(
-            row["expiration_time"], "2026-08-11T10:00:00+00:00"
-        )
+        self.assertIsNone(row["expiration_time"])
         self.assertEqual(row["current_delay_time"], 5)
         self.assertEqual(row["next_delay_time"], 15)
         self.assertEqual(row["emsc_alert_json"], '{"action": "create"}')
+
+        with sqlite3.connect(self.db_path) as connection:
+            columns = {
+                column[1]
+                for column in connection.execute("PRAGMA table_info(event_tracker)")
+            }
+        self.assertIn("expiration_time", columns)
 
     def test_failed_insert_rolls_back_and_later_stage_can_commit(self):
         real_connection = self.db.conn
@@ -223,6 +258,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                     retry_count = ?,
                     last_data_snapshot = ?,
                     last_update_time = ?,
+                    expiration_time = ?,
                     priority = ?,
                     last_error = ?,
                     last_data_hash = ?,
@@ -235,6 +271,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                     3,
                     "downstream snapshot",
                     "omitted update time",
+                    "2000-01-01T00:00:00+00:00",
                     9,
                     "omitted error",
                     "omitted hash",
@@ -262,7 +299,6 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                 "next_query_time": "2026-08-06T10:05:00+00:00",
                 "status": database.STATUS_PROCESSING,
                 "retry_count": 3,
-                "expiration_time": "2026-08-11T10:00:00+00:00",
                 "current_delay_time": 5,
                 "next_delay_time": 15,
                 "emsc_alert_json": '{"action": "create"}',
@@ -276,6 +312,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
         self.assertTrue(
             {
                 "last_update_time",
+                "expiration_time",
                 "priority",
                 "last_error",
                 "last_data_hash",
@@ -291,127 +328,6 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                 current_delay_time=0,
             )
         )
-
-    def test_every_scheduler_required_mutable_field_remains_writable(self):
-        self.insert_item()
-
-        self.db._update_event_fields(
-            event_id="event-1",
-            service="RRSM",
-            current_delay_time=5,
-            status=database.STATUS_INCOMPLETE,
-            last_query_time="2026-08-06T10:06:00+00:00",
-            last_error="provider unavailable",
-            retry_count=2,
-            next_query_time="2026-08-06T10:10:00+00:00",
-        )
-
-        row = self.fetch_rows()[0]
-        self.assertEqual(row["status"], database.STATUS_INCOMPLETE)
-        self.assertEqual(
-            row["last_query_time"],
-            "2026-08-06T10:06:00+00:00",
-        )
-        self.assertEqual(row["last_error"], "provider unavailable")
-        self.assertEqual(row["retry_count"], 2)
-        self.assertEqual(
-            row["next_query_time"],
-            "2026-08-06T10:10:00+00:00",
-        )
-
-    def test_untrusted_mutation_fields_fail_before_sql_execution(self):
-        monitored_cursor = mock.Mock(wraps=self.db.cursor)
-        self.db.cursor = monitored_cursor
-        rejected_fields = (
-            ("unknown", "not_a_column"),
-            ("targeted metadata", "origin_time"),
-            ("targeted metadata", "emsc_alert_json"),
-            ("schema only", "priority"),
-            ("schema only", "last_data_hash"),
-            ("malformed", ""),
-            ("SQL fragment", "status = 'completed'"),
-        )
-
-        for category, field in rejected_fields:
-            with self.subTest(category=category, field=field):
-                with self.assertRaises(ValueError):
-                    self.db._update_event_fields(
-                        event_id="event-1",
-                        service="RRSM",
-                        current_delay_time=5,
-                        **{field: "value"},
-                    )
-
-        monitored_cursor.execute.assert_not_called()
-
-    def test_identity_mutation_fields_fail_before_sql_execution(self):
-        monitored_cursor = mock.Mock(wraps=self.db.cursor)
-        self.db.cursor = monitored_cursor
-
-        for field in ("event_id", "service", "current_delay_time"):
-            with self.subTest(field=field):
-                # Identity names collide with the method's row-identity
-                # parameters, so Python rejects them before the allowlist or
-                # SQL execution can be reached.
-                with self.assertRaises(TypeError):
-                    self.db._update_event_fields(
-                        event_id="event-1",
-                        service="RRSM",
-                        current_delay_time=5,
-                        **{field: "replacement"},
-                    )
-
-        monitored_cursor.execute.assert_not_called()
-
-    def test_invalid_mutation_field_with_none_still_fails(self):
-        monitored_cursor = mock.Mock(wraps=self.db.cursor)
-        self.db.cursor = monitored_cursor
-
-        with self.assertRaises(ValueError):
-            self.db._update_event_fields(
-                event_id="event-1",
-                service="RRSM",
-                current_delay_time=5,
-                priority=None,
-            )
-
-        monitored_cursor.execute.assert_not_called()
-
-    def test_all_none_allowed_mutation_is_a_no_op(self):
-        monitored_cursor = mock.Mock(wraps=self.db.cursor)
-        monitored_connection = mock.Mock(wraps=self.db.conn)
-        self.db.cursor = monitored_cursor
-        self.db.conn = monitored_connection
-
-        self.db._update_event_fields(
-            event_id="event-1",
-            service="RRSM",
-            current_delay_time=5,
-            status=None,
-            last_query_time=None,
-            last_error=None,
-            retry_count=None,
-            next_query_time=None,
-        )
-
-        monitored_cursor.execute.assert_not_called()
-        monitored_connection.commit.assert_not_called()
-        monitored_connection.rollback.assert_not_called()
-
-    def test_sql_like_mutation_value_is_stored_as_ordinary_data(self):
-        self.insert_item()
-        sql_like_text = "failure'); DROP TABLE event_tracker; --"
-
-        self.db._update_event_fields(
-            event_id="event-1",
-            service="RRSM",
-            current_delay_time=5,
-            last_error=sql_like_text,
-        )
-
-        rows = self.fetch_rows()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["last_error"], sql_like_text)
 
     def test_metadata_refresh_returns_matching_pending_row_count(self):
         self.insert_item(current_delay_time=0, next_delay_time=5)
@@ -464,18 +380,12 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
             database,
             "datetime",
             FixedDateTime,
-        ), mock.patch.object(
-            self.db,
-            "_update_event_fields",
-            autospec=True,
-        ) as generic_update:
+        ):
             affected_rows = self.db.mark_event_completed(
                 event_id="event-1",
                 service="RRSM",
                 current_delay_time=5,
             )
-
-        generic_update.assert_not_called()
         monitored_cursor.execute.assert_called_once()
         statement, parameters = monitored_cursor.execute.call_args.args
         self.assertIn("SET status = ?, last_query_time = ?", statement)
@@ -801,9 +711,13 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
             self.insert_item(
                 current_delay_time=delay,
                 next_delay_time=delay + 1,
-                expiration_time="2000-01-01T00:00:00+00:00",
             )
             self.set_lifecycle_state(state, current_delay_time=delay)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE event_tracker SET expiration_time = ?",
+                ("2000-01-01T00:00:00+00:00",),
+            )
         before = self.fetch_rows()
 
         affected_rows = self.db.fail_abandoned_processing(
@@ -835,6 +749,165 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
             ),
             0,
         )
+
+    def test_cleanup_deletes_events_with_uniform_terminal_statuses(self):
+        for index, status in enumerate(
+            (
+                database.STATUS_COMPLETED,
+                database.STATUS_FAILED,
+                database.STATUS_INCOMPLETE,
+            )
+        ):
+            event_id = f"terminal-{index}"
+            self.seed_cleanup_item(event_id, "RRSM", 0, status)
+            self.seed_cleanup_item(event_id, "RRSM", 5, status)
+
+        self.assertEqual(self.db.cleanup_terminal_events(), 6)
+        self.assertEqual(self.fetch_rows(), [])
+        self.assertEqual(self.db.cleanup_terminal_events(), 0)
+
+    def test_cleanup_deletes_mixed_terminal_services_and_delays(self):
+        terminal_rows = (
+            ("RRSM", 0, database.STATUS_COMPLETED),
+            ("RRSM", 5, database.STATUS_FAILED),
+            ("OTHER", 0, database.STATUS_INCOMPLETE),
+            ("OTHER", 15, database.STATUS_COMPLETED),
+        )
+        for service, delay, status in terminal_rows:
+            self.seed_cleanup_item(
+                "mixed-terminal-event",
+                service,
+                delay,
+                status,
+            )
+
+        self.assertEqual(self.db.cleanup_terminal_events(), 4)
+        self.assertEqual(self.fetch_rows(), [])
+
+    def test_cleanup_protects_whole_event_for_every_nonterminal_status(self):
+        blockers = (
+            ("pending", database.STATUS_PENDING),
+            ("processing", database.STATUS_PROCESSING),
+            ("null", None),
+            ("unknown", "awaiting_external_result"),
+        )
+        for label, blocker in blockers:
+            event_id = f"blocked-{label}"
+            self.seed_cleanup_item(
+                event_id,
+                "RRSM",
+                0,
+                database.STATUS_COMPLETED,
+            )
+            self.seed_cleanup_item(event_id, "OTHER", 5, blocker)
+
+        before = self.fetch_rows()
+        self.assertEqual(self.db.cleanup_terminal_events(), 0)
+        self.assertEqual(self.fetch_rows(), before)
+
+    def test_cleanup_deletes_eligible_event_and_leaves_blocked_event(self):
+        for delay, status in enumerate(
+            (
+                database.STATUS_COMPLETED,
+                database.STATUS_FAILED,
+                database.STATUS_INCOMPLETE,
+            )
+        ):
+            self.seed_cleanup_item("eligible-event", "RRSM", delay, status)
+        self.seed_cleanup_item(
+            "blocked-event",
+            "RRSM",
+            0,
+            database.STATUS_COMPLETED,
+        )
+        self.seed_cleanup_item(
+            "blocked-event",
+            "OTHER",
+            5,
+            database.STATUS_PENDING,
+        )
+
+        self.assertEqual(self.db.cleanup_terminal_events(), 3)
+        remaining = self.fetch_rows()
+        self.assertEqual({row["event_id"] for row in remaining}, {"blocked-event"})
+        self.assertEqual(len(remaining), 2)
+
+    def test_cleanup_ignores_old_future_null_and_mixed_expiration_values(self):
+        terminal_rows = (
+            (0, database.STATUS_COMPLETED, "2000-01-01T00:00:00+00:00"),
+            (5, database.STATUS_FAILED, "2099-01-01T00:00:00+00:00"),
+            (15, database.STATUS_INCOMPLETE, None),
+        )
+        for delay, status, expiration_time in terminal_rows:
+            self.seed_cleanup_item(
+                "expiration-independent",
+                "RRSM",
+                delay,
+                status,
+                expiration_time=expiration_time,
+            )
+        self.seed_cleanup_item(
+            "expired-pending",
+            "RRSM",
+            0,
+            database.STATUS_PENDING,
+            expiration_time="2000-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(self.db.cleanup_terminal_events(), 3)
+        remaining = self.fetch_rows()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["event_id"], "expired-pending")
+        self.assertEqual(remaining[0]["status"], database.STATUS_PENDING)
+
+    def test_cleanup_execute_failure_rolls_back_and_propagates(self):
+        self.seed_cleanup_item(
+            "cleanup-execute-failure",
+            "RRSM",
+            0,
+            database.STATUS_COMPLETED,
+        )
+        real_cursor = self.db.cursor
+        real_connection = self.db.conn
+        operation_error = sqlite3.OperationalError("cleanup execute failed")
+        monitored_cursor = mock.Mock(wraps=real_cursor)
+        monitored_cursor.execute.side_effect = operation_error
+        monitored_connection = mock.Mock(wraps=real_connection)
+        self.db.cursor = monitored_cursor
+        self.db.conn = monitored_connection
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                self.db.cleanup_terminal_events()
+        finally:
+            self.db.cursor = real_cursor
+            self.db.conn = real_connection
+
+        self.assertIs(raised.exception, operation_error)
+        monitored_connection.rollback.assert_called_once_with()
+        monitored_connection.commit.assert_not_called()
+        self.assertEqual(len(self.fetch_rows()), 1)
+
+    def test_cleanup_commit_failure_rolls_back_deletion_and_propagates(self):
+        self.seed_cleanup_item(
+            "cleanup-commit-failure",
+            "RRSM",
+            0,
+            database.STATUS_COMPLETED,
+        )
+        real_connection = self.db.conn
+        operation_error = sqlite3.OperationalError("cleanup commit failed")
+        monitored_connection = mock.Mock(wraps=real_connection)
+        monitored_connection.commit.side_effect = operation_error
+        self.db.conn = monitored_connection
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                self.db.cleanup_terminal_events()
+        finally:
+            self.db.conn = real_connection
+
+        self.assertIs(raised.exception, operation_error)
+        monitored_connection.rollback.assert_called_once_with()
+        self.assertEqual(len(self.fetch_rows()), 1)
 
     def test_active_writes_roll_back_execute_failures(self):
         operations = (
@@ -891,15 +964,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                     last_query_time="2026-08-06T12:00:00+00:00",
                 ),
             ),
-            (
-                "generic mutation",
-                lambda: self.db._update_event_fields(
-                    event_id="event-1",
-                    service="RRSM",
-                    current_delay_time=5,
-                    last_error="failure",
-                ),
-            ),
+            ("terminal cleanup", self.db.cleanup_terminal_events),
         )
         real_cursor = self.db.cursor
         real_connection = self.db.conn
@@ -978,15 +1043,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                     last_query_time="2026-08-06T12:00:00+00:00",
                 ),
             ),
-            (
-                "generic mutation",
-                lambda: self.db._update_event_fields(
-                    event_id="event-1",
-                    service="RRSM",
-                    current_delay_time=5,
-                    last_error="failure",
-                ),
-            ),
+            ("terminal cleanup", self.db.cleanup_terminal_events),
         )
         real_connection = self.db.conn
 
@@ -1005,9 +1062,9 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                 finally:
                     self.db.conn = real_connection
 
-    def test_active_write_rollback_failure_does_not_mask_primary_error(self):
+    def test_cleanup_rollback_failure_does_not_mask_primary_error(self):
         self.insert_item()
-        self.set_lifecycle_state(database.STATUS_PROCESSING)
+        self.set_lifecycle_state(database.STATUS_COMPLETED)
         real_connection = self.db.conn
         operation_error = sqlite3.OperationalError("commit failed")
         rollback_error = sqlite3.OperationalError("rollback failed")
@@ -1017,11 +1074,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
         self.db.conn = monitored_connection
 
         with self.assertRaises(sqlite3.OperationalError) as raised:
-            self.db.increment_processing_retry_count(
-                event_id="event-1",
-                service="RRSM",
-                current_delay_time=5,
-            )
+            self.db.cleanup_terminal_events()
 
         self.assertIs(raised.exception, operation_error)
         self.assertIs(raised.exception.__cause__, rollback_error)
