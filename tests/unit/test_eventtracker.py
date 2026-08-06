@@ -489,6 +489,50 @@ class EventTrackerMetadataTests(unittest.TestCase):
             with self.assertRaisesRegex(sqlite3.OperationalError, "update failure"):
                 self.apply("existing-event")
 
+    def test_mark_completed_uses_one_persistence_transition(self):
+        with mock.patch.object(
+            self.tracker._db,
+            "mark_event_completed",
+            autospec=True,
+        ) as mark_completed, mock.patch.object(
+            self.tracker,
+            "db_update_event_fields",
+            autospec=True,
+        ) as generic_update:
+            self.tracker.mark_completed("event-1", "RRSM", 15)
+
+        mark_completed.assert_called_once_with(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=15,
+        )
+        generic_update.assert_not_called()
+
+    def test_existing_positional_schedule_arguments_keep_their_meaning(self):
+        # Positional use is intentional in this compatibility test. Production
+        # callers use named arguments so field meaning is explicit at the call site.
+        self.tracker.register_new_schedule(
+            "positional-event",
+            "RRSM",
+            "2026-08-06T10:00:00.000000+00:00",
+            "2026-08-06T10:01:00+00:00",
+            5,
+            15,
+            "2026-08-06T10:05:00+00:00",
+            '{"action": "create"}',
+        )
+
+        rows = self.fetch_rows("positional-event", "RRSM")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["current_delay_time"], 5)
+        self.assertEqual(row["next_delay_time"], 15)
+        self.assertEqual(
+            row["next_query_time"],
+            "2026-08-06T10:05:00+00:00",
+        )
+        self.assertEqual(row["emsc_alert_json"], '{"action": "create"}')
+
 
 class EventTrackerImportSafetyTests(unittest.TestCase):
     def test_import_does_not_construct_database_logger_or_policy(self):

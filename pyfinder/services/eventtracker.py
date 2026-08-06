@@ -72,19 +72,7 @@ class EventTracker:
         if not isinstance(logger, logging.Logger):
             raise ValueError("Logger must be an instance of logging.Logger")
         self.logger = logger
-        self._db.logger = logger
-        self._db.set_logger(logger)
         logger.info("EventTracker logger set successfully.")
-        
-    # def initialize_event(self, event_id, services, origin_time, last_update_time, expiration_days=5):
-    #     """Initialize a new event for one or more services."""
-    #     self._db.add_event(
-    #         event_id=event_id, 
-    #         services=services, 
-    #         expiration_days=expiration_days,
-    #         origin_time=origin_time,
-    #         last_update_time=last_update_time
-    #         )
 
     def get_due_events(self, service):
         """Fetch events that are due for querying for a given service."""
@@ -92,11 +80,11 @@ class EventTracker:
 
     def mark_completed(self, event_id, service, current_delay_time):
         """Mark event as completed with timestamp."""
-        self._db.mark_event_completed(event_id, service, current_delay_time)
-        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        self.db_update_event_fields(event_id, service, current_delay_time, **{
-            self.Field.last_query_time: now
-        })
+        self._db.mark_event_completed(
+            event_id=event_id,
+            service=service,
+            current_delay_time=current_delay_time,
+        )
 
     def mark_as_processing(self, event_id, service, current_delay_time):
         """Mark an event as currently being processed."""
@@ -181,7 +169,11 @@ class EventTracker:
             self.Field.expiration_time: expiration_time,
             **kwargs,
         }
-        self._db.add_event(event_id, [service], **fields)
+        self._db.insert_scheduled_item(
+            event_id=event_id,
+            service=service,
+            **fields
+        )
 
     def batch_register_from_policy(
         self, event_id, policy, origin_time, last_update_time,
