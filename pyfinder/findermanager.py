@@ -12,18 +12,18 @@ utility as well as a runtime library.
 import os
 import sys
 import logging
-from pyfinderconfig import pyfinderconfig
+from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.utils import customlogger
 from paramws.clients import (RRSMPeakMotionClient, 
                              RRSMShakeMapClient,
                              EMSCFeltReportClient,
                              ESMShakeMapClient)
-from finderutils import (FinderChannelList, FinderSolution)
-from utils.dataformatter import (RRSMPeakMotionDataFormatter,
-                                 ESMShakeMapDataFormatter,
-                                 FinDerFormatterFromRawList,
-                                 get_epoch_time)
-from utils.station_merger import StationMerger
+from pyfinder.finderutils import (FinderChannelList, FinderSolution)
+from pyfinder.utils.dataformatter import (RRSMPeakMotionDataFormatter,
+                                          ESMShakeMapDataFormatter,
+                                          FinDerFormatterFromRawList,
+                                          get_epoch_time)
+from pyfinder.utils.station_merger import StationMerger
 
 class FinDerManager:
     """ Class for managing the FinDer library and executable wrappers"""
@@ -204,13 +204,9 @@ class FinDerManager:
         # Create the RRSM and ESM clients
         self.logger.info(f"Querying the RRSM and ESM web services for event {event_id}")
         rrsm_client = RRSMPeakMotionClient()
-        _rrsm_code, _rrsm_event_and_amplitudes, _ = rrsm_client.query(event_id=event_id)
-        if _rrsm_event_and_amplitudes:
-            _rrsm_event = _rrsm_event_and_amplitudes.get_event_data()
-            _rrsm_amplitude = _rrsm_event_and_amplitudes
-        else:
-            _rrsm_event = None
-            _rrsm_amplitude = None
+        _rrsm_code, _rrsm_event, _rrsm_datasets = rrsm_client.query(
+            event_id=event_id)
+        _rrsm_amplitude = _rrsm_datasets["peak_motion"]
 
         # Log the RRSM status
         self.logger.info(f"RRSM event status: {_rrsm_event is not None} ")
@@ -219,7 +215,9 @@ class FinDerManager:
         # Create the ESM client
         self.logger.info(f"Querying the ESM web services for event {event_id}")
         esm_client = ESMShakeMapClient()
-        _esm_code, _esm_event, _esm_amplitude = esm_client.query(event_id=event_id)
+        _esm_code, _esm_event, _esm_datasets = esm_client.query(
+            event_id=event_id)
+        _esm_amplitude = _esm_datasets["station_amplitudes"]
         self.logger.info(f"ESM event status: {_esm_event is not None} ")
         self.logger.info(f"ESM amplitude status: {_esm_amplitude is not None} ")
 

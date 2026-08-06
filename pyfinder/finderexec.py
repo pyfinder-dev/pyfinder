@@ -8,20 +8,19 @@ import json
 from typing import List
 from datetime import datetime
 from pyfinder.utils import customlogger
-import pyfinderconfig
-from paramws.clients.services.peakmotion_data import PeakMotionData
-from paramws.clients.services.shakemap_data import ShakeMapStationAmplitudes
-from finderutils import (FinderChannelList, FinderChannel, 
-                         FinderSolution, FinderRupture,
-                         FinderEvent)
-from finderutils import (read_event_solution_from_file, 
-                         read_rupture_polygon_from_file,
-                         read_finder_channels_from_file)
-from utils.dataformatter import (RRSMPeakMotionDataFormatter,
-                                 ESMShakeMapDataFormatter,
-                                 FinDerFormatterFromRawList,
-                                 get_epoch_time)
-from utils.station_merger import RawStationMeasurement
+from pyfinder import pyfinderconfig
+from paramws.clients import PeakMotionData, ShakeMapStationAmplitudes
+from pyfinder.finderutils import (FinderChannelList, FinderChannel,
+                                  FinderSolution, FinderRupture,
+                                  FinderEvent)
+from pyfinder.finderutils import (read_event_solution_from_file,
+                                  read_rupture_polygon_from_file,
+                                  read_finder_channels_from_file)
+from pyfinder.utils.dataformatter import (RRSMPeakMotionDataFormatter,
+                                          ESMShakeMapDataFormatter,
+                                          FinDerFormatterFromRawList,
+                                          get_epoch_time)
+from pyfinder.utils.station_merger import RawStationMeasurement
 
 class FinDerExecutable(object):
     """ Class for executing the FinDer executable. """
@@ -452,4 +451,3 @@ class FinDerExecutable(object):
 
         # Return the self object for further use
         return self
-            

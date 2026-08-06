@@ -9,10 +9,10 @@ from typing import List, Tuple
 import fnmatch
 from typing import Union
 from .calculator import Calculator
-from pyfinderconfig import pyfinderconfig
-from paramws.clients.services.shakemap_data import ShakeMapEventData, ShakeMapStationAmplitudes
-from paramws.clients.services.peakmotion_data import PeakMotionData
-from finderutils import FinderChannelList
+from pyfinder.pyfinderconfig import pyfinderconfig
+from paramws.clients import (PeakMotionData, ShakeMapEventData,
+                             ShakeMapStationAmplitudes)
+from pyfinder.finderutils import FinderChannelList
 from pyfinder.utils.station_merger import RawStationMeasurement
 
 # Thresholds for the RRSM peak motion data that are used to filter out
@@ -615,4 +615,3 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
         
         # Return the formatted data
         return "\n".join(data).encode("ascii"), finder_channels
-    
