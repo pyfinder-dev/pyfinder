@@ -60,6 +60,35 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
         values.update(overrides)
         return self.db.update_pending_emsc_metadata(**values)
 
+    def set_lifecycle_state(
+        self,
+        status,
+        retry_count=0,
+        event_id="event-1",
+        service="RRSM",
+        current_delay_time=5,
+    ):
+        """Prepare lifecycle state directly without using behavior under test."""
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE event_tracker
+                SET status = ?, retry_count = ?
+                WHERE event_id = ? AND service = ? AND current_delay_time = ?
+                """,
+                (
+                    status,
+                    retry_count,
+                    event_id,
+                    service,
+                    current_delay_time,
+                ),
+            )
+
+    def test_failed_is_intended_while_incomplete_remains_legacy(self):
+        self.assertEqual(database.STATUS_FAILED, "failed")
+        self.assertEqual(database.STATUS_INCOMPLETE, "incomplete")
+
     def test_single_scheduled_item_is_committed_with_supplied_fields(self):
         self.insert_item()
 
@@ -412,6 +441,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
 
     def test_completion_uses_fixed_write_and_preserves_timestamp_shape(self):
         self.insert_item()
+        self.set_lifecycle_state(database.STATUS_PROCESSING)
         completion_time = datetime(
             2026,
             8,
@@ -428,6 +458,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                 return completion_time
 
         monitored_cursor = mock.Mock(wraps=self.db.cursor)
+        monitored_cursor.rowcount = 1
         self.db.cursor = monitored_cursor
         with mock.patch.object(
             database,
@@ -438,7 +469,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
             "_update_event_fields",
             autospec=True,
         ) as generic_update:
-            self.db.mark_event_completed(
+            affected_rows = self.db.mark_event_completed(
                 event_id="event-1",
                 service="RRSM",
                 current_delay_time=5,
@@ -456,8 +487,10 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
                 "event-1",
                 "RRSM",
                 5,
+                database.STATUS_PROCESSING,
             ),
         )
+        self.assertEqual(affected_rows, 1)
         row = self.fetch_rows()[0]
         self.assertEqual(row["status"], database.STATUS_COMPLETED)
         self.assertEqual(
@@ -465,15 +498,397 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
             "2026-08-06T12:00:00+00:00",
         )
 
+    def test_processing_assignment_is_conditional_and_explicit(self):
+        self.insert_item()
+        processing_time = "2026-08-06T10:06:00+00:00"
+
+        affected_rows = self.db.mark_event_processing(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=5,
+            last_query_time=processing_time,
+        )
+
+        self.assertEqual(affected_rows, 1)
+        row = self.fetch_rows()[0]
+        self.assertEqual(row["status"], database.STATUS_PROCESSING)
+        self.assertEqual(row["last_query_time"], processing_time)
+        self.assertEqual(
+            self.db.mark_event_processing(
+                event_id="event-1",
+                service="RRSM",
+                current_delay_time=5,
+                last_query_time="2026-08-06T10:07:00+00:00",
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.db.mark_event_processing(
+                event_id="missing-event",
+                service="RRSM",
+                current_delay_time=5,
+                last_query_time=processing_time,
+            ),
+            0,
+        )
+
+    def test_processing_assignment_rejects_every_non_pending_state(self):
+        self.insert_item()
+        for state in (
+            database.STATUS_PROCESSING,
+            database.STATUS_COMPLETED,
+            database.STATUS_FAILED,
+            database.STATUS_INCOMPLETE,
+        ):
+            with self.subTest(state=state):
+                self.set_lifecycle_state(state)
+                before = self.fetch_rows()[0]
+                self.assertEqual(
+                    self.db.mark_event_processing(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=5,
+                        last_query_time="2026-08-06T12:00:00+00:00",
+                    ),
+                    0,
+                )
+                self.assertEqual(self.fetch_rows()[0], before)
+
+    def test_completion_rejects_missing_and_non_processing_rows(self):
+        self.insert_item()
+        for state in (
+            database.STATUS_PENDING,
+            database.STATUS_COMPLETED,
+            database.STATUS_FAILED,
+            database.STATUS_INCOMPLETE,
+        ):
+            with self.subTest(state=state):
+                self.set_lifecycle_state(state)
+                before = self.fetch_rows()[0]
+                self.assertEqual(
+                    self.db.mark_event_completed(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=5,
+                    ),
+                    0,
+                )
+                self.assertEqual(self.fetch_rows()[0], before)
+        self.assertEqual(
+            self.db.mark_event_completed(
+                event_id="missing-event",
+                service="RRSM",
+                current_delay_time=5,
+            ),
+            0,
+        )
+
+    def test_processing_retry_count_returns_each_newly_persisted_value(self):
+        self.insert_item()
+        self.set_lifecycle_state(database.STATUS_PROCESSING)
+
+        for expected_count in (1, 2, 3):
+            with self.subTest(expected_count=expected_count):
+                self.assertEqual(
+                    self.db.increment_processing_retry_count(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=5,
+                    ),
+                    expected_count,
+                )
+                self.assertEqual(
+                    self.fetch_rows()[0]["retry_count"],
+                    expected_count,
+                )
+
+    def test_retry_increment_rejects_missing_and_non_processing_rows(self):
+        self.insert_item()
+        self.assertIsNone(
+            self.db.increment_processing_retry_count(
+                event_id="missing-event",
+                service="RRSM",
+                current_delay_time=5,
+            )
+        )
+        for state in (
+            database.STATUS_PENDING,
+            database.STATUS_COMPLETED,
+            database.STATUS_FAILED,
+            database.STATUS_INCOMPLETE,
+        ):
+            with self.subTest(state=state):
+                self.set_lifecycle_state(state, retry_count=2)
+                self.assertIsNone(
+                    self.db.increment_processing_retry_count(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=5,
+                    )
+                )
+                self.assertEqual(self.fetch_rows()[0]["retry_count"], 2)
+
+    def test_retry_increment_execute_failure_rolls_back_increment(self):
+        self.insert_item()
+        self.set_lifecycle_state(database.STATUS_PROCESSING)
+        real_cursor = self.db.cursor
+        operation_error = sqlite3.OperationalError("readback failed")
+        monitored_cursor = mock.Mock(wraps=real_cursor)
+        real_connection = self.db.conn
+
+        def execute_with_readback_failure(statement, parameters=()):
+            if "SELECT retry_count" in statement:
+                raise operation_error
+            return real_cursor.execute(statement, parameters)
+
+        monitored_cursor.execute.side_effect = execute_with_readback_failure
+        monitored_connection = mock.Mock(wraps=real_connection)
+        self.db.cursor = monitored_cursor
+        self.db.conn = monitored_connection
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                self.db.increment_processing_retry_count(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                )
+        finally:
+            self.db.cursor = real_cursor
+            self.db.conn = real_connection
+
+        self.assertIs(raised.exception, operation_error)
+        monitored_connection.rollback.assert_called_once_with()
+        monitored_connection.commit.assert_not_called()
+        self.assertEqual(self.fetch_rows()[0]["retry_count"], 0)
+
+    def test_retry_increment_commit_failure_rolls_back_increment(self):
+        self.insert_item()
+        self.set_lifecycle_state(database.STATUS_PROCESSING)
+        real_connection = self.db.conn
+        operation_error = sqlite3.OperationalError("commit failed")
+        monitored_connection = mock.Mock(wraps=real_connection)
+        monitored_connection.commit.side_effect = operation_error
+        self.db.conn = monitored_connection
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                self.db.increment_processing_retry_count(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                )
+        finally:
+            self.db.conn = real_connection
+
+        self.assertIs(raised.exception, operation_error)
+        monitored_connection.rollback.assert_called_once_with()
+        self.assertEqual(self.fetch_rows()[0]["retry_count"], 0)
+
+    def test_retry_transition_persists_explicit_time_and_diagnostic(self):
+        self.insert_item()
+        self.set_lifecycle_state(database.STATUS_PROCESSING, retry_count=1)
+        retry_time = "2026-08-06T12:00:10+00:00"
+
+        affected_rows = self.db.mark_event_pending_for_retry(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=5,
+            last_error="provider unavailable",
+            next_query_time=retry_time,
+        )
+
+        self.assertEqual(affected_rows, 1)
+        row = self.fetch_rows()[0]
+        self.assertEqual(row["status"], database.STATUS_PENDING)
+        self.assertEqual(row["last_error"], "provider unavailable")
+        self.assertEqual(row["next_query_time"], retry_time)
+        self.assertEqual(row["retry_count"], 1)
+
+    def test_retry_transition_rejects_missing_and_non_processing_rows(self):
+        self.insert_item()
+        for state in (
+            database.STATUS_PENDING,
+            database.STATUS_COMPLETED,
+            database.STATUS_FAILED,
+            database.STATUS_INCOMPLETE,
+        ):
+            with self.subTest(state=state):
+                self.set_lifecycle_state(state)
+                before = self.fetch_rows()[0]
+                self.assertEqual(
+                    self.db.mark_event_pending_for_retry(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=5,
+                        last_error="new failure",
+                        next_query_time="2026-08-06T12:00:10+00:00",
+                    ),
+                    0,
+                )
+                self.assertEqual(self.fetch_rows()[0], before)
+        self.assertEqual(
+            self.db.mark_event_pending_for_retry(
+                event_id="missing-event",
+                service="RRSM",
+                current_delay_time=5,
+                last_error="new failure",
+                next_query_time="2026-08-06T12:00:10+00:00",
+            ),
+            0,
+        )
+
+    def test_terminal_failure_persists_processing_outcome(self):
+        failure_time = "2026-08-06T12:00:00+00:00"
+        self.insert_item()
+        self.set_lifecycle_state(database.STATUS_PROCESSING)
+
+        affected_rows = self.db.mark_event_failed(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=5,
+            last_error="required metadata missing",
+            last_query_time=failure_time,
+        )
+
+        self.assertEqual(affected_rows, 1)
+        row = self.fetch_rows()[0]
+        self.assertEqual(row["status"], database.STATUS_FAILED)
+        self.assertEqual(row["last_error"], "required metadata missing")
+        self.assertEqual(row["last_query_time"], failure_time)
+
+    def test_terminal_failure_rejects_pending_terminal_and_legacy_rows(self):
+        self.insert_item()
+        for state in (
+            database.STATUS_PENDING,
+            database.STATUS_COMPLETED,
+            database.STATUS_FAILED,
+            database.STATUS_INCOMPLETE,
+        ):
+            with self.subTest(state=state):
+                self.set_lifecycle_state(state)
+                before = self.fetch_rows()[0]
+                self.assertEqual(
+                    self.db.mark_event_failed(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=5,
+                        last_error="replacement failure",
+                        last_query_time="2026-08-06T12:00:00+00:00",
+                    ),
+                    0,
+                )
+                self.assertEqual(self.fetch_rows()[0], before)
+        self.assertEqual(
+            self.db.mark_event_failed(
+                event_id="missing-event",
+                service="RRSM",
+                current_delay_time=5,
+                last_error="replacement failure",
+                last_query_time="2026-08-06T12:00:00+00:00",
+            ),
+            0,
+        )
+
+    def test_startup_recovery_fails_all_and_only_processing_rows(self):
+        states = (
+            database.STATUS_PENDING,
+            database.STATUS_PROCESSING,
+            database.STATUS_PROCESSING,
+            database.STATUS_COMPLETED,
+            database.STATUS_FAILED,
+            database.STATUS_INCOMPLETE,
+        )
+        for delay, state in enumerate(states):
+            self.insert_item(
+                current_delay_time=delay,
+                next_delay_time=delay + 1,
+                expiration_time="2000-01-01T00:00:00+00:00",
+            )
+            self.set_lifecycle_state(state, current_delay_time=delay)
+        before = self.fetch_rows()
+
+        affected_rows = self.db.fail_abandoned_processing(
+            last_error="abandoned by local restart",
+            last_query_time="2026-08-06T12:00:00+00:00",
+        )
+
+        self.assertEqual(affected_rows, 2)
+        rows = self.fetch_rows()
+        self.assertEqual(
+            [row["status"] for row in rows],
+            [
+                database.STATUS_PENDING,
+                database.STATUS_FAILED,
+                database.STATUS_FAILED,
+                database.STATUS_COMPLETED,
+                database.STATUS_FAILED,
+                database.STATUS_INCOMPLETE,
+            ],
+        )
+        for row in rows[1:3]:
+            self.assertEqual(row["last_error"], "abandoned by local restart")
+        for index in (0, 3, 4, 5):
+            self.assertEqual(rows[index], before[index])
+        self.assertEqual(
+            self.db.fail_abandoned_processing(
+                last_error="second recovery must be a no-op",
+                last_query_time="2026-08-06T12:01:00+00:00",
+            ),
+            0,
+        )
+
     def test_active_writes_roll_back_execute_failures(self):
         operations = (
             ("metadata refresh", lambda: self.update_pending_metadata()),
+            (
+                "processing assignment",
+                lambda: self.db.mark_event_processing(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                    last_query_time="2026-08-06T12:00:00+00:00",
+                ),
+            ),
             (
                 "completion",
                 lambda: self.db.mark_event_completed(
                     event_id="event-1",
                     service="RRSM",
                     current_delay_time=5,
+                ),
+            ),
+            (
+                "retry increment",
+                lambda: self.db.increment_processing_retry_count(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                ),
+            ),
+            (
+                "paced retry",
+                lambda: self.db.mark_event_pending_for_retry(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                    last_error="failure",
+                    next_query_time="2026-08-06T12:00:10+00:00",
+                ),
+            ),
+            (
+                "terminal failure",
+                lambda: self.db.mark_event_failed(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                    last_error="failure",
+                    last_query_time="2026-08-06T12:00:00+00:00",
+                ),
+            ),
+            (
+                "startup recovery",
+                lambda: self.db.fail_abandoned_processing(
+                    last_error="abandoned",
+                    last_query_time="2026-08-06T12:00:00+00:00",
                 ),
             ),
             (
@@ -512,11 +927,55 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
         operations = (
             ("metadata refresh", lambda: self.update_pending_metadata()),
             (
+                "processing assignment",
+                lambda: self.db.mark_event_processing(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                    last_query_time="2026-08-06T12:00:00+00:00",
+                ),
+            ),
+            (
                 "completion",
                 lambda: self.db.mark_event_completed(
                     event_id="event-1",
                     service="RRSM",
                     current_delay_time=5,
+                ),
+            ),
+            (
+                "retry increment",
+                lambda: self.db.increment_processing_retry_count(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                ),
+            ),
+            (
+                "paced retry",
+                lambda: self.db.mark_event_pending_for_retry(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                    last_error="failure",
+                    next_query_time="2026-08-06T12:00:10+00:00",
+                ),
+            ),
+            (
+                "terminal failure",
+                lambda: self.db.mark_event_failed(
+                    event_id="event-1",
+                    service="RRSM",
+                    current_delay_time=5,
+                    last_error="failure",
+                    last_query_time="2026-08-06T12:00:00+00:00",
+                ),
+            ),
+            (
+                "startup recovery",
+                lambda: self.db.fail_abandoned_processing(
+                    last_error="abandoned",
+                    last_query_time="2026-08-06T12:00:00+00:00",
                 ),
             ),
             (
@@ -548,6 +1007,7 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
 
     def test_active_write_rollback_failure_does_not_mask_primary_error(self):
         self.insert_item()
+        self.set_lifecycle_state(database.STATUS_PROCESSING)
         real_connection = self.db.conn
         operation_error = sqlite3.OperationalError("commit failed")
         rollback_error = sqlite3.OperationalError("rollback failed")
@@ -557,11 +1017,10 @@ class ScheduledItemPersistenceTests(unittest.TestCase):
         self.db.conn = monitored_connection
 
         with self.assertRaises(sqlite3.OperationalError) as raised:
-            self.db._update_event_fields(
+            self.db.increment_processing_retry_count(
                 event_id="event-1",
                 service="RRSM",
                 current_delay_time=5,
-                last_error="failure",
             )
 
         self.assertIs(raised.exception, operation_error)

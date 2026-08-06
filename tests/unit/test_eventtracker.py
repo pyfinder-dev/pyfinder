@@ -69,6 +69,7 @@ class EventTrackerMetadataTests(unittest.TestCase):
         delay,
         status,
         next_query_time,
+        expiration_time="2099-01-01T00:00:00",
     ):
         self.tracker.register_new_schedule(
             event_id=event_id,
@@ -105,7 +106,7 @@ class EventTrackerMetadataTests(unittest.TestCase):
                     next_query_time,
                     delay + 1,
                     4,
-                    "2099-01-01T00:00:00",
+                    expiration_time,
                     7,
                     "old error",
                     "old hash",
@@ -461,16 +462,27 @@ class EventTrackerMetadataTests(unittest.TestCase):
             hasattr(eventtracker.EventTracker, "get_all_pending_events")
         )
 
-    def test_due_discovery_excludes_future_pending_and_incomplete_rows(self):
-        now = datetime.now(timezone.utc)
+    def test_failed_is_exported_while_incomplete_remains_compatible(self):
+        self.assertEqual(eventtracker.STATUS_FAILED, "failed")
+        self.assertEqual(eventtracker.STATUS_INCOMPLETE, "incomplete")
+
+    def test_due_discovery_keeps_expired_pending_catch_up_only(self):
+        now = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
         overdue = (now - timedelta(days=1)).isoformat(timespec="seconds")
         future = (now + timedelta(days=1)).isoformat(timespec="seconds")
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
         self.seed_row(
             "due-pending",
             "RRSM",
             0,
             database.STATUS_PENDING,
             overdue,
+            expiration_time="2000-01-01T00:00:00+00:00",
         )
         self.seed_row(
             "future-pending",
@@ -479,18 +491,19 @@ class EventTrackerMetadataTests(unittest.TestCase):
             database.STATUS_PENDING,
             future,
         )
-        self.seed_row(
-            "due-incomplete",
-            "RRSM",
-            0,
-            database.STATUS_INCOMPLETE,
-            overdue,
-        )
+        for event_id, state in (
+            ("due-processing", database.STATUS_PROCESSING),
+            ("due-completed", database.STATUS_COMPLETED),
+            ("due-failed", database.STATUS_FAILED),
+            ("due-incomplete", database.STATUS_INCOMPLETE),
+        ):
+            self.seed_row(event_id, "RRSM", 0, state, overdue)
 
-        self.assertEqual(
-            self.tracker.get_due_events(service="RRSM"),
-            [("due-pending", "RRSM", 0.0)],
-        )
+        with mock.patch.object(database, "datetime", FixedDateTime):
+            self.assertEqual(
+                self.tracker.get_due_events(service="RRSM"),
+                [("due-pending", "RRSM", 0.0)],
+            )
 
     def test_refresh_updates_all_and_only_matching_pending_rows(self):
         target_event = "target-event"
@@ -510,6 +523,9 @@ class EventTrackerMetadataTests(unittest.TestCase):
         )
         self.seed_row(
             target_event, "RRSM", 360, database.STATUS_INCOMPLETE, overdue
+        )
+        self.seed_row(
+            target_event, "RRSM", 720, database.STATUS_FAILED, overdue
         )
         self.seed_row(
             target_event, "OTHER", 0, database.STATUS_PENDING, overdue
@@ -633,19 +649,119 @@ class EventTrackerMetadataTests(unittest.TestCase):
             self.tracker._db,
             "mark_event_completed",
             autospec=True,
+            return_value=1,
         ) as mark_completed, mock.patch.object(
             self.tracker,
             "db_update_event_fields",
             autospec=True,
         ) as generic_update:
-            self.tracker.mark_completed("event-1", "RRSM", 15)
+            result = self.tracker.mark_completed("event-1", "RRSM", 15)
 
+        self.assertEqual(result, 1)
         mark_completed.assert_called_once_with(
             event_id="event-1",
             service="RRSM",
             current_delay_time=15,
         )
         generic_update.assert_not_called()
+
+    def test_lifecycle_boundaries_forward_named_values_and_results(self):
+        transition_time = datetime(
+            2026,
+            8,
+            6,
+            12,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return transition_time
+
+        with mock.patch.object(
+            eventtracker,
+            "datetime",
+            FixedDateTime,
+        ), mock.patch.object(
+            self.tracker._db,
+            "mark_event_processing",
+            return_value=1,
+        ) as mark_processing, mock.patch.object(
+            self.tracker._db,
+            "increment_processing_retry_count",
+            return_value=2,
+        ) as increment_retry, mock.patch.object(
+            self.tracker._db,
+            "mark_event_pending_for_retry",
+            return_value=1,
+        ) as mark_retry, mock.patch.object(
+            self.tracker._db,
+            "mark_event_failed",
+            return_value=1,
+        ) as mark_failed, mock.patch.object(
+            self.tracker._db,
+            "fail_abandoned_processing",
+            return_value=3,
+        ) as recover:
+            processing_result = self.tracker.mark_as_processing(
+                "event-1", "RRSM", 15
+            )
+            count_result = self.tracker.increment_retry_count(
+                "event-1", "RRSM", 15
+            )
+            retry_result = self.tracker.mark_for_retry(
+                "event-1",
+                "RRSM",
+                15,
+                "provider unavailable",
+            )
+            failed_result = self.tracker.mark_failed(
+                "event-1",
+                "RRSM",
+                15,
+                "retry limit reached",
+            )
+            recovery_result = self.tracker.recover_abandoned_processing(
+                error_message="abandoned by restart"
+            )
+
+        self.assertEqual(processing_result, 1)
+        self.assertEqual(count_result, 2)
+        self.assertEqual(retry_result, 1)
+        self.assertEqual(failed_result, 1)
+        self.assertEqual(recovery_result, 3)
+        mark_processing.assert_called_once_with(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=15,
+            last_query_time="2026-08-06T12:00:00+00:00",
+        )
+        increment_retry.assert_called_once_with(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=15,
+        )
+        mark_retry.assert_called_once_with(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=15,
+            last_error="provider unavailable",
+            next_query_time="2026-08-06T12:00:10+00:00",
+        )
+        mark_failed.assert_called_once_with(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=15,
+            last_error="retry limit reached",
+            last_query_time="2026-08-06T12:00:00+00:00",
+        )
+        recover.assert_called_once_with(
+            last_error="abandoned by restart",
+            last_query_time="2026-08-06T12:00:00+00:00",
+        )
 
     def test_existing_positional_schedule_arguments_keep_their_meaning(self):
         # Positional use is intentional in this compatibility test. Production

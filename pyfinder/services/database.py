@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
 STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
 STATUS_INCOMPLETE = "incomplete"
 
 
@@ -198,14 +199,44 @@ class ThreadSafeDB:
             ),
         )
 
-    def mark_event_completed(self, event_id, service, current_delay_time):
-        """Mark an event as completed with timestamp."""
-        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        self._execute_write(
+    def mark_event_processing(
+        self,
+        event_id,
+        service,
+        current_delay_time,
+        last_query_time,
+    ):
+        """Assign one known pending row to processing."""
+        return self._execute_write(
             statement='''
                 UPDATE event_tracker
                 SET status = ?, last_query_time = ?
-                WHERE event_id = ? AND service = ? AND current_delay_time = ?
+                WHERE event_id = ?
+                    AND service = ?
+                    AND current_delay_time = ?
+                    AND status = ?
+            ''',
+            parameters=(
+                STATUS_PROCESSING,
+                last_query_time,
+                event_id,
+                service,
+                current_delay_time,
+                STATUS_PENDING,
+            ),
+        )
+
+    def mark_event_completed(self, event_id, service, current_delay_time):
+        """Complete one processing row and return the affected-row count."""
+        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        return self._execute_write(
+            statement='''
+                UPDATE event_tracker
+                SET status = ?, last_query_time = ?
+                WHERE event_id = ?
+                    AND service = ?
+                    AND current_delay_time = ?
+                    AND status = ?
             ''',
             parameters=(
                 STATUS_COMPLETED,
@@ -213,6 +244,137 @@ class ThreadSafeDB:
                 event_id,
                 service,
                 current_delay_time,
+                STATUS_PROCESSING,
+            ),
+        )
+
+    def increment_processing_retry_count(
+        self,
+        event_id,
+        service,
+        current_delay_time,
+    ):
+        """Increment a processing row and return its newly committed count."""
+        with self._lock:
+            try:
+                self.cursor.execute('''
+                    UPDATE event_tracker
+                    SET retry_count = COALESCE(retry_count, 0) + 1
+                    WHERE event_id = ?
+                        AND service = ?
+                        AND current_delay_time = ?
+                        AND status = ?
+                ''', (
+                    event_id,
+                    service,
+                    current_delay_time,
+                    STATUS_PROCESSING,
+                ))
+                if self.cursor.rowcount == 0:
+                    self.conn.commit()
+                    return None
+
+                # Read the value before committing so the increment and value
+                # returned to orchestration describe the same transaction.
+                self.cursor.execute('''
+                    SELECT retry_count
+                    FROM event_tracker
+                    WHERE event_id = ?
+                        AND service = ?
+                        AND current_delay_time = ?
+                        AND status = ?
+                ''', (
+                    event_id,
+                    service,
+                    current_delay_time,
+                    STATUS_PROCESSING,
+                ))
+                row = self.cursor.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "Incremented processing row could not be read back"
+                    )
+                updated_count = row[0]
+                self.conn.commit()
+                return updated_count
+            except Exception as operation_error:
+                try:
+                    self.conn.rollback()
+                except Exception as rollback_error:
+                    raise operation_error from rollback_error
+                raise
+
+    def mark_event_pending_for_retry(
+        self,
+        event_id,
+        service,
+        current_delay_time,
+        last_error,
+        next_query_time,
+    ):
+        """Return one processing row to pending at an explicit retry time."""
+        return self._execute_write(
+            statement='''
+                UPDATE event_tracker
+                SET status = ?, last_error = ?, next_query_time = ?
+                WHERE event_id = ?
+                    AND service = ?
+                    AND current_delay_time = ?
+                    AND status = ?
+            ''',
+            parameters=(
+                STATUS_PENDING,
+                last_error,
+                next_query_time,
+                event_id,
+                service,
+                current_delay_time,
+                STATUS_PROCESSING,
+            ),
+        )
+
+    def mark_event_failed(
+        self,
+        event_id,
+        service,
+        current_delay_time,
+        last_error,
+        last_query_time,
+    ):
+        """Fail one processing row without consuming pending catch-up work."""
+        return self._execute_write(
+            statement='''
+                UPDATE event_tracker
+                SET status = ?, last_error = ?, last_query_time = ?
+                WHERE event_id = ?
+                    AND service = ?
+                    AND current_delay_time = ?
+                    AND status = ?
+            ''',
+            parameters=(
+                STATUS_FAILED,
+                last_error,
+                last_query_time,
+                event_id,
+                service,
+                current_delay_time,
+                STATUS_PROCESSING,
+            ),
+        )
+
+    def fail_abandoned_processing(self, last_error, last_query_time):
+        """Fail every row left processing by an earlier local runtime."""
+        return self._execute_write(
+            statement='''
+                UPDATE event_tracker
+                SET status = ?, last_error = ?, last_query_time = ?
+                WHERE status = ?
+            ''',
+            parameters=(
+                STATUS_FAILED,
+                last_error,
+                last_query_time,
+                STATUS_PROCESSING,
             ),
         )
 

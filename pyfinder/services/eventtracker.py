@@ -11,6 +11,7 @@ from pyfinder.services.database import (
     STATUS_PENDING,
     STATUS_PROCESSING,
     STATUS_COMPLETED,
+    STATUS_FAILED,
     STATUS_INCOMPLETE
 )
 from datetime import datetime, timedelta, timezone
@@ -80,24 +81,21 @@ class EventTracker:
         return self._db.fetch_due_events(service=service)
 
     def mark_completed(self, event_id, service, current_delay_time):
-        """Mark event as completed with timestamp."""
-        self._db.mark_event_completed(
+        """Complete one processing row and report whether it changed."""
+        return self._db.mark_event_completed(
             event_id=event_id,
             service=service,
             current_delay_time=current_delay_time,
         )
 
     def mark_as_processing(self, event_id, service, current_delay_time):
-        """Mark an event as currently being processed."""
+        """Assign one known pending row and report whether it changed."""
         now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        self.db_update_event_fields(
+        return self._db.mark_event_processing(
             event_id=event_id,
             service=service,
             current_delay_time=current_delay_time,
-            **{
-                self.Field.status: STATUS_PROCESSING,
-                self.Field.last_query_time: now,
-            },
+            last_query_time=now,
         )
 
     def cleanup_expired(self):
@@ -142,36 +140,56 @@ class EventTracker:
         return meta
 
     def mark_failed(self, event_id, service, current_delay_time, error_message):
-        """Mark an event as failed and log the error message."""
+        """Fail one processing row and report whether it changed."""
         now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        self.db_update_event_fields(
+        return self._db.mark_event_failed(
             event_id=event_id,
             service=service,
             current_delay_time=current_delay_time,
-            **{
-                self.Field.status: STATUS_INCOMPLETE,
-                self.Field.last_error: error_message,
-                self.Field.last_query_time: now,
-            },
+            last_error=error_message,
+            last_query_time=now,
         )
 
     def increment_retry_count(self, event_id, service, current_delay_time):
-        """Increment the retry count for a given event and service."""
-        meta = self.get_event_meta(
+        """Increment a processing row and return its persisted count."""
+        return self._db.increment_processing_retry_count(
             event_id=event_id,
             service=service,
             current_delay_time=current_delay_time,
         )
-        if not meta:
-            return
-        retry = (meta.get(self.Field.retry_count) or 0) + 1
-        self.db_update_event_fields(
+
+    def mark_for_retry(
+        self,
+        event_id,
+        service,
+        current_delay_time,
+        error_message,
+    ):
+        """Return processing work to pending ten seconds after failure."""
+        failure_time = datetime.now(timezone.utc)
+        next_query_time = (
+            failure_time + timedelta(seconds=10)
+        ).isoformat(timespec='seconds')
+        return self._db.mark_event_pending_for_retry(
             event_id=event_id,
             service=service,
             current_delay_time=current_delay_time,
-            **{
-                self.Field.retry_count: retry,
-            },
+            last_error=error_message,
+            next_query_time=next_query_time,
+        )
+
+    def recover_abandoned_processing(
+        self,
+        error_message=(
+            "PyFinder restarted while this scheduled item was processing; "
+            "the local execution was abandoned."
+        ),
+    ):
+        """Fail all processing rows abandoned by an earlier local runtime."""
+        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        return self._db.fail_abandoned_processing(
+            last_error=error_message,
+            last_query_time=now,
         )
 
     def query_by_priority(self, min_priority=1):
