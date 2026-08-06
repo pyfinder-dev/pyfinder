@@ -80,22 +80,42 @@ class EventTrackerMetadataTests(unittest.TestCase):
             next_query_time=next_query_time,
             emsc_alert_json='{"version": "old"}',
         )
-        self.tracker.db_update_event_fields(
-            event_id,
-            service,
-            delay,
-            status=status,
-            last_query_time="2000-01-01T00:02:00",
-            next_query_time=next_query_time,
-            next_delay_time=delay + 1,
-            retry_count=4,
-            expiration_time="2099-01-01T00:00:00",
-            priority=7,
-            last_error="old error",
-            last_data_hash="old hash",
-            last_data_snapshot="old downstream snapshot",
-            last_modified="2000-01-01T00:03:00",
-        )
+        # Fixture-only schema setup must not define which fields the
+        # transitional production mutation API is allowed to change.
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE event_tracker
+                SET status = ?,
+                    last_query_time = ?,
+                    next_query_time = ?,
+                    next_delay_time = ?,
+                    retry_count = ?,
+                    expiration_time = ?,
+                    priority = ?,
+                    last_error = ?,
+                    last_data_hash = ?,
+                    last_data_snapshot = ?,
+                    last_modified = ?
+                WHERE event_id = ? AND service = ? AND current_delay_time = ?
+                """,
+                (
+                    status,
+                    "2000-01-01T00:02:00",
+                    next_query_time,
+                    delay + 1,
+                    4,
+                    "2099-01-01T00:00:00",
+                    7,
+                    "old error",
+                    "old hash",
+                    "old downstream snapshot",
+                    "2000-01-01T00:03:00",
+                    event_id,
+                    service,
+                    delay,
+                ),
+            )
 
     def apply(self, event_id, action="create", **metadata):
         alert = {"action": action, "extra": "preserved"}
@@ -352,6 +372,125 @@ class EventTrackerMetadataTests(unittest.TestCase):
             (eventtracker.EventTracker.RESULT_REFRESHED, 8),
         )
         self.assertEqual(len(self.fetch_rows(event_id, "RRSM")), 8)
+
+    def test_scheduler_metadata_always_contains_derived_region_on_a_copy(self):
+        cases = (
+            ("valid", '{"flynn_region": "Northern Italy"}', "Northern Italy"),
+            ("absent", None, None),
+            ("empty", "", None),
+            ("missing member", '{"action": "create"}', None),
+            ("malformed", "{not-json", None),
+            ("explicit null", '{"flynn_region": null}', None),
+        )
+        for label, snapshot, expected_region in cases:
+            with self.subTest(label=label):
+                stored_meta = {
+                    "event_id": "event-1",
+                    "emsc_alert_json": snapshot,
+                }
+                with mock.patch.object(
+                    self.tracker._db,
+                    "get_event_meta",
+                    return_value=stored_meta,
+                ):
+                    result = self.tracker.get_event_meta(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=0,
+                    )
+
+                self.assertIsInstance(result, dict)
+                self.assertIn(eventtracker.EventTracker.Field.region, result)
+                self.assertEqual(
+                    result[eventtracker.EventTracker.Field.region],
+                    expected_region,
+                )
+                self.assertIsNot(result, stored_meta)
+                self.assertNotIn(
+                    eventtracker.EventTracker.Field.region,
+                    stored_meta,
+                )
+
+    def test_removed_registration_passthrough_arguments_fail_loudly(self):
+        common_registration = {
+            "event_id": "override-event",
+            "service": "RRSM",
+            "origin_time": "2026-08-06T10:00:00+00:00",
+            "last_update_time": "2026-08-06T10:01:00+00:00",
+            "current_delay_time": 0,
+            "next_delay_time": 5,
+            "next_query_time": "2026-08-06T10:00:00+00:00",
+        }
+        with self.assertRaises(TypeError):
+            self.tracker.register_new_schedule(
+                **common_registration,
+                status=database.STATUS_COMPLETED,
+            )
+
+        with self.assertRaises(TypeError):
+            self.tracker.batch_register_from_policy(
+                event_id="batch-override-event",
+                policy=self.policy,
+                origin_time="2026-08-06T10:00:00+00:00",
+                last_update_time="2026-08-06T10:01:00+00:00",
+                priority=99,
+            )
+
+        self.assertEqual(self.fetch_rows(), [])
+
+    def test_named_schedule_registration_persists_pending_initial_state(self):
+        self.tracker.register_new_schedule(
+            event_id="named-event",
+            service="RRSM",
+            origin_time="2026-08-06T10:00:00+00:00",
+            last_update_time="2026-08-06T10:01:00+00:00",
+            current_delay_time=0,
+            next_delay_time=5,
+            next_query_time="2026-08-06T10:00:00+00:00",
+            emsc_alert_json='{"action": "create"}',
+            expiration_days=5,
+        )
+
+        rows = self.fetch_rows("named-event", "RRSM")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], database.STATUS_PENDING)
+        self.assertEqual(rows[0]["current_delay_time"], 0)
+
+    def test_obsolete_all_pending_wrapper_is_absent(self):
+        self.assertFalse(
+            hasattr(eventtracker.EventTracker, "get_all_pending_events")
+        )
+
+    def test_due_discovery_excludes_future_pending_and_incomplete_rows(self):
+        now = datetime.now(timezone.utc)
+        overdue = (now - timedelta(days=1)).isoformat(timespec="seconds")
+        future = (now + timedelta(days=1)).isoformat(timespec="seconds")
+        self.seed_row(
+            "due-pending",
+            "RRSM",
+            0,
+            database.STATUS_PENDING,
+            overdue,
+        )
+        self.seed_row(
+            "future-pending",
+            "RRSM",
+            0,
+            database.STATUS_PENDING,
+            future,
+        )
+        self.seed_row(
+            "due-incomplete",
+            "RRSM",
+            0,
+            database.STATUS_INCOMPLETE,
+            overdue,
+        )
+
+        self.assertEqual(
+            self.tracker.get_due_events(service="RRSM"),
+            [("due-pending", "RRSM", 0.0)],
+        )
 
     def test_refresh_updates_all_and_only_matching_pending_rows(self):
         target_event = "target-event"

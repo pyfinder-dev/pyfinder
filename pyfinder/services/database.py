@@ -21,6 +21,27 @@ STATUS_INCOMPLETE = "incomplete"
 
 class ThreadSafeDB:
     _lock = threading.Lock()
+    SCHEDULER_METADATA_FIELDS = (
+        "event_id",
+        "service",
+        "origin_time",
+        "last_query_time",
+        "next_query_time",
+        "status",
+        "retry_count",
+        "expiration_time",
+        "current_delay_time",
+        "next_delay_time",
+        "emsc_alert_json",
+        "last_data_snapshot",
+    )
+    _MUTABLE_EVENT_FIELDS = frozenset({
+        "status",
+        "last_query_time",
+        "last_error",
+        "retry_count",
+        "next_query_time",
+    })
 
     def __init__(self, db_path="event_update_follow_up.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -64,37 +85,59 @@ class ThreadSafeDB:
         """Calculate a hash of the provided data for change detection."""
         return hashlib.sha256(data.encode('utf-8')).hexdigest()
 
+    def _execute_write(self, statement, parameters):
+        """Execute one write while preserving its primary failure on rollback."""
+        with self._lock:
+            try:
+                self.cursor.execute(statement, parameters)
+                affected_rows = self.cursor.rowcount
+                self.conn.commit()
+                return affected_rows
+            except Exception as operation_error:
+                # A failed write or commit must not leave an open transaction
+                # that a later operation could commit accidentally.
+                try:
+                    self.conn.rollback()
+                except Exception as rollback_error:
+                    # Keep the write or commit error primary while retaining
+                    # the rollback failure as useful secondary context.
+                    raise operation_error from rollback_error
+                raise
+
     def insert_scheduled_item(
             self, event_id, service, origin_time, last_update_time,
             next_query_time, expiration_time=None, current_delay_time=None,
-            next_delay_time=None, emsc_alert_json=None, status=STATUS_PENDING):
+            next_delay_time=None, emsc_alert_json=None):
         """Persist one scheduled item and commit it independently."""
         if next_query_time is None:
             raise ValueError("A scheduled item requires next_query_time")
+        if current_delay_time is None:
+            raise ValueError("A scheduled item requires current_delay_time")
 
-        with self._lock:
-            try:
-                self.cursor.execute('''
+        self._execute_write(
+            statement='''
                 INSERT INTO event_tracker (
                     event_id, service, status, origin_time, last_update_time,
                     last_query_time, next_query_time, retry_count,
                     expiration_time,
                     current_delay_time, next_delay_time, emsc_alert_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (event_id, service, status, origin_time, last_update_time, None,
-                      next_query_time, 0, expiration_time, current_delay_time,
-                      next_delay_time, emsc_alert_json))
-                self.conn.commit()
-            except Exception as operation_error:
-                # One failed delay stage must leave this connection ready for
-                # later best-effort stages without disturbing prior commits.
-                try:
-                    self.conn.rollback()
-                except Exception as rollback_error:
-                    # The insertion or commit failure is the primary failure.
-                    # Keep it visible while retaining rollback context.
-                    raise operation_error from rollback_error
-                raise
+            ''',
+            parameters=(
+                event_id,
+                service,
+                STATUS_PENDING,
+                origin_time,
+                last_update_time,
+                None,
+                next_query_time,
+                0,
+                expiration_time,
+                current_delay_time,
+                next_delay_time,
+                emsc_alert_json,
+            ),
+        )
 
     def fetch_due_events(self, service=None):
         """Fetch events that are due for querying, optionally filtered by service."""
@@ -135,15 +178,16 @@ class ThreadSafeDB:
         last_modified,
     ):
         """Refresh EMSC metadata on every matching pending scheduled row."""
-        with self._lock:
-            self.cursor.execute('''
+        return self._execute_write(
+            statement='''
                 UPDATE event_tracker
                 SET origin_time = ?,
                     last_update_time = ?,
                     emsc_alert_json = ?,
                     last_modified = ?
                 WHERE event_id = ? AND service = ? AND status = ?
-            ''', (
+            ''',
+            parameters=(
                 origin_time,
                 last_update_time,
                 emsc_alert_json,
@@ -151,20 +195,25 @@ class ThreadSafeDB:
                 event_id,
                 service,
                 STATUS_PENDING,
-            ))
-            updated_rows = self.cursor.rowcount
-            self.conn.commit()
-            return updated_rows
+            ),
+        )
 
     def mark_event_completed(self, event_id, service, current_delay_time):
         """Mark an event as completed with timestamp."""
         now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        self._update_event_fields(
-            event_id,
-            service,
-            current_delay_time=current_delay_time,
-            status=STATUS_COMPLETED,
-            last_query_time=now
+        self._execute_write(
+            statement='''
+                UPDATE event_tracker
+                SET status = ?, last_query_time = ?
+                WHERE event_id = ? AND service = ? AND current_delay_time = ?
+            ''',
+            parameters=(
+                STATUS_COMPLETED,
+                now,
+                event_id,
+                service,
+                current_delay_time,
+            ),
         )
 
     def cleanup_expired_events(self):
@@ -183,20 +232,17 @@ class ThreadSafeDB:
             self.conn.close()
 
     def get_event_meta(self, event_id, service, current_delay_time):
+        """Return the stored metadata used by scheduler execution paths."""
+        selected_columns = ", ".join(self.SCHEDULER_METADATA_FIELDS)
         with self._lock:
-            self.cursor.execute('''
-            SELECT event_id, service, origin_time, last_query_time, next_query_time, status, 
-                retry_count, expiration_time,
-                current_delay_time, next_delay_time, emsc_alert_json, last_data_snapshot
+            self.cursor.execute(f'''
+            SELECT {selected_columns}
             FROM event_tracker
             WHERE event_id = ? AND service = ? AND current_delay_time = ?
             ''', (event_id, service, current_delay_time))
             row = self.cursor.fetchone()
             if row:
-                keys = ["event_id", "service", "origin_time", "last_query_time", "next_query_time", "status",
-                        "retry_count", "expiration_time",
-                        "current_delay_time", "next_delay_time", "emsc_alert_json", "last_data_snapshot"]
-                return dict(zip(keys, row))
+                return dict(zip(self.SCHEDULER_METADATA_FIELDS, row))
             return None
 
 
@@ -213,8 +259,16 @@ class ThreadSafeDB:
 
     def _update_event_fields(self, event_id, service, current_delay_time, **kwargs):
         """
-        Update specific fields of an event.
+        Update the narrow lifecycle fields still required by the scheduler.
         """
+        invalid_fields = set(kwargs) - self._MUTABLE_EVENT_FIELDS
+        if invalid_fields:
+            raise ValueError(
+                "Unsupported mutable event fields: {0}".format(
+                    ", ".join(sorted(invalid_fields))
+                )
+            )
+
         columns = []
         values = []
         for key, value in kwargs.items():
@@ -224,10 +278,11 @@ class ThreadSafeDB:
         if not columns:
             return
         values.extend([event_id, service, current_delay_time])
-        with self._lock:
-            self.cursor.execute(f'''
+        self._execute_write(
+            statement=f'''
                 UPDATE event_tracker
                 SET {", ".join(columns)}
                 WHERE event_id = ? AND service = ? AND current_delay_time = ?
-            ''', values)
-            self.conn.commit()
+            ''',
+            parameters=values,
+        )
