@@ -6,6 +6,8 @@ the ThreadSafeDB class to provide a relatively higher-level interface for managi
 events, including registering, updating, and querying.
 """
 
+from collections.abc import Mapping
+
 from pyfinder.services.database import ThreadSafeDB
 from datetime import datetime, timedelta, timezone
 import json
@@ -55,6 +57,8 @@ class EventTracker:
         emsc_alert_json = "emsc_alert_json"
         last_modified = "last_modified"
         region = "region"
+        emsc_latitude = "emsc_latitude"
+        emsc_longitude = "emsc_longitude"
         
     def __init__(self, db_path="event_update_follow_up.db", logger=None):
         self._db = ThreadSafeDB(db_path)
@@ -98,7 +102,7 @@ class EventTracker:
         self._db.close()
 
     def get_event_meta(self, event_id, service, current_delay_time):
-        """Return scheduler-facing metadata with an EMSC-derived region."""
+        """Return scheduler metadata with values derived from the EMSC alert."""
         stored_meta = self._db.get_event_meta(
             event_id=event_id,
             service=service,
@@ -109,14 +113,21 @@ class EventTracker:
 
         meta = dict(stored_meta)
         meta[self.Field.region] = None
+        meta[self.Field.emsc_latitude] = None
+        meta[self.Field.emsc_longitude] = None
         alert_json = meta.get(self.Field.emsc_alert_json)
         if alert_json:
             try:
                 parsed = json.loads(alert_json)
-                if isinstance(parsed, dict):
+                if isinstance(parsed, Mapping):
                     region = parsed.get("flynn_region")
                     if region is not None:
                         meta[self.Field.region] = str(region)
+                    # Coordinate validation belongs to the computational-profile
+                    # selector. This adapter must preserve the persisted EMSC
+                    # values exactly so that boundary can make the decision.
+                    meta[self.Field.emsc_latitude] = parsed.get("lat")
+                    meta[self.Field.emsc_longitude] = parsed.get("lon")
             except (TypeError, ValueError):
                 pass
         return meta

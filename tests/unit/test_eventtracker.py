@@ -371,13 +371,162 @@ class EventTrackerMetadataTests(unittest.TestCase):
         )
         self.assertEqual(len(self.fetch_rows(event_id, "RRSM")), 8)
 
-    def test_scheduler_metadata_always_contains_derived_region_on_a_copy(self):
+    def test_scheduler_metadata_exposes_raw_emsc_coordinates_on_a_copy(self):
+        stored_meta = {
+            "event_id": "event-1",
+            "emsc_alert_json": json.dumps(
+                {
+                    "flynn_region": 17,
+                    "lat": 45.25,
+                    "lon": 7.75,
+                }
+            ),
+        }
+        with mock.patch.object(
+            self.tracker._db,
+            "get_event_meta",
+            return_value=stored_meta,
+        ) as get_event_meta:
+            result = self.tracker.get_event_meta(
+                event_id="event-1",
+                service="RRSM",
+                current_delay_time=0,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result[eventtracker.EventTracker.Field.region], "17")
+        self.assertEqual(
+            result[eventtracker.EventTracker.Field.emsc_latitude],
+            45.25,
+        )
+        self.assertEqual(
+            result[eventtracker.EventTracker.Field.emsc_longitude],
+            7.75,
+        )
+        self.assertIsNot(result, stored_meta)
+        self.assertNotIn(eventtracker.EventTracker.Field.region, stored_meta)
+        self.assertNotIn(
+            eventtracker.EventTracker.Field.emsc_latitude,
+            stored_meta,
+        )
+        self.assertNotIn(
+            eventtracker.EventTracker.Field.emsc_longitude,
+            stored_meta,
+        )
+        get_event_meta.assert_called_once_with(
+            event_id="event-1",
+            service="RRSM",
+            current_delay_time=0,
+        )
+
+    def test_scheduler_metadata_preserves_all_raw_coordinate_value_types(self):
+        cases = (
+            ("numeric strings", "45.25", "7.75"),
+            ("booleans", True, False),
+            ("invalid strings", "north", "east"),
+            ("out of range", 91, -181),
+        )
+        for label, latitude, longitude in cases:
+            with self.subTest(label=label):
+                stored_meta = {
+                    "emsc_alert_json": json.dumps(
+                        {"lat": latitude, "lon": longitude}
+                    )
+                }
+                with mock.patch.object(
+                    self.tracker._db,
+                    "get_event_meta",
+                    return_value=stored_meta,
+                ):
+                    result = self.tracker.get_event_meta(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=0,
+                    )
+
+                actual_latitude = result[
+                    eventtracker.EventTracker.Field.emsc_latitude
+                ]
+                actual_longitude = result[
+                    eventtracker.EventTracker.Field.emsc_longitude
+                ]
+                self.assertEqual(actual_latitude, latitude)
+                self.assertEqual(actual_longitude, longitude)
+                self.assertIs(type(actual_latitude), type(latitude))
+                self.assertIs(type(actual_longitude), type(longitude))
+
+    def test_scheduler_metadata_handles_missing_and_null_coordinates_independently(self):
+        cases = (
+            ("both missing", {}, None, None),
+            ("longitude missing", {"lat": 45.25}, 45.25, None),
+            ("latitude missing", {"lon": 7.75}, None, 7.75),
+            ("both null", {"lat": None, "lon": None}, None, None),
+        )
+        for label, alert, expected_latitude, expected_longitude in cases:
+            with self.subTest(label=label):
+                with mock.patch.object(
+                    self.tracker._db,
+                    "get_event_meta",
+                    return_value={"emsc_alert_json": json.dumps(alert)},
+                ):
+                    result = self.tracker.get_event_meta(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=0,
+                    )
+
+                self.assertEqual(
+                    result[eventtracker.EventTracker.Field.emsc_latitude],
+                    expected_latitude,
+                )
+                self.assertEqual(
+                    result[eventtracker.EventTracker.Field.emsc_longitude],
+                    expected_longitude,
+                )
+
+    def test_scheduler_metadata_defaults_derived_fields_for_unusable_json(self):
+        absent = object()
+        cases = (
+            ("absent", absent),
+            ("null database value", None),
+            ("empty", ""),
+            ("malformed", "{not-json"),
+            ("array", "[]"),
+            ("string", '"alert"'),
+            ("number", "17"),
+            ("JSON null", "null"),
+        )
+        for label, snapshot in cases:
+            with self.subTest(label=label):
+                stored_meta = {}
+                if snapshot is not absent:
+                    stored_meta["emsc_alert_json"] = snapshot
+                with mock.patch.object(
+                    self.tracker._db,
+                    "get_event_meta",
+                    return_value=stored_meta,
+                ):
+                    result = self.tracker.get_event_meta(
+                        event_id="event-1",
+                        service="RRSM",
+                        current_delay_time=0,
+                    )
+
+                self.assertIsNone(
+                    result[eventtracker.EventTracker.Field.region]
+                )
+                self.assertIsNone(
+                    result[eventtracker.EventTracker.Field.emsc_latitude]
+                )
+                self.assertIsNone(
+                    result[eventtracker.EventTracker.Field.emsc_longitude]
+                )
+
+    def test_scheduler_metadata_preserves_flynn_region_behavior(self):
         cases = (
             ("valid", '{"flynn_region": "Northern Italy"}', "Northern Italy"),
-            ("absent", None, None),
-            ("empty", "", None),
+            ("non-string", '{"flynn_region": 17}', "17"),
             ("missing member", '{"action": "create"}', None),
-            ("malformed", "{not-json", None),
             ("explicit null", '{"flynn_region": null}', None),
         )
         for label, snapshot, expected_region in cases:
@@ -403,11 +552,31 @@ class EventTrackerMetadataTests(unittest.TestCase):
                     result[eventtracker.EventTracker.Field.region],
                     expected_region,
                 )
-                self.assertIsNot(result, stored_meta)
-                self.assertNotIn(
-                    eventtracker.EventTracker.Field.region,
-                    stored_meta,
+                self.assertIsNone(
+                    result[eventtracker.EventTracker.Field.emsc_latitude]
                 )
+                self.assertIsNone(
+                    result[eventtracker.EventTracker.Field.emsc_longitude]
+                )
+
+    def test_scheduler_metadata_returns_none_when_database_row_is_missing(self):
+        with mock.patch.object(
+            self.tracker._db,
+            "get_event_meta",
+            return_value=None,
+        ) as get_event_meta:
+            result = self.tracker.get_event_meta(
+                event_id="missing-event",
+                service="RRSM",
+                current_delay_time=15,
+            )
+
+        self.assertIsNone(result)
+        get_event_meta.assert_called_once_with(
+            event_id="missing-event",
+            service="RRSM",
+            current_delay_time=15,
+        )
 
     def test_removed_registration_passthrough_arguments_fail_loudly(self):
         common_registration = {
