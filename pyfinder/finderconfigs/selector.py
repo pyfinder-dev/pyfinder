@@ -63,6 +63,26 @@ class FinderConfigSelector:
         return resource_root.joinpath(filename)
 
     @staticmethod
+    def _native_line_error(configuration):
+        """Return why a mapping entry cannot form one native config line."""
+        for key, value in configuration.items():
+            if not isinstance(key, str) or not key:
+                return "native field names must be non-empty strings"
+            if any(character.isspace() for character in key):
+                return "native field names must not contain whitespace"
+
+            try:
+                rendered_value = str(value)
+            except Exception as exc:
+                return "native field value conversion failed: {0}: {1}".format(
+                    type(exc).__name__,
+                    exc,
+                )
+            if "\r" in rendered_value or "\n" in rendered_value:
+                return "native field values must not contain line breaks"
+        return None
+
+    @staticmethod
     def _validate_global_profile(global_profile):
         name = getattr(global_profile, "name", None)
         wkt_filename = getattr(global_profile, "wkt_filename", None)
@@ -83,6 +103,14 @@ class FinderConfigSelector:
         if "DATA_FOLDER" not in configuration:
             raise GlobalFinderConfigError(
                 "The global FinDer configuration must define DATA_FOLDER."
+            )
+        native_line_error = FinderConfigSelector._native_line_error(
+            configuration
+        )
+        if native_line_error is not None:
+            raise GlobalFinderConfigError(
+                "The global FinDer configuration cannot be written as native "
+                "key/value lines: {0}.".format(native_line_error)
             )
 
         try:
@@ -254,12 +282,18 @@ class FinderConfigSelector:
     def _resolved_regional_profile(self, profile):
         profile_name = getattr(profile, "name", None)
         configuration = getattr(profile, "configuration", None)
+        native_line_error = (
+            self._native_line_error(configuration)
+            if isinstance(configuration, Mapping) and configuration
+            else None
+        )
         if (
             not isinstance(profile_name, str)
             or not profile_name.strip()
             or not isinstance(configuration, Mapping)
             or not configuration
             or frozenset(configuration) != self._global_keys
+            or native_line_error is not None
         ):
             return self._global_fallback(
                 "Selected regional FinDer configuration {0!r} is missing, "

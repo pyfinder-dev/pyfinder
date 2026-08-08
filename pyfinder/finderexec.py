@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """ Module for executing the FinDer executable, namely the FinDer file. """
 
+from collections.abc import Mapping
+from copy import deepcopy
 import os
 import subprocess
 import sys
@@ -8,7 +10,6 @@ import json
 from typing import List
 from datetime import datetime
 from pyfinder.utils import customlogger
-from pyfinder import pyfinderconfig
 from paramws.clients import PeakMotionData, ShakeMapStationAmplitudes
 from pyfinder.finderutils import (FinderChannelList, FinderChannel,
                                   FinderSolution, FinderRupture,
@@ -24,9 +25,39 @@ from pyfinder.utils.station_merger import RawStationMeasurement
 
 class FinDerExecutable(object):
     """ Class for executing the FinDer executable. """
-    def __init__(self, options: dict, configuration: dict):
+    def __init__(
+        self,
+        options: dict,
+        configuration: dict,
+        finder_configuration_name,
+        finder_configuration,
+    ):
         # Options from the command line arguments
         self.options: dict = options
+
+        if (
+            not isinstance(finder_configuration_name, str)
+            or not finder_configuration_name.strip()
+        ):
+            raise ValueError(
+                "finder_configuration_name must be a non-empty string"
+            )
+        if (
+            not isinstance(finder_configuration, Mapping)
+            or not finder_configuration
+        ):
+            raise ValueError(
+                "finder_configuration must be a non-empty mapping"
+            )
+        try:
+            execution_configuration = deepcopy(dict(finder_configuration))
+        except Exception as exc:
+            raise ValueError(
+                "finder_configuration cannot be isolated for execution"
+            ) from exc
+
+        self.finder_configuration_name = finder_configuration_name
+        self.finder_configuration = execution_configuration
 
         # User-defined configuration
         self.configuration: dict = configuration
@@ -175,10 +206,16 @@ class FinDerExecutable(object):
     def _write_finder_configuration(self):
         """ Write the FinDer configuration file under the working directory. """
         self.logger.info("Writing the FinDer configuration file...")
+        self.logger.info(
+            "Selected FinDer configuration: %s",
+            self.finder_configuration_name,
+        )
 
         try:
-            # The template configuration for the FinDer executable (finder_file)
-            finder_file_config = pyfinderconfig.finder_file_config_template
+            # Materialization works from another execution-local copy. Replacing
+            # DATA_FOLDER for this run must not alter the mapping retained by the
+            # executable or any upstream selector/manager-owned dictionary.
+            finder_file_config = deepcopy(self.finder_configuration)
 
             # Change the data folder to the working directory. This is where FinDer
             # will create 'temp' and 'temp_data' directories to dump its output.
@@ -187,7 +224,7 @@ class FinDerExecutable(object):
             # Write the configuration to the working directory
             config_file_path = os.path.join(self.working_directory, "finder_file.config")
 
-            with open(config_file_path, "w") as config_file:
+            with open(config_file_path, "w", encoding="utf-8") as config_file:
                 for key, value in finder_file_config.items():
                     config_file.write("{} {}\n".format(key, value))
 
@@ -196,10 +233,11 @@ class FinDerExecutable(object):
             # Log the configuration file path
             self.logger.info("FinDer configuration file: {}".format(config_file_path))
 
-            # Log the configuration. Remove json-specific formatting for better readability
-            dumps_config = json.dumps(finder_file_config, indent=4)
-            dumps_config = dumps_config.replace('"', '').replace(',', '')
-            self.logger.debug(f"FinDer configuration: {dumps_config}")
+            rendered_config = "\n".join(
+                "{} {}".format(key, value)
+                for key, value in finder_file_config.items()
+            )
+            self.logger.debug("FinDer configuration:\n%s", rendered_config)
             self.logger.ok("FinDer configuration file is written.")
 
         except Exception as e:

@@ -163,21 +163,28 @@ class FinderConfigProfileTests(unittest.TestCase):
         )
         self.assertIsNone(profiles.GLOBAL_PROFILE.wkt_filename)
 
-    def test_every_named_configuration_matches_transitional_template(self):
-        template = importlib.import_module(
-            "pyfinder.pyfinderconfig"
-        ).finder_file_config_template
-        expected_items = tuple(template.items())
-        expected_types = tuple(type(value) for value in template.values())
+    def test_named_configurations_share_the_current_ordered_global_key_set(self):
+        configurations = named_configurations()
+        expected_keys = tuple(configurations[0][1])
 
-        for name, configuration in named_configurations():
+        for name, configuration in configurations:
             with self.subTest(name=name):
                 self.assertIsInstance(configuration, dict)
-                self.assertEqual(tuple(configuration.items()), expected_items)
-                self.assertEqual(
-                    tuple(type(value) for value in configuration.values()),
-                    expected_types,
-                )
+                self.assertTrue(configuration)
+                self.assertIn("DATA_FOLDER", configuration)
+                self.assertEqual(tuple(configuration), expected_keys)
+
+    def test_transitional_template_is_absent_but_resource_paths_remain(self):
+        general_configuration = importlib.import_module(
+            "pyfinder.pyfinderconfig"
+        )
+        transitional_name = "finder_file_" "config_template"
+
+        self.assertFalse(
+            hasattr(general_configuration, transitional_name)
+        )
+        self.assertTrue(general_configuration.finder_resources)
+        self.assertTrue(general_configuration.gmt_resources)
 
     def test_named_configuration_dictionaries_are_distinct_objects(self):
         configurations = [

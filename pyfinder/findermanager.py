@@ -12,6 +12,10 @@ utility as well as a runtime library.
 import os
 import sys
 import logging
+from pyfinder.finderconfigs import (
+    GlobalFinderConfigError,
+    build_default_selector,
+)
 from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.utils import customlogger
 from paramws.clients import (RRSMPeakMotionClient, 
@@ -45,13 +49,6 @@ class FinDerManager:
             # Use the user-defined configuration
             self.configuration = configuration
 
-        # The selected native FinDer configuration is intentionally separate
-        # from PyFinder's general application configuration. This batch only
-        # carries the scheduler decision across the manager boundary; per-run
-        # executable materialization remains a later focused change.
-        self.finder_configuration_name = finder_configuration_name
-        self.finder_configuration = finder_configuration
-        
         # Solution metadata mainly for information purposes
         self.metadata = metadata or {}
 
@@ -70,6 +67,52 @@ class FinDerManager:
             overwrite=True,
             level=logging.DEBUG
         )
+
+        self._resolve_finder_configuration(
+            finder_configuration_name=finder_configuration_name,
+            finder_configuration=finder_configuration,
+        )
+
+    def _resolve_finder_configuration(
+        self,
+        finder_configuration_name,
+        finder_configuration,
+    ):
+        """Retain a complete decision or resolve one for direct manager use."""
+        name_supplied = finder_configuration_name is not None
+        configuration_supplied = finder_configuration is not None
+        if name_supplied and configuration_supplied:
+            self.finder_configuration_name = finder_configuration_name
+            self.finder_configuration = finder_configuration
+            return
+
+        try:
+            selector = build_default_selector(logger=self.logger)
+        except GlobalFinderConfigError:
+            self.logger.critical(
+                "Global FinDer configuration validation failed; "
+                "manager construction cannot continue",
+                exc_info=True,
+            )
+            raise
+
+        if name_supplied != configuration_supplied:
+            self.logger.critical(
+                "Incomplete FinDer configuration handoff; ignoring the "
+                "supplied member and using the global fallback"
+            )
+            latitude = None
+            longitude = None
+        else:
+            latitude = self.metadata.get("emsc_latitude")
+            longitude = self.metadata.get("emsc_longitude")
+
+        decision = selector.resolve(
+            latitude=latitude,
+            longitude=longitude,
+        )
+        self.finder_configuration_name = decision.configuration_name
+        self.finder_configuration = decision.configuration
         
     def set_finder_data_dirs(self, working_dir, finder_event_id):
         """ Set the FinDer data directories using the event id from FinDer run """
@@ -333,10 +376,17 @@ class FinDerManager:
         else:
             # Call the FinDer executable
             self.logger.info("Starting FinDer executable")
-            from finderexec import FinDerExecutable
-            executable = FinDerExecutable(
-                options=self.options, configuration=self.configuration).execute(
-                    event_data=_event_data, amplitudes=_amplitude_data)
+            from pyfinder.finderexec import FinDerExecutable
+            finder_executable = FinDerExecutable(
+                options=self.options,
+                configuration=self.configuration,
+                finder_configuration_name=self.finder_configuration_name,
+                finder_configuration=self.finder_configuration,
+            )
+            executable = finder_executable.execute(
+                event_data=_event_data,
+                amplitudes=_amplitude_data,
+            )
             
             # Check if the executable was successful
             if not executable or not executable.get_finder_solution_object():

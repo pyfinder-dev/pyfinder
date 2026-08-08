@@ -27,6 +27,13 @@ from pyfinder.finderconfigs.profiles import FinderConfigProfile
 DEFAULT_CONFIGURATION = object()
 
 
+class UnrenderableNativeValue:
+    """Raise when selector validation tries to form a native value string."""
+
+    def __str__(self):
+        raise RuntimeError("cannot render native value")
+
+
 class CountingResource:
     """Count WKT reads while retaining normal pathlib UTF-8 behavior."""
 
@@ -500,6 +507,8 @@ class FinderConfigSelectorTests(unittest.TestCase):
             "POLYGON ((10 10, 12 10, 12 12, 10 12, 10 10))",
         )
         selected_configuration = self.regional_configuration("selected")
+        unselected_configuration = self.regional_configuration("unselected")
+        unselected_configuration["MODE"] = "invalid\nsecond line"
         selector = self.make_selector(
             self.regional_profile(
                 "selected",
@@ -509,7 +518,7 @@ class FinderConfigSelectorTests(unittest.TestCase):
             self.regional_profile(
                 "unselected",
                 "unselected-invalid.wkt",
-                {},
+                unselected_configuration,
             ),
         )
 
@@ -557,6 +566,68 @@ class FinderConfigSelectorTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaises(GlobalFinderConfigError):
                     self.make_selector(global_profile=global_profile)
+
+    def test_global_rejects_native_line_structural_defects(self):
+        cases = (
+            ("empty field name", "", "value"),
+            ("whitespace field name", "BAD FIELD", "value"),
+            ("line-breaking field name", "BAD\nFIELD", "value"),
+            ("non-string field name", 17, "value"),
+            ("value conversion failure", "MODE", UnrenderableNativeValue()),
+            ("newline value", "MODE", "first\nsecond"),
+            ("carriage-return value", "MODE", "first\rsecond"),
+        )
+        for label, field_name, value in cases:
+            with self.subTest(label=label):
+                configuration = {
+                    "DATA_FOLDER": "<PATH>",
+                    field_name: value,
+                }
+                profile = FinderConfigProfile(
+                    name="global",
+                    configuration=configuration,
+                )
+
+                with self.assertRaises(GlobalFinderConfigError):
+                    self.make_selector(global_profile=profile)
+
+    def test_selected_regional_native_line_defects_use_whole_global(self):
+        self.write_wkt(
+            "native-line.wkt",
+            "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+        )
+        cases = (
+            ("empty field name", "", "value"),
+            ("whitespace field name", "BAD FIELD", "value"),
+            ("line-breaking field name", "BAD\nFIELD", "value"),
+            ("non-string field name", 17, "value"),
+            ("value conversion failure", "MODE", UnrenderableNativeValue()),
+            ("newline value", "MODE", "first\nsecond"),
+            ("carriage-return value", "MODE", "first\rsecond"),
+        )
+        for label, field_name, value in cases:
+            with self.subTest(label=label):
+                configuration = self.regional_configuration("invalid")
+                if field_name != "MODE":
+                    configuration.pop("MODE")
+                configuration[field_name] = value
+                selector = self.make_selector(
+                    self.regional_profile(
+                        "invalid",
+                        "native-line.wkt",
+                        configuration,
+                    )
+                )
+
+                decision, _captured = self.assert_critical_global_fallback(
+                    selector,
+                    latitude=1,
+                    longitude=1,
+                )
+                self.assertEqual(
+                    tuple(decision.configuration.items()),
+                    tuple(self.global_configuration.items()),
+                )
 
     def test_returned_dictionaries_are_deeply_isolated_from_all_sources(self):
         self.write_wkt(
