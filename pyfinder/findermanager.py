@@ -27,7 +27,14 @@ from pyfinder.utils.station_merger import StationMerger
 
 class FinDerManager:
     """ Class for managing the FinDer library and executable wrappers"""
-    def __init__(self, options, configuration=None, metadata=None):
+    def __init__(
+        self,
+        options,
+        configuration=None,
+        metadata=None,
+        finder_configuration_name=None,
+        finder_configuration=None,
+    ):
         # Options from the command line arguments
         self.options = options
 
@@ -37,6 +44,13 @@ class FinDerManager:
         else:
             # Use the user-defined configuration
             self.configuration = configuration
+
+        # The selected native FinDer configuration is intentionally separate
+        # from PyFinder's general application configuration. This batch only
+        # carries the scheduler decision across the manager boundary; per-run
+        # executable materialization remains a later focused change.
+        self.finder_configuration_name = finder_configuration_name
+        self.finder_configuration = finder_configuration
         
         # Solution metadata mainly for information purposes
         self.metadata = metadata or {}

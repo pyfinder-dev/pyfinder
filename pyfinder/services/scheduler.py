@@ -9,6 +9,10 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+from pyfinder.finderconfigs import (
+    GlobalFinderConfigError,
+    build_default_selector,
+)
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.services.querypolicy import build_service_policies
 from pyfinder.utils.customlogger import file_logger
@@ -26,7 +30,12 @@ class FollowUpScheduler:
     policies via dedicated policy instances supplied during construction.
     """
 
-    def __init__(self, tracker: EventTracker=None, service_policies=None):
+    def __init__(
+        self,
+        tracker: EventTracker=None,
+        service_policies=None,
+        finder_config_selector=None,
+    ):
         # Create a logger for the FollowUpScheduler and its sub-tasks
         self.logger = self._setup_file_logger()
         self._welcome_message(self.logger)
@@ -41,7 +50,22 @@ class FollowUpScheduler:
                 raise
         self.service_policies = service_policies
 
-        # FinDer is needed only after startup policy validation has succeeded.
+        if finder_config_selector is None:
+            try:
+                finder_config_selector = build_default_selector(
+                    logger=self.logger
+                )
+            except GlobalFinderConfigError:
+                self.logger.critical(
+                    "Global FinDer configuration validation failed; "
+                    "aborting scheduler startup",
+                    exc_info=True,
+                )
+                raise
+        self.finder_config_selector = finder_config_selector
+
+        # FinDer is needed only after startup policy and computational-profile
+        # validation have succeeded.
         from pyfinder.findermanager import FinDerManager
 
         self._finder_manager_class = FinDerManager
@@ -270,18 +294,25 @@ class FollowUpScheduler:
             current_delay_time,
         )
         try:
+            decision = self.finder_config_selector.resolve(
+                latitude=event_meta.get(EventTracker.Field.emsc_latitude),
+                longitude=event_meta.get(EventTracker.Field.emsc_longitude),
+            )
             finder_manager = self._finder_manager_class(
                 options=finder_options,
                 metadata=solution_metadata,
+                finder_configuration_name=decision.configuration_name,
+                finder_configuration=decision.configuration,
             )
             finder_solution = finder_manager.run(event_id=event_id)
         except Exception as error:
             diagnostic = self._failure_diagnostic(
-                "FinDerManager execution failed",
+                "Scheduled FinDer execution failed",
                 error,
             )
             self.logger.error(
-                "FinDerManager failed for event %s and service %s: %s",
+                "Scheduled FinDer execution failed for event %s and "
+                "service %s: %s",
                 event_id,
                 service,
                 diagnostic,

@@ -10,6 +10,10 @@ the FinDer with the parametric datasets.
 import sys
 import threading
 
+from pyfinder.finderconfigs import (
+    GlobalFinderConfigError,
+    build_default_selector,
+)
 from pyfinder.services import seismiclistener
 from pyfinder.services.querypolicy import build_service_policies
 from pyfinder.services.scheduler import FollowUpScheduler
@@ -64,6 +68,16 @@ def start_services():
         )
         raise
 
+    try:
+        finder_config_selector = build_default_selector(logger=logger)
+    except GlobalFinderConfigError:
+        logger.critical(
+            "Global FinDer configuration validation failed; "
+            "aborting PyFinder startup",
+            exc_info=True,
+        )
+        raise
+
     def start_listener():
         logger.info("Starting seismic listener...")
         seismiclistener.start_emsc_listener(policy=rrsm_policy)
@@ -73,7 +87,10 @@ def start_services():
     _listener_thread.start()
 
     logger.info("Starting FollowUpScheduler...")
-    _scheduler = FollowUpScheduler(service_policies=service_policies)
+    _scheduler = FollowUpScheduler(
+        service_policies=service_policies,
+        finder_config_selector=finder_config_selector,
+    )
     try:
         _scheduler.run_forever()
     except KeyboardInterrupt:

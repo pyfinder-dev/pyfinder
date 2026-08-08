@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from unittest.mock import Mock, patch
 
@@ -64,6 +65,15 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
 
     event_id = "test-event"
 
+    @staticmethod
+    def _application_configuration():
+        return {
+            "finder-executable": {
+                "finder-temp-data-dir": "/tmp/finder-data",
+                "finder-temp-dir": "/tmp/finder",
+            }
+        }
+
     def _manager(self):
         # Bypass __init__ because logger and output-directory setup are not
         # part of this dependency-boundary test.
@@ -110,6 +120,72 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
             "esm_formatter": esm_formatter,
             "merger_type": merger_type,
         }
+
+    def test_constructor_stores_selected_configuration_separately(self):
+        application_configuration = self._application_configuration()
+        finder_configuration = {
+            "DATA_FOLDER": "selected-data",
+            "MODEL": "regional",
+        }
+        executable_module = types.ModuleType("finderexec")
+        executable_module.FinDerExecutable = Mock(name="FinDerExecutable")
+
+        with patch.object(
+            findermanager.customlogger,
+            "file_logger",
+            return_value=Mock(),
+        ), patch.object(
+            findermanager,
+            "RRSMPeakMotionClient",
+        ) as rrsm_client, patch.object(
+            findermanager,
+            "RRSMShakeMapClient",
+        ) as rrsm_shakemap_client, patch.object(
+            findermanager,
+            "EMSCFeltReportClient",
+        ) as emsc_client, patch.object(
+            findermanager,
+            "ESMShakeMapClient",
+        ) as esm_client, patch.dict(
+            sys.modules,
+            {"finderexec": executable_module},
+        ):
+            manager = findermanager.FinDerManager(
+                options={"use_library": False},
+                configuration=application_configuration,
+                metadata={"source": "scheduler"},
+                finder_configuration_name="switzerland-alpine",
+                finder_configuration=finder_configuration,
+            )
+
+        self.assertIs(manager.configuration, application_configuration)
+        self.assertEqual(
+            manager.finder_configuration_name,
+            "switzerland-alpine",
+        )
+        self.assertIs(manager.finder_configuration, finder_configuration)
+        rrsm_client.assert_not_called()
+        rrsm_shakemap_client.assert_not_called()
+        emsc_client.assert_not_called()
+        esm_client.assert_not_called()
+        executable_module.FinDerExecutable.assert_not_called()
+
+    def test_constructor_accepts_omitted_selected_configuration(self):
+        application_configuration = self._application_configuration()
+
+        with patch.object(
+            findermanager.customlogger,
+            "file_logger",
+            return_value=Mock(),
+        ):
+            manager = findermanager.FinDerManager(
+                options={"use_library": False},
+                configuration=application_configuration,
+            )
+
+        self.assertIs(manager.configuration, application_configuration)
+        self.assertIsNone(manager.finder_configuration_name)
+        self.assertIsNone(manager.finder_configuration)
 
     def test_rrsm_keeps_tuple_event_separate_from_peak_motion_dataset(self):
         rrsm_event = _EventModel("rrsm")
