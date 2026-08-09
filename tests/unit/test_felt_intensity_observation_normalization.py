@@ -1,11 +1,34 @@
-"""Calculator tests for Batch 1 of the accepted felt-intensity contract."""
+"""Tests for Allen intensity prediction and EMSC felt-data normalization."""
 
+import atexit
 import inspect
+import math
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-from pyfinder.utils.calculator import Calculator
+
+# Importing the formatter also imports ParamWS. Keep the dependency's import
+# log outside the repository when this focused module runs on its own.
+_PARAMWS_LOG_DIRECTORY = tempfile.TemporaryDirectory(
+    prefix="pyfinder-felt-normalization-unit-")
+atexit.register(_PARAMWS_LOG_DIRECTORY.cleanup)
+_original_paramws_log_file = os.environ.get("PARAMWS_LOG_FILE")
+os.environ["PARAMWS_LOG_FILE"] = str(
+    Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
+try:
+    from paramws.clients import FeltReportEventData, FeltReportIntensityData
+    from pyfinder.utils.calculator import Calculator
+    from pyfinder.utils.dataformatter import EMSCFeltReportDataFormatter
+finally:
+    if _original_paramws_log_file is None:
+        os.environ.pop("PARAMWS_LOG_FILE", None)
+    else:
+        os.environ["PARAMWS_LOG_FILE"] = _original_paramws_log_file
 
 
 class AllenCalculatorTests(unittest.TestCase):
@@ -187,6 +210,564 @@ class AllenCalculatorTests(unittest.TestCase):
         self.assertAlmostEqual(float(log10_pga), 0.783558124598587, places=12)
         self.assertNotAlmostEqual(
             float(log10_pga), (3.0 - 1.78) / 1.55, places=6)
+
+
+_MISSING = object()
+
+
+def _event(*, event_id="event-one", latitude=45.0, longitude=10.0,
+           magnitude=5.5, depth=10.0,
+           event_time="2026-08-09T12:00:00Z"):
+    """Build one public EMSC event while allowing genuinely absent fields."""
+    data = {}
+    provider_fields = (
+        ("ev_id", event_id),
+        ("ev_latitude", latitude),
+        ("ev_longitude", longitude),
+        ("ev_mag_value", magnitude),
+        ("ev_depth", depth),
+        ("ev_event_time", event_time),
+    )
+    for field_name, provider_value in provider_fields:
+        if provider_value is not _MISSING:
+            data[field_name] = provider_value
+    return FeltReportEventData(data)
+
+
+def _row(*, latitude=45.0, longitude=10.0, raw=5.0, corrected=6.0):
+    """Build one public felt-intensity row with controlled provider values."""
+    data = {}
+    provider_fields = (
+        ("lat", latitude),
+        ("lon", longitude),
+        ("raw", raw),
+        ("corrected", corrected),
+    )
+    for field_name, provider_value in provider_fields:
+        if provider_value is not _MISSING:
+            data[field_name] = provider_value
+    return data
+
+
+def _felt_reports(rows, event_id="event-one"):
+    """Build the requested event view returned by get_feltreports()."""
+    return FeltReportIntensityData({
+        "unid": event_id,
+        "intensities": list(rows),
+        "comments": "#provider comments ",
+    })
+
+
+class EMSCFeltReportNormalizationTests(unittest.TestCase):
+    """Test the independent EMSC felt-intensity normalization adapter."""
+
+    def _extract(self, rows=None, *, event_data=_MISSING,
+                 felt_reports=_MISSING, logger=None):
+        logger = logger or Mock()
+        if event_data is _MISSING:
+            event_data = _event()
+        if felt_reports is _MISSING:
+            if rows is None:
+                rows = [_row()]
+            felt_reports = _felt_reports(rows)
+
+        formatter = EMSCFeltReportDataFormatter(logger=logger)
+        records = formatter.extract_raw_stations(
+            event_data=event_data,
+            felt_reports=felt_reports,
+        )
+        return records, logger
+
+    @staticmethod
+    def _warning_messages(logger):
+        return [str(call.args[0]) for call in logger.warning.call_args_list]
+
+    @staticmethod
+    def _error_messages(logger):
+        return [str(call.args[0]) for call in logger.error.call_args_list]
+
+    def test_public_event_view_normalizes_corrected_value_and_provenance(self):
+        event_data = _event()
+        felt_reports = _felt_reports([
+            _row(latitude=45.25, longitude=10.5, raw=4.0, corrected=6.25)
+        ])
+
+        records, logger = self._extract(
+            event_data=event_data,
+            felt_reports=felt_reports,
+        )
+
+        self.assertIsInstance(event_data, FeltReportEventData)
+        self.assertIsInstance(felt_reports, FeltReportIntensityData)
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["latitude"], 45.25)
+        self.assertEqual(record["longitude"], 10.5)
+        self.assertEqual(record["source"], "EMSC")
+        self.assertEqual(record["provider_value"], 6.25)
+        self.assertEqual(record["provider_unit"], "EMS-98")
+        self.assertEqual(
+            record["pga"],
+            float(10 ** Calculator.I_to_PGA_Wordon2012(6.25)),
+        )
+        self.assertTrue(math.isfinite(record["pga"]))
+        self.assertGreater(record["pga"], 0)
+        self.assertEqual(logger.warning.call_count, 0)
+        self.assertEqual(logger.error.call_count, 0)
+
+    def test_missing_and_none_corrected_values_use_raw_with_warning(self):
+        records, logger = self._extract([
+            _row(raw=4.0, corrected=_MISSING),
+            _row(raw=5.0, corrected=None),
+        ])
+
+        self.assertEqual(
+            [record["provider_value"] for record in records],
+            [4.0, 5.0],
+        )
+        fallback_warnings = [
+            message for message in self._warning_messages(logger)
+            if "raw intensity fallback" in message
+        ]
+        self.assertEqual(len(fallback_warnings), 2)
+        self.assertIn("row 0", fallback_warnings[0])
+        self.assertIn("4.0", fallback_warnings[0])
+        self.assertIn("missing", fallback_warnings[0])
+        self.assertIn("row 1", fallback_warnings[1])
+        self.assertIn("5.0", fallback_warnings[1])
+        self.assertIn("None", fallback_warnings[1])
+
+    def test_present_invalid_corrected_value_never_retries_raw(self):
+        records, logger = self._extract([
+            _row(raw=6.0, corrected="invalid-corrected")
+        ])
+
+        self.assertEqual(records, [])
+        warnings = self._warning_messages(logger)
+        self.assertTrue(any(
+            "EMSC" in message
+            and "row 0" in message
+            and "invalid selected intensity" in message
+            and "invalid-corrected" in message
+            for message in warnings
+        ), warnings)
+        self.assertFalse(any(
+            "raw intensity fallback" in message for message in warnings))
+        self.assertTrue(any(
+            "EMSC" in message and "zero usable" in message
+            for message in self._error_messages(logger)))
+
+    def test_invalid_selected_intensities_are_warned_and_rejected(self):
+        cases = (
+            ("missing", _row(raw=_MISSING, corrected=_MISSING), None),
+            ("boolean", _row(corrected=True), True),
+            ("nonnumeric", _row(corrected="six"), "six"),
+            ("nan", _row(corrected=float("nan")), float("nan")),
+            ("positive infinity", _row(corrected=float("inf")), float("inf")),
+            ("negative infinity", _row(corrected=float("-inf")), float("-inf")),
+            ("below one", _row(corrected=0.999), 0.999),
+            ("rounded above ten", _row(corrected=10.5001), 10.5001),
+        )
+        for label, row, original_value in cases:
+            with self.subTest(label=label):
+                records, logger = self._extract([row])
+
+                self.assertEqual(records, [])
+                warnings = self._warning_messages(logger)
+                self.assertTrue(any(
+                    "EMSC" in message
+                    and "row 0" in message
+                    and "invalid selected intensity" in message
+                    and repr(original_value) in message
+                    for message in warnings
+                ), warnings)
+                self.assertTrue(any(
+                    "zero usable" in message
+                    for message in self._error_messages(logger)))
+
+    def test_intensity_boundaries_preserve_numpy_rounding_and_exact_value(self):
+        cases = (
+            (1.0, 4.0),
+            (10.5, 7.5),
+        )
+        for selected_intensity, predicted_intensity in cases:
+            with self.subTest(selected_intensity=selected_intensity):
+                with patch.object(
+                        Calculator, "I_Allen2012_Rhypo",
+                        return_value=predicted_intensity), patch.object(
+                        Calculator, "I_to_PGA_Wordon2012", return_value=0.0):
+                    records, _logger = self._extract([
+                        _row(corrected=selected_intensity)
+                    ])
+
+                self.assertEqual(len(records), 1)
+                self.assertEqual(
+                    records[0]["provider_value"], selected_intensity)
+
+        with patch.object(Calculator, "I_Allen2012_Rhypo") as allen:
+            records, logger = self._extract([_row(corrected=10.5001)])
+
+        self.assertEqual(records, [])
+        allen.assert_not_called()
+        self.assertTrue(any(
+            "NumPy-rounded value" in message and "above 10" in message
+            for message in self._warning_messages(logger)))
+
+    def test_every_invalid_event_context_category_returns_before_rows(self):
+        common_invalid_values = (
+            ("missing", _MISSING),
+            ("boolean", True),
+            ("nonnumeric", "not-a-number"),
+            ("nan", float("nan")),
+            ("positive infinity", float("inf")),
+            ("negative infinity", float("-inf")),
+        )
+        cases = []
+        for field_name in ("latitude", "longitude", "magnitude", "depth"):
+            for label, value in common_invalid_values:
+                cases.append((field_name, label, value))
+        cases.extend((
+            ("latitude", "below range", -90.1),
+            ("latitude", "above range", 90.1),
+            ("longitude", "below range", -180.1),
+            ("longitude", "above range", 180.1),
+            ("depth", "negative", -0.1),
+        ))
+
+        for field_name, label, value in cases:
+            with self.subTest(field=field_name, label=label):
+                event_data = _event(**{field_name: value})
+                felt_reports = Mock()
+                logger = Mock()
+                formatter = EMSCFeltReportDataFormatter(logger=logger)
+
+                records = formatter.extract_raw_stations(
+                    event_data=event_data,
+                    felt_reports=felt_reports,
+                )
+
+                self.assertEqual(records, [])
+                felt_reports.get_intensities.assert_not_called()
+                logger.error.assert_called_once()
+                error_message = str(logger.error.call_args.args[0])
+                self.assertIn("EMSC", error_message)
+                self.assertIn("event-one", error_message)
+                self.assertIn(field_name, error_message)
+                self.assertIn("no usable felt records", error_message)
+
+    def test_zero_coordinates_depth_and_unrestricted_magnitude_are_accepted(self):
+        event_data = _event(
+            latitude=0,
+            longitude=0,
+            magnitude=-2.0,
+            depth=0,
+        )
+        with patch.object(
+                Calculator, "I_Allen2012_Rhypo", return_value=4.0), \
+                patch.object(
+                    Calculator, "I_to_PGA_Wordon2012", return_value=0.0):
+            records, logger = self._extract(
+                [_row(latitude=0, longitude=0, corrected=4.0)],
+                event_data=event_data,
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(logger.error.call_count, 0)
+
+    def test_every_invalid_row_coordinate_is_warned_and_rejected(self):
+        cases = (
+            ("latitude", "latitude", _MISSING),
+            ("latitude", "latitude", True),
+            ("latitude", "latitude", "north"),
+            ("latitude", "latitude", float("nan")),
+            ("latitude", "latitude", float("inf")),
+            ("latitude", "latitude", float("-inf")),
+            ("latitude", "latitude", -90.1),
+            ("latitude", "latitude", 90.1),
+            ("longitude", "longitude", _MISSING),
+            ("longitude", "longitude", True),
+            ("longitude", "longitude", "east"),
+            ("longitude", "longitude", float("nan")),
+            ("longitude", "longitude", float("inf")),
+            ("longitude", "longitude", float("-inf")),
+            ("longitude", "longitude", -180.1),
+            ("longitude", "longitude", 180.1),
+        )
+        for coordinate_label, row_field, value in cases:
+            with self.subTest(coordinate=coordinate_label, value=value):
+                records, logger = self._extract([
+                    _row(**{row_field: value})
+                ])
+
+                self.assertEqual(records, [])
+                warnings = self._warning_messages(logger)
+                self.assertTrue(any(
+                    "EMSC" in message
+                    and "row 0" in message
+                    and f"invalid {coordinate_label}" in message
+                    and repr(None if value is _MISSING else value) in message
+                    for message in warnings
+                ), warnings)
+
+    def test_coordinates_are_validated_independently(self):
+        records, logger = self._extract([
+            _row(latitude=None, longitude=None)
+        ])
+
+        self.assertEqual(records, [])
+        warnings = self._warning_messages(logger)
+        self.assertTrue(any("invalid latitude" in message for message in warnings))
+        self.assertTrue(any("invalid longitude" in message for message in warnings))
+
+    def test_longitude_181_is_rejected_without_rewriting(self):
+        with patch.object(Calculator, "haversine") as haversine:
+            records, logger = self._extract([_row(longitude=181)])
+
+        self.assertEqual(records, [])
+        haversine.assert_not_called()
+        warnings = self._warning_messages(logger)
+        self.assertTrue(any(
+            "invalid longitude" in message and "181" in message
+            for message in warnings))
+        self.assertFalse(any("-179" in message for message in warnings))
+
+    def test_latitude_first_distance_and_corrected_allen_boundary_are_used(self):
+        with patch.object(
+                Calculator, "haversine", return_value=12.5) as haversine, \
+                patch.object(
+                    Calculator, "I_Allen2012_Rhypo",
+                    return_value=6.0) as allen, \
+                patch.object(
+                    Calculator, "I_Allen2012_Rhypo_legacy",
+                    side_effect=AssertionError("legacy Allen must not run")) \
+                as legacy_allen, patch.object(
+                    Calculator, "I_to_PGA_Wordon2012", return_value=0.0):
+            records, _logger = self._extract([
+                _row(latitude=46.0, longitude=11.0, corrected=6.0)
+            ])
+
+        self.assertEqual(len(records), 1)
+        haversine.assert_called_once_with(45.0, 10.0, 46.0, 11.0)
+        allen.assert_called_once_with(5.5, 10.0, 12.5)
+        legacy_allen.assert_not_called()
+
+    def test_allen_reach_is_strictly_greater_than_three(self):
+        cases = (
+            (3.0, False),
+            (3.0001, True),
+        )
+        for predicted_intensity, should_retain in cases:
+            with self.subTest(predicted_intensity=predicted_intensity):
+                with patch.object(
+                        Calculator, "I_Allen2012_Rhypo",
+                        return_value=predicted_intensity), patch.object(
+                        Calculator, "I_to_PGA_Wordon2012",
+                        return_value=0.0) as worden:
+                    records, logger = self._extract([
+                        _row(corrected=6.0)
+                    ])
+
+                self.assertEqual(bool(records), should_retain)
+                if should_retain:
+                    worden.assert_called_once_with(6.0)
+                else:
+                    worden.assert_not_called()
+                    self.assertTrue(any(
+                        "Allen reach" in message
+                        and "3.0" in message
+                        and "greater than 3" in message
+                        for message in self._warning_messages(logger)))
+
+    def test_allen_residual_three_is_inclusive(self):
+        cases = (
+            (9.0, True),
+            (9.0001, False),
+        )
+        for selected_intensity, should_retain in cases:
+            with self.subTest(selected_intensity=selected_intensity):
+                with patch.object(
+                        Calculator, "I_Allen2012_Rhypo",
+                        return_value=6.0), patch.object(
+                        Calculator, "I_to_PGA_Wordon2012", return_value=0.0):
+                    records, logger = self._extract([
+                        _row(corrected=selected_intensity)
+                    ])
+
+                self.assertEqual(bool(records), should_retain)
+                if not should_retain:
+                    self.assertTrue(any(
+                        "Allen residual" in message
+                        and repr(selected_intensity) in message
+                        and "above 3" in message
+                        for message in self._warning_messages(logger)))
+
+    def test_worden_exact_value_is_exponentiated_once_without_g_conversion(self):
+        selected_intensity = 6.25
+        with patch.object(
+                Calculator, "I_Allen2012_Rhypo", return_value=6.0), \
+                patch.object(
+                    Calculator, "I_to_PGA_Wordon2012", return_value=2.0) \
+                as worden, patch.object(
+                    Calculator, "percent_g_to_cm_s2",
+                    side_effect=AssertionError("percent-g conversion used")) \
+                as percent_g:
+            records, _logger = self._extract([
+                _row(corrected=selected_intensity)
+            ])
+
+        worden.assert_called_once_with(selected_intensity)
+        percent_g.assert_not_called()
+        self.assertEqual(len(records), 1)
+        self.assertIsInstance(records[0]["pga"], float)
+        self.assertEqual(records[0]["pga"], 100.0)
+        self.assertNotEqual(records[0]["pga"], 100.0 * 980.665)
+
+    def test_invalid_converted_pga_is_warned_and_rejected(self):
+        cases = (
+            ("underflow", float("-inf")),
+            ("nan", float("nan")),
+            ("infinity", float("inf")),
+            ("overflow", 400.0),
+        )
+        for label, log10_pga in cases:
+            with self.subTest(label=label):
+                with patch.object(
+                        Calculator, "I_Allen2012_Rhypo", return_value=6.0), \
+                        patch.object(
+                            Calculator, "I_to_PGA_Wordon2012",
+                            return_value=log10_pga):
+                    records, logger = self._extract([
+                        _row(corrected=6.0)
+                    ])
+
+                self.assertEqual(records, [])
+                warnings = self._warning_messages(logger)
+                self.assertTrue(any(
+                    "EMSC" in message
+                    and "row 0" in message
+                    and "invalid converted PGA" in message
+                    and "6.0" in message
+                    for message in warnings
+                ), warnings)
+
+    def test_invalid_conversion_is_row_local(self):
+        with patch.object(
+                Calculator, "I_Allen2012_Rhypo", return_value=6.0), \
+                patch.object(
+                    Calculator, "I_to_PGA_Wordon2012",
+                    side_effect=[float("nan"), 2.0]):
+            records, logger = self._extract([
+                _row(corrected=6.0),
+                _row(corrected=7.0),
+            ])
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["provider_value"], 7.0)
+        self.assertEqual(records[0]["pga"], 100.0)
+        self.assertTrue(any(
+            "row 0" in message and "invalid converted PGA" in message
+            for message in self._warning_messages(logger)))
+
+    def test_colocated_rows_remain_separate_and_in_provider_order(self):
+        with patch.object(
+                Calculator, "I_Allen2012_Rhypo", return_value=6.0):
+            records, _logger = self._extract([
+                _row(corrected=4.0),
+                _row(corrected=5.0),
+                _row(corrected=6.0),
+            ])
+
+        self.assertEqual(len(records), 3)
+        self.assertEqual(
+            [record["provider_value"] for record in records],
+            [4.0, 5.0, 6.0],
+        )
+        for record in records:
+            self.assertEqual(record["latitude"], 45.0)
+            self.assertEqual(record["longitude"], 10.0)
+            self.assertEqual(record["network"], "")
+            self.assertEqual(record["station"], "")
+            self.assertEqual(record["location"], "")
+            self.assertEqual(record["channel"], "")
+            self.assertEqual(record["source"], "EMSC")
+            self.assertEqual(record["provider_unit"], "EMS-98")
+        self.assertEqual(len({record["timestamp"] for record in records}), 1)
+
+    def test_event_timestamp_and_felt_rows_are_each_read_once(self):
+        event_data = Mock(wraps=_event())
+        felt_reports = Mock(wraps=_felt_reports([
+            _row(corrected=5.0),
+            _row(corrected=6.0),
+        ]))
+        with patch(
+                "pyfinder.utils.dataformatter.get_epoch_time",
+                return_value=123.0) as epoch_time, patch.object(
+                    Calculator, "I_Allen2012_Rhypo", return_value=6.0), \
+                patch.object(
+                    Calculator, "I_to_PGA_Wordon2012", return_value=0.0):
+            records, _logger = self._extract(
+                event_data=event_data,
+                felt_reports=felt_reports,
+            )
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            [record["timestamp"] for record in records], [123.0, 123.0])
+        event_data.get_latitude.assert_called_once_with()
+        event_data.get_longitude.assert_called_once_with()
+        event_data.get_magnitude.assert_called_once_with()
+        event_data.get_depth.assert_called_once_with()
+        event_data.get_event_time.assert_called_once_with()
+        epoch_time.assert_called_once_with("2026-08-09T12:00:00Z")
+        felt_reports.get_intensities.assert_called_once_with()
+
+    def test_empty_event_view_emits_zero_result_error(self):
+        records, logger = self._extract([])
+
+        self.assertEqual(records, [])
+        logger.error.assert_called_once()
+        error_message = str(logger.error.call_args.args[0])
+        self.assertIn("EMSC", error_message)
+        self.assertIn("zero usable records", error_message)
+        self.assertIn("event-one", error_message)
+
+    def test_malformed_public_model_access_remains_visible(self):
+        logger = Mock()
+        formatter = EMSCFeltReportDataFormatter(logger=logger)
+
+        with self.assertRaises(AttributeError):
+            formatter.extract_raw_stations(
+                event_data=object(),
+                felt_reports=_felt_reports([_row()]),
+            )
+        logger.error.assert_not_called()
+
+        with self.assertRaises(AttributeError):
+            formatter.extract_raw_stations(
+                event_data=_event(),
+                felt_reports=None,
+            )
+        logger.error.assert_not_called()
+
+        multi_event_dataset = FeltReportIntensityData({
+            "event-one": {
+                "unid": "event-one",
+                "intensities": [_row()],
+            },
+        })
+        with self.assertRaises(TypeError):
+            formatter.extract_raw_stations(
+                event_data=_event(),
+                felt_reports=multi_event_dataset,
+            )
+        logger.error.assert_not_called()
+
+        with self.assertRaises(AttributeError):
+            formatter.extract_raw_stations(
+                event_data=_event(),
+                felt_reports=_felt_reports([object()]),
+            )
+        logger.error.assert_not_called()
 
 
 if __name__ == "__main__":

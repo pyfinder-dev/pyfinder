@@ -6,12 +6,14 @@ import numpy as np
 import datetime
 import logging
 import math
+import numbers
 from typing import List, Tuple
 import fnmatch
 from typing import Union
 from .calculator import Calculator
 from pyfinder.pyfinderconfig import pyfinderconfig
-from paramws.clients import (PeakMotionData, ShakeMapEventData,
+from paramws.clients import (FeltReportEventData, FeltReportIntensityData,
+                             PeakMotionData, ShakeMapEventData,
                              ShakeMapStationAmplitudes)
 from pyfinder.finderutils import FinderChannelList
 from pyfinder.utils.station_merger import RawStationMeasurement
@@ -174,7 +176,227 @@ class BaseDataFormatter(object):
     def extract_raw_stations(event_data, amplitudes):
         """ Method to be used when merging the station data from different services. """
         pass
-    
+
+
+class EMSCFeltReportDataFormatter(BaseDataFormatter):
+    """Normalize one public EMSC felt-intensity event view."""
+
+    @staticmethod
+    def _numeric_rejection_reason(value):
+        """Describe why one provider value is not a finite real number."""
+        if value is None:
+            return "missing value"
+        if isinstance(value, (bool, np.bool_)):
+            return "boolean value is not accepted as numerical"
+        if not isinstance(value, numbers.Real):
+            return "nonnumeric value"
+        if not math.isfinite(value):
+            return "nonfinite value"
+        return None
+
+    @staticmethod
+    def _event_identity(event_data):
+        """Return the best public EMSC event identifier available."""
+        event_identity = event_data.get_event_id()
+        if event_identity is None:
+            event_identity = event_data.get_event_unid()
+        return event_identity
+
+    def _event_context_is_invalid(self, event_identity, field_name, value,
+                                  minimum=None, maximum=None):
+        """Validate one required event value and emit the single fatal error."""
+        reason = self._numeric_rejection_reason(value)
+        if reason is None and minimum is not None and value < minimum:
+            reason = f"value is below {minimum}"
+        if reason is None and maximum is not None and value > maximum:
+            reason = f"value is above {maximum}"
+        if reason is None:
+            return False
+
+        identity = (
+            repr(event_identity)
+            if event_identity is not None
+            else "unknown event"
+        )
+        self.logger.error(
+            f"EMSC event {identity} has invalid {field_name} {value!r}: "
+            f"{reason}; normalization produced no usable felt records")
+        return True
+
+    def _valid_intensity(self, row_index, intensity):
+        """Return whether one selected EMSC provider intensity is usable."""
+        reason = self._numeric_rejection_reason(intensity)
+        if reason is None and intensity < 1:
+            reason = "value is below the accepted minimum 1"
+        if reason is None and np.round(intensity) > 10:
+            reason = (
+                f"NumPy-rounded value {np.round(intensity)!r} is above 10")
+        if reason is None:
+            return True
+
+        self.logger.warning(
+            f"EMSC felt row {row_index} rejected: invalid selected intensity "
+            f"{intensity!r} ({reason})")
+        return False
+
+    def _coordinate(self, row, row_index, coordinate_name, minimum, maximum):
+        """Validate one row coordinate without coercion or range rewriting."""
+        coordinate = row.get(coordinate_name)
+        coordinate_label = {
+            "lat": "latitude",
+            "lon": "longitude",
+        }.get(coordinate_name, coordinate_name)
+        reason = self._numeric_rejection_reason(coordinate)
+        if reason is None and coordinate < minimum:
+            reason = f"value is below {minimum}"
+        if reason is None and coordinate > maximum:
+            reason = f"value is above {maximum}"
+        if reason is None:
+            return coordinate
+
+        self.logger.warning(
+            f"EMSC felt row {row_index} rejected: invalid {coordinate_label} "
+            f"{coordinate!r} ({reason})")
+        return None
+
+    def extract_raw_stations(
+            self,
+            event_data: FeltReportEventData,
+            felt_reports: FeltReportIntensityData,
+    ) -> List[RawStationMeasurement]:
+        """
+        Normalize the requested event's EMSC felt-intensity rows.
+
+        Rows remain independent and in provider order. Dependency model access
+        errors are deliberately not caught or converted into an empty success.
+        """
+        event_identity = self._event_identity(event_data)
+        event_latitude = event_data.get_latitude()
+        event_longitude = event_data.get_longitude()
+        event_magnitude = event_data.get_magnitude()
+        event_depth = event_data.get_depth()
+        event_time = event_data.get_event_time()
+
+        context_rules = (
+            ("latitude", event_latitude, -90, 90),
+            ("longitude", event_longitude, -180, 180),
+            ("magnitude", event_magnitude, None, None),
+            ("depth", event_depth, 0, None),
+        )
+        for field_name, value, minimum, maximum in context_rules:
+            if self._event_context_is_invalid(
+                    event_identity, field_name, value, minimum, maximum):
+                return []
+
+        # EMSC rows have no report timestamp. Preserve the current project
+        # behavior by converting the matching event origin time once and
+        # reusing it without introducing new timestamp policy here.
+        time_epoch = get_epoch_time(event_time)
+        intensity_rows = felt_reports.get_intensities()
+        raw_stations = []
+
+        for row_index, row in enumerate(intensity_rows):
+            corrected_intensity = row.get("corrected")
+            if corrected_intensity is None:
+                selected_intensity = row.get("raw")
+                corrected_reason = (
+                    "missing" if "corrected" not in row else "None")
+                self.logger.warning(
+                    f"EMSC felt row {row_index} using raw intensity fallback "
+                    f"{selected_intensity!r}: corrected is "
+                    f"{corrected_reason}")
+            else:
+                selected_intensity = corrected_intensity
+
+            if not self._valid_intensity(row_index, selected_intensity):
+                continue
+
+            latitude = self._coordinate(
+                row, row_index, "lat", -90, 90)
+            longitude = self._coordinate(
+                row, row_index, "lon", -180, 180)
+            if latitude is None or longitude is None:
+                continue
+
+            epicentral_distance = Calculator.haversine(
+                event_latitude,
+                event_longitude,
+                latitude,
+                longitude,
+            )
+            predicted_intensity = Calculator.I_Allen2012_Rhypo(
+                event_magnitude,
+                event_depth,
+                epicentral_distance,
+            )
+            if not predicted_intensity > 3:
+                self.logger.warning(
+                    f"EMSC felt row {row_index} rejected by Allen reach: "
+                    f"predicted intensity {predicted_intensity!r} is not "
+                    f"greater than 3 for selected value "
+                    f"{selected_intensity!r}")
+                continue
+
+            intensity_residual = abs(
+                selected_intensity - predicted_intensity)
+            if intensity_residual > 3:
+                self.logger.warning(
+                    f"EMSC felt row {row_index} rejected by Allen residual: "
+                    f"selected intensity {selected_intensity!r}, predicted "
+                    f"intensity {predicted_intensity!r}, residual "
+                    f"{intensity_residual!r} is above 3")
+                continue
+
+            log10_pga_cm_s2 = Calculator.I_to_PGA_Wordon2012(
+                selected_intensity)
+            try:
+                with np.errstate(
+                        over="ignore", under="ignore", invalid="ignore"):
+                    pga_cm_s2 = 10 ** log10_pga_cm_s2
+            except OverflowError:
+                self.logger.warning(
+                    f"EMSC felt row {row_index} rejected: invalid converted "
+                    f"PGA for selected intensity {selected_intensity!r}; "
+                    f"exponentiating log10 value {log10_pga_cm_s2!r} "
+                    "overflowed")
+                continue
+
+            if isinstance(pga_cm_s2, np.ndarray) and pga_cm_s2.ndim == 0:
+                pga_cm_s2 = pga_cm_s2.item()
+            elif isinstance(pga_cm_s2, np.generic):
+                pga_cm_s2 = pga_cm_s2.item()
+
+            conversion_reason = self._numeric_rejection_reason(pga_cm_s2)
+            if conversion_reason is None and pga_cm_s2 <= 0:
+                conversion_reason = "converted value is not positive"
+            if conversion_reason is not None:
+                self.logger.warning(
+                    f"EMSC felt row {row_index} rejected: invalid converted "
+                    f"PGA {pga_cm_s2!r} from selected intensity "
+                    f"{selected_intensity!r} ({conversion_reason})")
+                continue
+
+            raw_stations.append(RawStationMeasurement(
+                latitude=latitude,
+                longitude=longitude,
+                network="",
+                station="",
+                location="",
+                channel="",
+                pga=pga_cm_s2,
+                timestamp=time_epoch,
+                source="EMSC",
+                provider_value=selected_intensity,
+                provider_unit="EMS-98",
+            ))
+
+        if not raw_stations:
+            self.logger.error(
+                f"EMSC felt normalization produced zero usable records for "
+                f"event {event_identity!r}")
+        return raw_stations
+
+
 class ESMShakeMapDataFormatter(BaseDataFormatter):
     """ Class for formatting the ESM ShakeMap data for the FinDer executable. """
     SUPPORTED_COMPONENT_SELECTIONS = (
