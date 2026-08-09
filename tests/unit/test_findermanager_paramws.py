@@ -79,6 +79,8 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
     def _exercise(self, rrsm_result, esm_result, *, rrsm_raw=None,
                   esm_raw=None):
         manager = self._manager()
+        rrsm_raw = [] if rrsm_raw is None else rrsm_raw
+        esm_raw = [] if esm_raw is None else esm_raw
 
         with patch.object(findermanager, "RRSMPeakMotionClient") as rrsm_type, \
                 patch.object(findermanager, "ESMShakeMapClient") as esm_type, \
@@ -189,7 +191,10 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         observed["esm_client"].query.assert_called_once_with(
             event_id=self.event_id)
         observed["esm_formatter"].assert_not_called()
-        observed["merger_type"].assert_not_called()
+        observed["merger_type"].return_value.merge.assert_called_once_with(
+            esm_data=[],
+            rrsm_data=[],
+        )
         self.assertIsNone(observed["result"])
 
     def test_non_200_codes_retain_partial_event_and_dataset_values(self):

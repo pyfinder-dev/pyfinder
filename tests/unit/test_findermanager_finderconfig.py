@@ -256,7 +256,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
     def exercise_executable_boundary(self, manager):
         provider_event = ProviderEventDouble()
         peak_motion = object()
-        merged_amplitudes = object()
+        merged_amplitudes = ["merged-normalized"]
         executable_instance = mock.Mock()
         executable_instance.execute.side_effect = ExecutableBoundaryReached(
             "stop after executable invocation"

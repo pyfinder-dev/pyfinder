@@ -291,7 +291,8 @@ class FinDerManager:
         else:
             self.metadata['ESM_status'] = "Success"
         
-        self.logger.info("Extacting raw amplitudes ...")
+        self.logger.info("Extracting normalized observations ...")
+        esm_raw = []
         if _esm_event and _esm_amplitude:
             esm_formatter = ESMShakeMapDataFormatter(
                 logger=self.logger,
@@ -299,8 +300,11 @@ class FinDerManager:
             )
             esm_raw = esm_formatter.extract_raw_stations(
                 event_data=_esm_event, amplitudes=_esm_amplitude)
-        else:
-            esm_raw = None
+
+        if not esm_raw:
+            self.logger.error(
+                f"ESM produced zero usable normalized observations for "
+                f"event {event_id}")
         
         # ##############################################
         # # Hack for M. Boese's playbacks to run only the RRSM part.
@@ -308,12 +312,11 @@ class FinDerManager:
         # _esm_event = None
         # ##############################################
 
+        rrsm_raw = []
         if _rrsm_event and _rrsm_amplitude:
             rrsm_raw = RRSMPeakMotionDataFormatter.extract_raw_stations(
                 event_data=_rrsm_amplitude, amplitudes=_rrsm_amplitude)
-        else:
-            rrsm_raw = None
-        self.logger.info("Raw amplitudes extracted.")
+        self.logger.info("Normalized observations extracted.")
 
         # ESM gets the priority over RRSM for event
         _event_data = _esm_event if _esm_event else _rrsm_event
@@ -339,28 +342,37 @@ class FinDerManager:
             self.logger.error(f"Error collecting metadata: {e}")
         self.logger.info(f"Calculation metadata: {self.metadata}")
 
-        # Merge the raw data if both are available
-        if esm_raw or rrsm_raw:
-            # Merge the data
-            self.logger.info("Merging the ESM and RRSM data")
-            _amplitude_data = StationMerger().merge(esm_data=esm_raw, rrsm_data=rrsm_raw)
-            self.logger.info("Merge completed")
-        else:
-            # Use the raw data from either ESM or RRSM
-            _amplitude_data = _esm_amplitude if _esm_amplitude else _rrsm_amplitude
+        # The downstream handoff is always the merged normalized list. An
+        # empty normalized source must never cause its raw provider model to
+        # bypass this boundary and reach a direct provider formatter.
+        self.logger.info("Merging the ESM and RRSM data")
+        _amplitude_data = StationMerger().merge(
+            esm_data=esm_raw,
+            rrsm_data=rrsm_raw,
+        )
+        self.logger.info("Merge completed")
 
 
         # A final check before running FinDer
         if not _event_data or not _amplitude_data:
             self.logger.warning("FinDer cannot be run.")
-            self.logger.warning("|- Reason: Neither ESM nor RRSM has event and/or amplitudes.")
+            if not _event_data:
+                self.logger.warning(
+                    "|- Reason: Neither ESM nor RRSM produced usable event "
+                    "metadata.")
+            if not _amplitude_data:
+                self.logger.error(
+                    "|- Reason: All normalized observation sources produced "
+                    "zero usable records.")
             self.logger.warning(f"|- event_id: {event_id}")
             self.logger.warning(f"|- ESM event: {_esm_event is not None}")
             self.logger.warning(f"|- ESM amplitude: {_esm_amplitude is not None}")
             self.logger.warning(f"|- RRSM event: {_rrsm_event is not None}")
             self.logger.warning(f"|- RRSM amplitude: {_rrsm_amplitude is not None}")
-            self.logger.warning(f"|- ESM raw: {esm_raw is not None}")
-            self.logger.warning(f"|- RRSM raw: {rrsm_raw is not None}")
+            self.logger.warning(
+                f"|- ESM normalized observations: {len(esm_raw)}")
+            self.logger.warning(
+                f"|- RRSM normalized observations: {len(rrsm_raw)}")
             self.logger.warning(f"|- ESM code: {_esm_code}")
             self.logger.warning(f"|- RRSM code: {_rrsm_code}")
 
