@@ -52,10 +52,22 @@ class Calculator(object):
         # Return the log PGA
         return sta_logPGA
 
-    def I_Allen2012_Rhypo(eq_mag, eq_depth, sta_dist,
-                          c0=2.085, c1=1.428, c2=-1.402,
-                          c4=0.078, m1=-0.209, m2=2.042,
-                          Imin=3):
+    def I_Allen2012_Rhypo_legacy(eq_mag, eq_depth, sta_dist,
+                                 c0=2.085, c1=1.428, c2=-1.402,
+                                 c4=0.078, m1=-0.209, m2=2.042,
+                                 Imin=3):
+        """
+        Preserve the historical Allen calculation and its defective cutoff.
+
+        This method is retained only to document and test the old behavior.
+        It substitutes each observation's own hypocentral distance into the
+        cutoff equation being solved. The alleged cutoff is therefore
+        station-dependent and changes between stations for the same event.
+        The far-distance term is also handled inconsistently while solving
+        that cutoff, and the historical caller compared epicentral distance
+        with a value derived from a hypocentral-distance equation.
+        Production code must not use this method.
+        """
         RM = m1 + m2 * np.exp(eq_mag - 5)
         R_hypo = np.sqrt(eq_depth ** 2 + sta_dist ** 2)
         I_sim = c0 + (c1 * eq_mag) + \
@@ -72,6 +84,39 @@ class Calculator(object):
                     / c2)) ** 2 - RM ** 2)
 
         return I_sim, max_dist
+
+    @staticmethod
+    def I_Allen2012_Rhypo(eq_mag, eq_depth, sta_dist,
+                          c0=2.085, c1=1.428, c2=-1.402,
+                          c4=0.078, m1=-0.209, m2=2.042):
+        """
+        Predict intensity from magnitude, depth, and epicentral distance.
+
+        The station distance is interpreted as epicentral kilometres and is
+        converted to hypocentral distance with the event depth. The Allen
+        far-distance term is applied only beyond 50 km hypocentral distance.
+        Scalar input returns one prediction, while a NumPy distance array
+        returns an array with the corresponding predictions.
+        """
+        station_distance = np.asarray(sta_dist)
+        RM = m1 + m2 * np.exp(eq_mag - 5)
+        R_hypo = np.sqrt(eq_depth ** 2 + station_distance ** 2)
+
+        # Calculate the common part first so the far-distance logarithm is not
+        # evaluated for observations at or inside the 50 km boundary.
+        I_sim = c0 + (c1 * eq_mag) + \
+            c2 * np.log(np.sqrt(R_hypo ** 2 + RM ** 2))
+
+        if R_hypo.ndim == 0:
+            if R_hypo > 50:
+                I_sim = I_sim + c4 * np.log(R_hypo / 50)
+            return I_sim.item()
+
+        I_sim = np.array(I_sim, copy=True)
+        far_distance = R_hypo > 50
+        I_sim[far_distance] = I_sim[far_distance] + \
+            c4 * np.log(R_hypo[far_distance] / 50)
+        return I_sim
     
     @staticmethod
     def predict_PGA_from_magnitude(magnitude, event_depth, log_scale=False):
