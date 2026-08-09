@@ -293,7 +293,11 @@ class FinDerManager:
         
         self.logger.info("Extacting raw amplitudes ...")
         if _esm_event and _esm_amplitude:
-            esm_raw = ESMShakeMapDataFormatter.extract_raw_stations(
+            esm_formatter = ESMShakeMapDataFormatter(
+                logger=self.logger,
+                configuration=self.configuration,
+            )
+            esm_raw = esm_formatter.extract_raw_stations(
                 event_data=_esm_event, amplitudes=_esm_amplitude)
         else:
             esm_raw = None

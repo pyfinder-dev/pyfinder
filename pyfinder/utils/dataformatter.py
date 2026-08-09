@@ -5,6 +5,7 @@ for the FinDer executable. """
 import numpy as np
 import datetime
 import logging
+import math
 from typing import List, Tuple
 import fnmatch
 from typing import Union
@@ -176,52 +177,190 @@ class BaseDataFormatter(object):
     
 class ESMShakeMapDataFormatter(BaseDataFormatter):
     """ Class for formatting the ESM ShakeMap data for the FinDer executable. """
-    def __init__(self, logger=None):
+    SUPPORTED_COMPONENT_SELECTIONS = (
+        "maximum-all",
+        "maximum-horizontal",
+    )
+
+    def __init__(self, logger=None, configuration=None):
         super().__init__(logger=logger)
+        self.configuration = (
+            pyfinderconfig if configuration is None else configuration)
+
+    def _component_selection(self):
+        """Return the configured component policy with its visible fallback."""
+        component_selection = self.configuration["general"][
+            "component-selection"]
+        if component_selection not in self.SUPPORTED_COMPONENT_SELECTIONS:
+            self.logger.critical(
+                "ESM component selection configuration %r is unsupported; "
+                "continuing with maximum-all",
+                component_selection,
+            )
+            return "maximum-all"
+        return component_selection
 
     @staticmethod
-    def extract_raw_stations(event_data, amplitudes) -> List[RawStationMeasurement]:
+    def _station_identity(station):
+        """Build the most useful station identity available for diagnostics."""
+        network_code = station.get_network_code()
+        station_code = station.get_station_code()
+        identity_parts = [
+            str(code).lstrip(".")
+            for code in (network_code, station_code)
+            if code not in (None, "")
+        ]
+        return ".".join(identity_parts) or "unknown station"
+
+    def _coordinate(self, station, coordinate_name, minimum, maximum,
+                    station_identity):
+        """Validate one ESM coordinate without changing its meaning."""
+        getter = getattr(station, f"get_{coordinate_name}")
+        provider_coordinate = getter()
+        if provider_coordinate is None:
+            self.logger.warning(
+                f"ESM station {station_identity} rejected: missing "
+                f"{coordinate_name}")
+            return None
+
+        try:
+            coordinate = float(provider_coordinate)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                f"ESM station {station_identity} rejected: nonnumeric "
+                f"{coordinate_name} {provider_coordinate!r}")
+            return None
+
+        if not math.isfinite(coordinate):
+            self.logger.warning(
+                f"ESM station {station_identity} rejected: nonfinite "
+                f"{coordinate_name} {provider_coordinate!r}")
+            return None
+        if not minimum <= coordinate <= maximum:
+            self.logger.warning(
+                f"ESM station {station_identity} rejected: {coordinate_name} "
+                f"{coordinate!r} is outside [{minimum}, {maximum}]")
+            return None
+        return coordinate
+
+    def _valid_acceleration(self, station_identity, component):
+        """Return one positive finite ESM acceleration, or reject it."""
+        component_name = component.get_component_name()
+        component_identity = (
+            str(component_name) if component_name not in (None, "")
+            else "unknown component"
+        )
+        provider_acceleration = component.get_acceleration()
+        diagnostic_prefix = (
+            f"ESM station {station_identity} component {component_identity} "
+            "rejected: "
+        )
+
+        if provider_acceleration is None:
+            self.logger.warning(diagnostic_prefix + "missing acceleration")
+            return None
+        try:
+            acceleration = float(provider_acceleration)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                diagnostic_prefix
+                + f"nonnumeric acceleration {provider_acceleration!r}")
+            return None
+
+        if not math.isfinite(acceleration):
+            self.logger.warning(
+                diagnostic_prefix
+                + f"nonfinite acceleration {provider_acceleration!r}")
+            return None
+        if acceleration == 0:
+            self.logger.warning(diagnostic_prefix + "zero acceleration")
+            return None
+        if acceleration < 0:
+            self.logger.warning(
+                diagnostic_prefix
+                + f"negative acceleration {provider_acceleration!r}")
+            return None
+        return acceleration
+
+    def extract_raw_stations(self, event_data,
+                             amplitudes) -> List[RawStationMeasurement]:
         """
-        Extract valid ESM station data for merging. 
+        Extract and normalize valid ESM station data for merging.
+
+        Component failures are isolated so a bad component cannot discard a
+        valid sibling or stop later stations from being processed.
         Used for merging the station data from different services.
         """
         raw_stations = []
         time_epoch = get_epoch_time(event_data.get_origin_time())
+        component_selection = self._component_selection()
 
         stations = amplitudes.get_stations()
         
         for station in stations:
-            best_pga = -np.inf
+            station_identity = self._station_identity(station)
+            latitude = self._coordinate(
+                station, "latitude", -90, 90, station_identity)
+            longitude = self._coordinate(
+                station, "longitude", -180, 180, station_identity)
+            if latitude is None or longitude is None:
+                continue
+
+            components = station.get_components()
+            eligible_components = []
+            for component in components:
+                component_name = component.get_component_name()
+                if (component_selection == "maximum-horizontal"
+                        and str(component_name).endswith("Z")):
+                    continue
+                eligible_components.append(component)
+
+            best_pga = None
             selected_channel = None
 
-            for channel in station.get_components():
-                acc = channel.get_acceleration()
-                if acc > best_pga:
-                    best_pga = acc
+            for channel in eligible_components:
+                acceleration = self._valid_acceleration(
+                    station_identity, channel)
+                if acceleration is not None and (
+                        best_pga is None or acceleration > best_pga):
+                    best_pga = acceleration
                     selected_channel = channel
 
-            if selected_channel is None or best_pga <= 0:
-                continue  # Skip stations with no valid component
+            if selected_channel is None:
+                if not components:
+                    reason = "component collection is empty"
+                elif not eligible_components:
+                    reason = (
+                        "no component is eligible under "
+                        f"{component_selection}")
+                else:
+                    reason = "all eligible components are invalid"
+                self.logger.warning(
+                    f"ESM station {station_identity} rejected: no eligible "
+                    f"valid component remains ({reason})")
+                continue
 
             # Strip codes
-            network_code = station.get_network_code().lstrip(".")
-            station_code = station.get_station_code().lstrip(".")
+            network_code = (station.get_network_code() or "").lstrip(".")
+            station_code = (station.get_station_code() or "").lstrip(".")
             channel_code = selected_channel.get_component_name().lstrip(".")
 
             location_code = ""
             if "." in channel_code:
-                location_code, channel_code = channel_code.split(".")
+                location_code, channel_code = channel_code.split(".", 1)
 
             raw_stations.append(RawStationMeasurement(
-                latitude=float(station.get_latitude()),
-                longitude=float(station.get_longitude()),
+                latitude=latitude,
+                longitude=longitude,
                 network=network_code,
                 station=station_code,
                 location=location_code,
                 channel=channel_code,
                 pga=Calculator.percent_g_to_cm_s2(best_pga),  # Convert to cm/s²
                 timestamp=time_epoch,
-                source="ESM"
+                source="ESM",
+                provider_value=best_pga,
+                provider_unit="%g",
             ))
 
         return raw_stations

@@ -88,13 +88,15 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
                     return_value=rrsm_raw,
                 ) as rrsm_formatter, \
                 patch.object(
-                    findermanager.ESMShakeMapDataFormatter,
-                    "extract_raw_stations",
-                    return_value=esm_raw,
-                ) as esm_formatter, \
+                    findermanager,
+                    "ESMShakeMapDataFormatter",
+                ) as esm_formatter_type, \
                 patch.object(findermanager, "StationMerger") as merger_type:
             rrsm_type.return_value.query.return_value = rrsm_result
             esm_type.return_value.query.return_value = esm_result
+            esm_formatter = (
+                esm_formatter_type.return_value.extract_raw_stations)
+            esm_formatter.return_value = esm_raw
 
             # A false merged value stops the legacy workflow immediately after
             # the values under test reach their current measurement consumers.
@@ -109,6 +111,7 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
             "rrsm_formatter": rrsm_formatter,
             "esm_type": esm_type,
             "esm_client": esm_type.return_value,
+            "esm_formatter_type": esm_formatter_type,
             "esm_formatter": esm_formatter,
             "merger_type": merger_type,
         }
@@ -157,6 +160,10 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         observed["esm_type"].assert_called_once_with()
         observed["esm_client"].query.assert_called_once_with(
             event_id=self.event_id)
+        observed["esm_formatter_type"].assert_called_once_with(
+            logger=observed["manager"].logger,
+            configuration=observed["manager"].configuration,
+        )
         observed["esm_formatter"].assert_called_once_with(
             event_data=esm_event,
             amplitudes=station_amplitudes,

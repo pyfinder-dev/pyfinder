@@ -21,6 +21,12 @@ pyfinderconfig = {
     "general": {
         # Web services ordered by priority
         "services": [ESM_SHAKEMAP_SERVICE, RRSM_PEAK_MOTION_SERVICE, EMSC_FEELT_REPORT_SERVICE],
+
+        # Choose the greatest valid acceleration from either every component
+        # or only non-vertical components. ESM applies this setting now; RRSM
+        # will adopt the same application-wide setting in its normalization
+        # refactor.
+        "component-selection": "maximum-all",
         
         # The default test event id for the FinDer executable
         "test-event-id": NORCIA_ITALY_EVENT_ID,
