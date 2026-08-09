@@ -250,6 +250,79 @@ class ESMObservationNormalizationTests(unittest.TestCase):
             for message in self._warning_messages(logger)
         ))
 
+    def test_invalid_converted_pga_is_warned_and_station_is_rejected(self):
+        cases = (
+            (1e308, "OVERFLOW", "HNE", "nonfinite"),
+            (5e-324, "UNDERFLOW", "HNN", "nonpositive"),
+        )
+        for provider_value, station_code, component_code, reason in cases:
+            with self.subTest(reason=reason):
+                converted_pga = Calculator.percent_g_to_cm_s2(provider_value)
+                if reason == "nonfinite":
+                    self.assertFalse(math.isfinite(converted_pga))
+                else:
+                    self.assertEqual(converted_pga, 0.0)
+
+                records, logger = self._extract([
+                    _Station(
+                        [_Component(component_code, provider_value)],
+                        station=station_code,
+                    )
+                ])
+
+                self.assertEqual(records, [])
+                warnings = self._warning_messages(logger)
+                self.assertTrue(any(
+                    "ESM" in message
+                    and f"NW.{station_code}" in message
+                    and component_code in message
+                    and "conversion" in message
+                    and reason in message
+                    and repr(provider_value) in message
+                    for message in warnings
+                ), warnings)
+                self.assertTrue(any(
+                    f"ESM station NW.{station_code}" in message
+                    and "no eligible valid component remains" in message
+                    and "all eligible components are invalid" in message
+                    for message in warnings
+                ), warnings)
+
+    def test_invalid_converted_pga_does_not_discard_valid_sibling(self):
+        cases = (
+            (1e308, "HNE", "nonfinite"),
+            (5e-324, "HNN", "nonpositive"),
+        )
+        valid_provider_value = 2.5
+        for invalid_provider_value, invalid_component, reason in cases:
+            with self.subTest(reason=reason):
+                records, logger = self._extract([
+                    _Station([
+                        _Component(invalid_component, invalid_provider_value),
+                        _Component("HN1", valid_provider_value),
+                    ], station="SIBLING")
+                ])
+
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                self.assertEqual(record["channel"], "HN1")
+                self.assertEqual(
+                    record["provider_value"], valid_provider_value)
+                self.assertEqual(
+                    record["pga"],
+                    Calculator.percent_g_to_cm_s2(valid_provider_value),
+                )
+                self.assertTrue(math.isfinite(record["pga"]))
+                self.assertGreater(record["pga"], 0)
+                self.assertTrue(any(
+                    "ESM" in message
+                    and "NW.SIBLING" in message
+                    and invalid_component in message
+                    and "conversion" in message
+                    and reason in message
+                    for message in self._warning_messages(logger)
+                ))
+
     def test_station_without_eligible_valid_component_is_warned(self):
         cases = (
             ([], "maximum-all", "component collection is empty"),

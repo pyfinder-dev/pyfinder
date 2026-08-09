@@ -244,7 +244,7 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
         return coordinate
 
     def _valid_acceleration(self, station_identity, component):
-        """Return one positive finite ESM acceleration, or reject it."""
+        """Return valid provider and normalized ESM accelerations."""
         component_name = component.get_component_name()
         component_identity = (
             str(component_name) if component_name not in (None, "")
@@ -280,7 +280,24 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
                 diagnostic_prefix
                 + f"negative acceleration {provider_acceleration!r}")
             return None
-        return acceleration
+
+        # Convert before station-level maximum selection so an overflow or
+        # underflow rejects only this component. A smaller valid sibling must
+        # remain available instead of being lost after raw-value selection.
+        converted_acceleration = Calculator.percent_g_to_cm_s2(acceleration)
+        if not math.isfinite(converted_acceleration):
+            self.logger.warning(
+                diagnostic_prefix
+                + "percent-g conversion produced nonfinite acceleration "
+                + f"from provider value {provider_acceleration!r}")
+            return None
+        if converted_acceleration <= 0:
+            self.logger.warning(
+                diagnostic_prefix
+                + "percent-g conversion produced nonpositive acceleration "
+                + f"from provider value {provider_acceleration!r}")
+            return None
+        return acceleration, converted_acceleration
 
     def extract_raw_stations(self, event_data,
                              amplitudes) -> List[RawStationMeasurement]:
@@ -315,15 +332,21 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
                     continue
                 eligible_components.append(component)
 
-            best_pga = None
+            selected_provider_pga = None
+            selected_converted_pga = None
             selected_channel = None
 
             for channel in eligible_components:
-                acceleration = self._valid_acceleration(
+                valid_acceleration = self._valid_acceleration(
                     station_identity, channel)
-                if acceleration is not None and (
-                        best_pga is None or acceleration > best_pga):
-                    best_pga = acceleration
+                if valid_acceleration is None:
+                    continue
+
+                provider_pga, converted_pga = valid_acceleration
+                if (selected_converted_pga is None
+                        or converted_pga > selected_converted_pga):
+                    selected_provider_pga = provider_pga
+                    selected_converted_pga = converted_pga
                     selected_channel = channel
 
             if selected_channel is None:
@@ -356,10 +379,10 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
                 station=station_code,
                 location=location_code,
                 channel=channel_code,
-                pga=Calculator.percent_g_to_cm_s2(best_pga),  # Convert to cm/s²
+                pga=selected_converted_pga,
                 timestamp=time_epoch,
                 source="ESM",
-                provider_value=best_pga,
+                provider_value=selected_provider_pga,
                 provider_unit="%g",
             ))
 
