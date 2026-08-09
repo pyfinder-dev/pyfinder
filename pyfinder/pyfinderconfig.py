@@ -23,9 +23,8 @@ pyfinderconfig = {
         "services": [ESM_SHAKEMAP_SERVICE, RRSM_PEAK_MOTION_SERVICE, EMSC_FEELT_REPORT_SERVICE],
 
         # Choose the greatest valid acceleration from either every component
-        # or only non-vertical components. ESM applies this setting now; RRSM
-        # will adopt the same application-wide setting in its normalization
-        # refactor.
+        # or only non-vertical components. The same application-wide setting
+        # applies to both ESM and RRSM normalization.
         "component-selection": "maximum-all",
         
         # The default test event id for the FinDer executable

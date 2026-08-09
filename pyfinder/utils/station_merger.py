@@ -2,7 +2,7 @@
 """ 
 Utility classes used when merging station/amplitude data from different web services. 
 """
-from typing import List, NotRequired, TypedDict
+from typing import List, TypedDict
 
 class RawStationMeasurement(TypedDict):
     """
@@ -17,10 +17,8 @@ class RawStationMeasurement(TypedDict):
     pga: float  # in cm/s/s
     timestamp: float 
     source: str  # "ESM" or "RRSM" etc.
-    # Provider-native provenance is populated by ESM now. It remains optional
-    # in the shared record until RRSM completes its own scientific migration.
-    provider_value: NotRequired[float]
-    provider_unit: NotRequired[str]
+    provider_value: float
+    provider_unit: str
 
 
 class StationMerger:

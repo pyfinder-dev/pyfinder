@@ -314,8 +314,17 @@ class FinDerManager:
 
         rrsm_raw = []
         if _rrsm_event and _rrsm_amplitude:
-            rrsm_raw = RRSMPeakMotionDataFormatter.extract_raw_stations(
+            rrsm_formatter = RRSMPeakMotionDataFormatter(
+                logger=self.logger,
+                configuration=self.configuration,
+            )
+            rrsm_raw = rrsm_formatter.extract_raw_stations(
                 event_data=_rrsm_amplitude, amplitudes=_rrsm_amplitude)
+
+        if not rrsm_raw:
+            self.logger.error(
+                f"RRSM produced zero usable normalized observations for "
+                f"event {event_id}")
         self.logger.info("Normalized observations extracted.")
 
         # ESM gets the priority over RRSM for event

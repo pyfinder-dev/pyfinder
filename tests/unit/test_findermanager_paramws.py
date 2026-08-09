@@ -85,10 +85,9 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         with patch.object(findermanager, "RRSMPeakMotionClient") as rrsm_type, \
                 patch.object(findermanager, "ESMShakeMapClient") as esm_type, \
                 patch.object(
-                    findermanager.RRSMPeakMotionDataFormatter,
-                    "extract_raw_stations",
-                    return_value=rrsm_raw,
-                ) as rrsm_formatter, \
+                    findermanager,
+                    "RRSMPeakMotionDataFormatter",
+                ) as rrsm_formatter_type, \
                 patch.object(
                     findermanager,
                     "ESMShakeMapDataFormatter",
@@ -96,6 +95,9 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
                 patch.object(findermanager, "StationMerger") as merger_type:
             rrsm_type.return_value.query.return_value = rrsm_result
             esm_type.return_value.query.return_value = esm_result
+            rrsm_formatter = (
+                rrsm_formatter_type.return_value.extract_raw_stations)
+            rrsm_formatter.return_value = rrsm_raw
             esm_formatter = (
                 esm_formatter_type.return_value.extract_raw_stations)
             esm_formatter.return_value = esm_raw
@@ -110,6 +112,7 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
             "result": result,
             "rrsm_type": rrsm_type,
             "rrsm_client": rrsm_type.return_value,
+            "rrsm_formatter_type": rrsm_formatter_type,
             "rrsm_formatter": rrsm_formatter,
             "esm_type": esm_type,
             "esm_client": esm_type.return_value,
@@ -133,6 +136,10 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         observed["rrsm_client"].query.assert_called_once_with(
             event_id=self.event_id)
         rrsm_event.get_event_data.assert_not_called()
+        observed["rrsm_formatter_type"].assert_called_once_with(
+            logger=observed["manager"].logger,
+            configuration=observed["manager"].configuration,
+        )
         observed["rrsm_formatter"].assert_called_once_with(
             event_data=peak_motion,
             amplitudes=peak_motion,

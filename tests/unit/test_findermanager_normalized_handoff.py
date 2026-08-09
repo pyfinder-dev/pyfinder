@@ -258,6 +258,43 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             and "zero usable normalized observations" in message
             for message in errors
         ), errors)
+        self.assertTrue(any(
+            "RRSM" in message
+            and "zero usable normalized observations" in message
+            for message in errors
+        ), errors)
+
+    def test_absent_rrsm_logs_error_and_usable_esm_still_reaches_finder(self):
+        esm_event = _EventModel("esm")
+        _rrsm_provider, esm_provider = self._provider_models()
+        esm_records = [{"source": "ESM"}]
+        merged_records = list(esm_records)
+
+        observed = self._exercise(
+            rrsm_event=None,
+            esm_event=esm_event,
+            rrsm_provider=None,
+            esm_provider=esm_provider,
+            rrsm_records=[],
+            esm_records=esm_records,
+            merged_records=merged_records,
+        )
+
+        observed["rrsm_extract"].assert_not_called()
+        observed["merger_type"].return_value.merge.assert_called_once_with(
+            esm_data=esm_records,
+            rrsm_data=[],
+        )
+        observed["executable"].execute.assert_called_once_with(
+            event_data=esm_event,
+            amplitudes=merged_records,
+        )
+        errors = self._messages(observed["manager"].logger.error)
+        self.assertTrue(any(
+            "RRSM" in message
+            and "zero usable normalized observations" in message
+            for message in errors
+        ), errors)
 
     def test_truthy_provider_models_cannot_replace_empty_normalized_lists(self):
         rrsm_event = _EventModel("rrsm")
@@ -292,6 +329,11 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         errors = self._messages(observed["manager"].logger.error)
         self.assertTrue(any(
             "ESM" in message
+            and "zero usable normalized observations" in message
+            for message in errors
+        ), errors)
+        self.assertTrue(any(
+            "RRSM" in message
             and "zero usable normalized observations" in message
             for message in errors
         ), errors)
