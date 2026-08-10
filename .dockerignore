@@ -1,0 +1,54 @@
+# The image is built from a wheel, so the context is an explicit source
+# allowlist. This keeps ignored and untracked runtime artifacts out even when
+# a developer's working tree contains them.
+**
+
+!Dockerfile
+!pyproject.toml
+!README.md
+!LICENSE
+
+!pyfinder/
+!pyfinder/*.py
+!pyfinder/finderconfigs/
+!pyfinder/finderconfigs/*.py
+!pyfinder/services/
+!pyfinder/services/*.py
+!pyfinder/utils/
+!pyfinder/utils/*.py
+
+!pyfinder/extern/
+!pyfinder/extern/finder_regional_wkt/
+!pyfinder/extern/finder_regional_wkt/**
+!pyfinder/extern/ne_110m_admin_0_countries/
+!pyfinder/extern/ne_110m_admin_0_countries/**
+
+# OS metadata is not a packaged resource even inside an accepted tree.
+**/.DS_Store
+**/Thumbs.db
+**/desktop.ini
+
+# Keep repository, test, runtime, credential, and retired downstream material
+# excluded even when a generic root filename exception would also match a
+# nested file with the same basename.
+.git/**
+.agent/**
+.pytest_cache/**
+tests/**
+assets/**
+legacy/**
+**/__pycache__/**
+**/*.py[cod]
+**/*.log
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite3
+**/*.sqlite3-*
+**/.pyfinder_alert_config*
+**/gmt.conf
+**/gmt.history
+**/runtime/**
+**/output/**
+pyfinder/extern/shakemap-conf-eu/**
