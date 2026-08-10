@@ -2,7 +2,10 @@
 """ Module for executing the FinDer executable, namely the FinDer file. """
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from copy import deepcopy
+import fcntl
+import logging
 import os
 import subprocess
 import sys
@@ -67,10 +70,11 @@ class FinDerExecutable(object):
         # Path to the FinDer executable
         self.executable_path: str = self.configuration["finder-executable"]["path"]
 
-        # A composed calculation logger is shared with the manager. Direct
-        # executable use may initialize its event-local logger after the
-        # workspace exists.
-        self.logger = logger
+        # Manager and provider diagnostics remain on this process-owned logger.
+        # Only the locked FinDer workspace phase temporarily replaces it.
+        self.logger = (
+            logger if logger is not None else logging.getLogger(__name__)
+        )
 
         # Working directory. It will be created for each event id
         self.working_directory: str = None
@@ -126,28 +130,6 @@ class FinDerExecutable(object):
         """ Get the channels used by the FinDer executable. """
         return self.finder_used_channels
     
-    def _initialize_logger(self):
-        """ Initialize the logger. """
-        if self.logger is not None:
-            return
-
-        log_file = self.configuration["finder-executable"]["log-file-name"]
-        overwrite_log_file = self.configuration["logging"]["overwrite-log-file"]
-        rotate_log_file = self.configuration["logging"]["rotate-log-file"]
-
-        event_output_folder = self.get_working_directory()
-
-        if log_file is not None:
-            log_file = os.path.join(event_output_folder, log_file)
-        else:
-            # Default log file name, if something goes wrong with the configuration
-            log_file = os.path.join(event_output_folder, "pyfinder.log")
-
-        # Create the logger
-        self.logger = customlogger.file_logger(
-            log_file=log_file, module_name="pyfinder", 
-            overwrite=overwrite_log_file, rotate=rotate_log_file)
-
     def _prepare_workspace(self, augmented_event_id):
         """ 
         Parepares the working environment for running the FinDer executable.
@@ -168,23 +150,111 @@ class FinDerExecutable(object):
         # file. PyFinder only rewrites the two invocation files it owns.
         self.working_directory = str(workspace)
         os.makedirs(self.working_directory, exist_ok=True)
-        
-        # Initialize the logger with a log file inside the working directory
-        self._initialize_logger()
-        self.logger.info("START... Initiated with '{}'".format(self.options['command_line_args']))
-        self.logger.info(
-            "Augmented event ID: {}".format(augmented_event_id)
+
+    @contextmanager
+    def _workspace_lock(self):
+        """Exclusively lock this augmented workspace for one invocation."""
+        lock_file_path = os.path.join(
+            self.working_directory,
+            ".pyfinder.lock",
         )
-        self.logger.info("FinDer executable path: {}".format(self.executable_path))
-        self.logger.info("Output root folder: {}".format(output_root_folder))
+        with open(lock_file_path, "a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-        self.logger.info("Event output folder: {}".format(self.working_directory))
-        
-        # Dump the configuration to the log file
-        self.logger.debug("Self configuration: {}".format(json.dumps(self.configuration, indent=4)))
+    @contextmanager
+    def _workspace_phase(self, augmented_event_id):
+        """Use the event log only while this process owns the workspace."""
+        process_logger = self.logger
+        process_logger_name = getattr(process_logger, "name", None)
+        if not isinstance(process_logger_name, str) or not process_logger_name:
+            process_logger_name = type(process_logger).__name__
+        workspace_log_path = os.path.join(
+            self.working_directory,
+            "pyfinder.log",
+        )
 
-        # Write the FinDer configuration file
-        self._write_finder_configuration()
+        process_logger.info(
+            "Calculation %s is waiting to enter the locked FinDer workspace "
+            "phase; workspace=%s; pyfinder_log=%s",
+            augmented_event_id,
+            self.working_directory,
+            workspace_log_path,
+        )
+
+        try:
+            try:
+                with self._workspace_lock():
+                    with customlogger.transient_file_logger(
+                        workspace_log_path
+                    ) as workspace_logger:
+                        self.logger = workspace_logger
+                        workspace_logger.info(
+                            "Entered locked FinDer workspace phase for %s; "
+                            "originating_process_logger=%s",
+                            augmented_event_id,
+                            process_logger_name,
+                        )
+                        workspace_logger.info(
+                            "START... Initiated with '%s'",
+                            self.options["command_line_args"],
+                        )
+                        workspace_logger.info(
+                            "Augmented event ID: %s",
+                            augmented_event_id,
+                        )
+                        workspace_logger.info(
+                            "FinDer executable path: %s",
+                            self.executable_path,
+                        )
+                        workspace_logger.info(
+                            "Event output folder: %s",
+                            self.working_directory,
+                        )
+                        workspace_logger.debug(
+                            "Self configuration: %s",
+                            json.dumps(self.configuration, indent=4),
+                        )
+                        try:
+                            yield
+                        except BaseException as exc:
+                            workspace_logger.error(
+                                "Leaving locked FinDer workspace phase for %s "
+                                "with failure: %s",
+                                augmented_event_id,
+                                exc,
+                                exc_info=True,
+                            )
+                            raise
+                        else:
+                            workspace_logger.info(
+                                "Leaving locked FinDer workspace phase "
+                                "successfully for %s",
+                                augmented_event_id,
+                            )
+            finally:
+                # The transient handler closes before the lock is released; the
+                # stable process logger is restored after both lifetimes end.
+                self.logger = process_logger
+        except BaseException as exc:
+            process_logger.error(
+                "Calculation %s failed in the locked FinDer workspace phase; "
+                "pyfinder_log=%s; error=%s",
+                augmented_event_id,
+                workspace_log_path,
+                exc,
+            )
+            raise
+        else:
+            process_logger.info(
+                "Calculation %s completed the locked FinDer workspace phase; "
+                "pyfinder_log=%s",
+                augmented_event_id,
+                workspace_log_path,
+            )
     
     
     def _write_finder_configuration(self):
@@ -433,6 +503,12 @@ class FinDerExecutable(object):
     ):
         """Write the existing FinDer configuration and input data files."""
         self._prepare_workspace(augmented_event_id)
+        with self._workspace_phase(augmented_event_id):
+            return self._materialize_inputs(amplitudes, event_data)
+
+    def _materialize_inputs(self, amplitudes, event_data):
+        """Write invocation inputs while the caller owns the workspace lock."""
+        self._write_finder_configuration()
         data_path, self.finder_used_channels = self._write_data_for_finder(
             amplitudes,
             event_data,
@@ -460,36 +536,36 @@ class FinDerExecutable(object):
         
         # Get the event id to create the working directory
         event_id = event_data.get_event_id()
-        
-        self.materialize_inputs(
-            amplitudes,
-            event_data,
-            augmented_event_id=augmented_event_id,
-        )
-        
-        try:
-            # Execute the FinDer executable
-            self._run_finder()
 
-            # Log the success and collect the output
-            self.logger.info(f"FinDer execution completed. Now collecting the output...")
+        self._prepare_workspace(augmented_event_id)
+        # FinDer reads these shared workspace inputs throughout its invocation,
+        # so another process must not rewrite them until output collection ends.
+        with self._workspace_phase(augmented_event_id):
+            self._materialize_inputs(amplitudes, event_data)
 
-            # Collect the output of the executable
-            self._collect_finder_output(event_id=event_id)
-            
-        except Exception as e:
-            # Log the error and exit
-            self.logger.error(f"Error executing FinDer:")
-            self.logger.error(f"{e}")
-            sys.exit(1)
+            try:
+                # Execute the FinDer executable
+                self._run_finder()
 
-        finally:
-            # The end of the execution
-            _exec_end = datetime.now()
-            _exec_time = _exec_end - _exec_start
-            _exec_time_min = round(_exec_time.total_seconds() / 60, 2)
+                # Log the success and collect the output
+                self.logger.info(f"FinDer execution completed. Now collecting the output...")
 
-            self.logger.info(f"execute() FINISHED... Elapsed time is {_exec_time} ({_exec_time_min} minutes)")
+                # Collect the output of the executable
+                self._collect_finder_output(event_id=event_id)
+
+            except Exception as e:
+                # Log the error and exit
+                self.logger.error(f"Error executing FinDer:")
+                self.logger.error(f"{e}")
+                sys.exit(1)
+
+            finally:
+                # The end of the execution
+                _exec_end = datetime.now()
+                _exec_time = _exec_end - _exec_start
+                _exec_time_min = round(_exec_time.total_seconds() / 60, 2)
+
+                self.logger.info(f"execute() FINISHED... Elapsed time is {_exec_time} ({_exec_time_min} minutes)")
 
         # Return the self object for further use
         return self

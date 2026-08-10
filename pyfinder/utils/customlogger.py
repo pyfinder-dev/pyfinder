@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """PyFinder's isolated file-logger configuration."""
 
+from contextlib import contextmanager
 import logging
 import logging.handlers
 import os
@@ -167,3 +168,27 @@ def file_logger(
         _CONFIGURATIONS[configuration_key] = (logger, rotate)
         _DESTINATION_OWNERS[destination] = logical_name
         return logger
+
+
+@contextmanager
+def transient_file_logger(log_file, level=logging.DEBUG):
+    """Yield one append-only logger whose handler is closed on exit."""
+    destination = os.path.abspath(os.fspath(log_file))
+    handler = _new_handler(destination, overwrite=False, rotate=False)
+    logger = None
+    try:
+        handler.setLevel(logging.NOTSET)
+        handler.setFormatter(FileLoggingFormatter())
+
+        logger = logging.Logger(
+            "pyfinder.transient@{0}".format(destination)
+        )
+        logger.setLevel(level)
+        logger.propagate = False
+        _attach_custom_methods(logger)
+        logger.addHandler(handler)
+        yield logger
+    finally:
+        if logger is not None:
+            logger.removeHandler(handler)
+        handler.close()

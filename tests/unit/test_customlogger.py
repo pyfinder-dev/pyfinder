@@ -377,6 +377,28 @@ class CustomLoggerTests(unittest.TestCase):
             start_marker = lines[line_number].split("-start", 1)[0].split()[-1]
             self.assertIn(start_marker + "-end", lines[line_number + 1])
 
+    def test_transient_file_logger_appends_without_registry_or_handler_leaks(self):
+        path = self.directory / "transient.log"
+        path.write_text("existing content\n", encoding="utf-8")
+        configurations_before = dict(customlogger._CONFIGURATIONS)
+        owners_before = dict(customlogger._DESTINATION_OWNERS)
+
+        with customlogger.transient_file_logger(path) as logger:
+            handler = logger.handlers[0]
+            logger.ok("transient custom method")
+            logger.finder("transient finder output")
+            self.flush(logger)
+            self.assertIsNotNone(handler.stream)
+
+        self.assertEqual(logger.handlers, [])
+        self.assertIsNone(handler.stream)
+        self.assertEqual(customlogger._CONFIGURATIONS, configurations_before)
+        self.assertEqual(customlogger._DESTINATION_OWNERS, owners_before)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("existing content", content)
+        self.assertIn("transient custom method", content)
+        self.assertIn("transient finder output", content)
+
 
 if __name__ == "__main__":
     unittest.main()
