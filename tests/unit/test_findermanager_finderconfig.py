@@ -126,6 +126,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             arguments = {
                 "options": {"use_library": False},
                 "configuration": self.application_configuration(),
+                "logger": logger,
                 "metadata": metadata,
                 "finder_configuration_name": finder_configuration_name,
                 "finder_configuration": finder_configuration,
@@ -167,26 +168,21 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         executable_type.assert_not_called()
 
     def test_omitted_on_demand_decision_defers_until_provider_context(self):
-        events = []
         logger = mock.Mock()
         selector = SelectorDouble(
             name="regional",
             configuration={"DATA_FOLDER": "regional-data"},
         )
 
-        def configure_logger(**kwargs):
-            events.append("logger")
-            return logger
-
         with mock.patch.object(
             findermanager.customlogger,
             "file_logger",
-            side_effect=configure_logger,
-        ), mock.patch.object(
+            autospec=True,
+        ) as file_logger, mock.patch.object(
             findermanager,
             "build_default_selector",
             return_value=selector,
-        ) as selector_builder, mock.patch.object(
+        ), mock.patch.object(
             findermanager,
             "RRSMPeakMotionClient",
         ) as rrsm_client, mock.patch.object(
@@ -196,11 +192,12 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             manager = findermanager.FinDerManager.for_on_demand(
                 options={"use_library": False},
                 configuration=self.application_configuration(),
+                logger=logger,
                 metadata={"emsc_latitude": "46.2", "emsc_longitude": "7.3"},
             )
 
-        self.assertEqual(events, ["logger"])
-        selector_builder.assert_not_called()
+        file_logger.assert_not_called()
+        self.assertIs(manager.logger, logger)
         selector.resolve.assert_not_called()
         self.assertIsNone(manager.finder_configuration_name)
         self.assertIsNone(manager.finder_configuration)
@@ -407,6 +404,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             configuration=manager.configuration,
             finder_configuration_name=manager.finder_configuration_name,
             finder_configuration=manager.finder_configuration,
+            logger=manager.logger,
         )
         executable_instance.execute.assert_called_once_with(
             event_data=manager.event_context,

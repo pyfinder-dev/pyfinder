@@ -1,8 +1,10 @@
 """Unit tests for logged policy validation at service startup boundaries."""
 
+from copy import deepcopy
 import socket
 import sqlite3
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -26,6 +28,22 @@ class ImmediateThread:
 
 
 class PolicyStartupTests(unittest.TestCase):
+    @staticmethod
+    def runtime_context():
+        return SimpleNamespace(
+            process_log_path="/runtime/logs/continuous/monitoring.log",
+            listener_log_path=(
+                "/runtime/logs/continuous/seismiclistener.log"
+            ),
+            scheduler_log_path=(
+                "/runtime/logs/continuous/followupscheduler.log"
+            ),
+            operational_database_path=(
+                "/runtime/state/scheduled_queries.sqlite3"
+            ),
+            isolated_configuration=deepcopy,
+        )
+
     def setUp(self):
         start_monitoring._listener_thread = None
         start_monitoring._scheduler = None
@@ -77,9 +95,11 @@ class PolicyStartupTests(unittest.TestCase):
             socket, "socket", autospec=True
         ) as socket_constructor:
             with self.assertRaisesRegex(ValueError, "invalid startup policy"):
-                start_monitoring.start_services()
+                start_monitoring.start_services(
+                    runtime_context=self.runtime_context()
+                )
 
-        self.assertEqual(events, ["logger", "policy"])
+        self.assertEqual(events, ["logger", "logger", "logger", "policy"])
         logger.exception.assert_called_once()
         selector_builder.assert_not_called()
         thread_constructor.assert_not_called()
@@ -125,10 +145,10 @@ class PolicyStartupTests(unittest.TestCase):
             events.append("listener-thread")
             return ImmediateThread(target=target, daemon=daemon)
 
-        def start_listener(*, policy):
+        def start_listener(**kwargs):
             events.append("listener")
 
-        def construct_scheduler(*, service_policies, finder_config_selector):
+        def construct_scheduler(**kwargs):
             events.append("scheduler")
             return scheduler_instance
 
@@ -157,11 +177,15 @@ class PolicyStartupTests(unittest.TestCase):
             "FollowUpScheduler",
             side_effect=construct_scheduler,
         ) as scheduler_constructor:
-            start_monitoring.start_services()
+            start_monitoring.start_services(
+                runtime_context=self.runtime_context()
+            )
 
         self.assertEqual(
             events,
             [
+                "logger",
+                "logger",
                 "logger",
                 "policy",
                 "selector",
@@ -171,7 +195,6 @@ class PolicyStartupTests(unittest.TestCase):
             ],
         )
         selector_builder.assert_called_once_with(logger=logger)
-        self.assertEqual(listener_start.call_args.kwargs, {"policy": rrsm_policy})
         self.assertIs(listener_start.call_args.kwargs["policy"], rrsm_policy)
         self.assertIs(
             scheduler_constructor.call_args.kwargs["service_policies"],
@@ -249,10 +272,15 @@ class PolicyStartupTests(unittest.TestCase):
             autospec=True,
         ) as socket_constructor:
             with self.assertRaises(GlobalFinderConfigError) as raised:
-                start_monitoring.start_services()
+                start_monitoring.start_services(
+                    runtime_context=self.runtime_context()
+                )
 
         self.assertIs(raised.exception, error)
-        self.assertEqual(events, ["logger", "policy", "selector"])
+        self.assertEqual(
+            events,
+            ["logger", "logger", "logger", "policy", "selector"],
+        )
         selector_builder.assert_called_once_with(logger=logger)
         logger.critical.assert_called_once()
         self.assertIs(logger.critical.call_args.kwargs["exc_info"], True)
@@ -289,7 +317,7 @@ class PolicyStartupTests(unittest.TestCase):
         with mock.patch(
             "pyfinder.utils.customlogger.file_logger",
             side_effect=configure_logger,
-        ), mock.patch.object(
+        ) as file_logger, mock.patch.object(
             querypolicy,
             "RRSMQueryPolicy",
             side_effect=fail_validation,
@@ -301,9 +329,10 @@ class PolicyStartupTests(unittest.TestCase):
             socket, "socket", autospec=True
         ) as socket_constructor:
             with self.assertRaisesRegex(ValueError, "invalid listener policy"):
-                seismiclistener.start_emsc_listener()
+                seismiclistener.start_emsc_listener(logger=logger)
 
-        self.assertEqual(events, ["logger", "policy"])
+        self.assertEqual(events, ["policy"])
+        file_logger.assert_not_called()
         logger.exception.assert_called_once()
         tracker_constructor.assert_not_called()
         database_connect.assert_not_called()

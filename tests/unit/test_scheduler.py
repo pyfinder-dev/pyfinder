@@ -134,6 +134,8 @@ class ManagerFactory:
         metadata,
         event_context,
         context_diagnostic,
+        configuration,
+        logger,
         finder_configuration_name=None,
         finder_configuration=None,
     ):
@@ -143,6 +145,8 @@ class ManagerFactory:
                 "metadata": metadata,
                 "event_context": event_context,
                 "context_diagnostic": context_diagnostic,
+                "configuration": configuration,
+                "logger": logger,
                 "finder_configuration_name": finder_configuration_name,
                 "finder_configuration": finder_configuration,
             }
@@ -250,6 +254,9 @@ def make_scheduler(
     """Build a scheduler without invoking unrelated production startup work."""
     instance = FollowUpScheduler.__new__(FollowUpScheduler)
     instance.logger = mock.Mock()
+    instance.configuration = {
+        "finder-executable": {"output-root-folder": "/runtime/work"}
+    }
     instance.tracker = tracker
     instance.service_policies = (
         {SERVICE: RRSMQueryPolicy()}
@@ -494,6 +501,8 @@ class SchedulerExecutionTests(unittest.TestCase):
             construction["finder_configuration"],
             selected_configuration,
         )
+        self.assertIs(construction["configuration"], scheduler.configuration)
+        self.assertIs(construction["logger"], scheduler.logger)
         self.assertEqual(manager.run_event_ids, [EVENT_ID])
         tracker.mark_completed.assert_called_once()
 
@@ -1153,7 +1162,9 @@ class SchedulerStartupTests(unittest.TestCase):
                 "pyfinder.utils.config_fetcher": config_fetcher,
             },
         ):
-            instance = FollowUpScheduler()
+            instance = FollowUpScheduler(
+                db_path="/runtime/state/scheduled_queries.sqlite3"
+            )
 
         self.assertEqual(
             events,

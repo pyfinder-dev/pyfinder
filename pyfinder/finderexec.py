@@ -31,6 +31,7 @@ class FinDerExecutable(object):
         configuration: dict,
         finder_configuration_name,
         finder_configuration,
+        logger=None,
     ):
         # Options from the command line arguments
         self.options: dict = options
@@ -65,8 +66,10 @@ class FinDerExecutable(object):
         # Path to the FinDer executable
         self.executable_path: str = self.configuration["finder-executable"]["path"]
 
-        # The logger
-        self.logger = None
+        # A composed calculation logger is shared with the manager. Direct
+        # executable use may initialize its event-local logger after the
+        # workspace exists.
+        self.logger = logger
 
         # Working directory. It will be created for each event id
         self.working_directory: str = None
@@ -124,6 +127,9 @@ class FinDerExecutable(object):
     
     def _initialize_logger(self):
         """ Initialize the logger. """
+        if self.logger is not None:
+            return
+
         log_file = self.configuration["finder-executable"]["log-file-name"]
         overwrite_log_file = self.configuration["logging"]["overwrite-log-file"]
         rotate_log_file = self.configuration["logging"]["rotate-log-file"]
@@ -148,32 +154,14 @@ class FinDerExecutable(object):
         config file configured for this event.
         """
         output_root_folder = self.get_configured_root_folder()
-        has_write_access = os.access(output_root_folder, os.W_OK)
-        
-        # Create the output root folder if it does not exist
-        if not os.path.exists(output_root_folder):
-            os.makedirs(output_root_folder)
-        else:
-            # Check if the output root folder is a directory and not a file
-            if not os.path.isdir(output_root_folder):
-                raise NotADirectoryError(
-                    "The output root folder is not a directory: {}".format(output_root_folder))
-            
-        # Check if we have write access to the output root folder
-        is_workdir_overriden = False
-        if not has_write_access:
-            # Use ~/pyfinder-output as the default output folder
-            output_root_folder = os.path.join(os.path.expanduser("~"), "pyfinder-output")
-            is_workdir_overriden = True
-
-        # Check if the output root folder exists
-        if not os.path.exists(output_root_folder):
-            os.makedirs(output_root_folder)
+        # Creating the configured directory is the authoritative permission
+        # check. Filesystem errors propagate; execution never selects a CWD or
+        # home-directory substitute.
+        os.makedirs(output_root_folder, exist_ok=True)
 
         # Create a working directory with the event id that is currently being processed
         self.working_directory = os.path.join(output_root_folder, str(event_id))
-        if not os.path.exists(self.working_directory):
-            os.makedirs(self.working_directory)
+        os.makedirs(self.working_directory, exist_ok=True)
         
         # Initialize the logger with a log file inside the working directory
         self._initialize_logger()
@@ -182,18 +170,6 @@ class FinDerExecutable(object):
         self.logger.info("FinDer executable path: {}".format(self.executable_path))
         self.logger.info("Output root folder: {}".format(output_root_folder))
 
-        if is_workdir_overriden:
-            # Log a warning if the output root folder is overriden due 
-            # to write permission issues
-            self.logger.warning(f"No write access to the configured output root folder: " + \
-                                f"{self.get_configured_root_folder()}")
-            self.logger.warning(f"Your path is overriden!")
-            
-        # Check if we have write access to the event output folder again.
-        # We should be OK at this point.
-        has_write_access = os.access(self.working_directory, os.W_OK)
-        self.logger.debug("Write permission check: {}".format
-                          ("Access granted" if has_write_access else "Access denied"))
         self.logger.info("Event output folder: {}".format(self.working_directory))
         
         # Dump the configuration to the log file

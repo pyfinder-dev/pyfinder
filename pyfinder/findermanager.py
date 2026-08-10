@@ -89,6 +89,7 @@ class FinDerManager:
         metadata=None,
         finder_configuration_name=None,
         finder_configuration=None,
+        logger=None,
         *,
         entry_kind,
         event_context=None,
@@ -128,14 +129,9 @@ class FinDerManager:
         # Working directory
         self.working_dir = None
 
-        # The logger for the FinDerManager
-        self.logger = customlogger.file_logger(
-            module_name="FinDerManager",
-            log_file="finder_manager.log",
-            rotate=True,
-            overwrite=True,
-            level=logging.DEBUG
-        )
+        # Composition owns file destinations. Direct library construction uses
+        # a standard non-file logger and never opens a shared manager log.
+        self.logger = logger or logging.getLogger(__name__)
 
         if isinstance(self.event_context, EventContext):
             self._populate_metadata_from_event_context(self.event_context)
@@ -825,6 +821,7 @@ class FinDerManager:
                 configuration=self.configuration,
                 finder_configuration_name=self.finder_configuration_name,
                 finder_configuration=self.finder_configuration,
+                logger=self.logger,
             )
             executable = finder_executable.execute(
                 event_data=_event_data,
@@ -912,7 +909,7 @@ class FinDerManager:
             return executable.get_finder_solution_object()
             
     
-def run_cli(arguments):
+def run_cli(arguments, *, runtime_context):
     """Run the existing on-demand manager from parsed CLI arguments."""
     options = {
         "verbosity": arguments.verbosity,
@@ -933,9 +930,20 @@ def run_cli(arguments):
     
     # Execute the FinDer manager, which will call either the FinDer library 
     # or executable based on the options
+    process_logger = customlogger.file_logger(
+        runtime_context.process_log_path,
+        module_name="OnDemand",
+        rotate=True,
+        overwrite=False,
+        level=getattr(logging, options["verbosity"]),
+    )
+    application_configuration = runtime_context.isolated_configuration(
+        pyfinderconfig
+    )
     manager = FinDerManager.for_on_demand(
         options=options,
-        configuration=pyfinderconfig,
+        configuration=application_configuration,
+        logger=process_logger,
     )
     solution = manager.run(event_id=options["event_id"])
     if solution is not None:

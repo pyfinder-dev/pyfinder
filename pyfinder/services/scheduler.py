@@ -7,6 +7,7 @@ handles the results.
 """
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import threading
 
 from pyfinder.eventcontext import EventContext
@@ -16,7 +17,6 @@ from pyfinder.finderconfigs import (
 )
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.services.querypolicy import build_service_policies
-from pyfinder.utils.customlogger import file_logger
 
 
 class SchedulerLifecycleError(RuntimeError):
@@ -36,9 +36,13 @@ class FollowUpScheduler:
         tracker: EventTracker=None,
         service_policies=None,
         finder_config_selector=None,
+        db_path=None,
+        logger=None,
+        configuration=None,
     ):
-        # Create a logger for the FollowUpScheduler and its sub-tasks
-        self.logger = self._setup_file_logger()
+        # Supported process composition supplies the scheduler-owned logger.
+        # Direct construction retains a non-file logger for library use.
+        self.logger = logger or self._setup_file_logger()
         self._welcome_message(self.logger)
 
         if service_policies is None:
@@ -71,9 +75,20 @@ class FollowUpScheduler:
 
         self._finder_manager_class = FinDerManager
 
+        if configuration is None:
+            from pyfinder.pyfinderconfig import pyfinderconfig
+
+            configuration = pyfinderconfig
+        self.configuration = configuration
+
         # Initialize the EventTracker for managing event updates
         if tracker is None:
-            tracker = EventTracker("event_update_follow_up.db")
+            if db_path is None:
+                raise ValueError(
+                    "the scheduler requires an explicit operational "
+                    "database path when no tracker is supplied"
+                )
+            tracker = EventTracker(str(db_path))
         self.tracker = tracker
         self.tracker.set_logger(self.logger)
         self.logger.info("EventTracker initialized for the scheduler.")
@@ -123,19 +138,16 @@ class FollowUpScheduler:
         logger.info("... Testing logger functionality ...")
         logger.error("This is an error message for testing purposes.")
         logger.info("This is an info message for testing purposes.")
-        logger.ok("This is an ok message for testing purposes.")
+        getattr(logger, "ok", logger.info)(
+            "This is an ok message for testing purposes."
+        )
         logger.info("---------------------------------------------------------")
         logger.info("BEGIN: Init FollowUpScheduler")
 
     @staticmethod
     def _setup_file_logger():
-        """ Set up a file logger for the FollowUpScheduler."""
-        return file_logger(
-            module_name="FollowUpScheduler",
-            log_file="followupscheduler.log",
-            rotate=True,
-            overwrite=False
-            )
+        """Return a non-file fallback for direct library construction."""
+        return logging.getLogger(__name__)
 
     @staticmethod
     def _failure_diagnostic(prefix, error):
@@ -264,7 +276,6 @@ class FollowUpScheduler:
 
         finder_options = {
             "verbosity": "INFO",
-            "log_file": None,
             "with_seiscomp": True,
             "event_id": event_id,
             "test": False,
@@ -301,6 +312,8 @@ class FollowUpScheduler:
             )
             manager_arguments = {
                 "options": finder_options,
+                "configuration": self.configuration,
+                "logger": self.logger,
                 "metadata": solution_metadata,
                 "event_context": event_context,
                 "context_diagnostic": context_diagnostic,

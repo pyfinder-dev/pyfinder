@@ -271,21 +271,17 @@ def launch_client(
             yield sleep(5)
 
 
-def start_emsc_listener(policy=None):
-    """Start the Seismic Portal WebSocket listener service."""
-    # The listener logger must exist before standalone startup validates its
-    # policy. Parent startup may supply the already-validated policy instead.
+def start_emsc_listener(
+    policy=None,
+    *,
+    db_path=None,
+    logger=None,
+    configuration=None,
+):
+    """Start the listener with explicitly composed persistence and logging."""
     from functools import partial
 
-    from pyfinder.utils.customlogger import file_logger
-
-    logger = file_logger(
-        module_name="SeismicListener",
-        log_file="seismiclistener.log",
-        rotate=True,
-        overwrite=False,
-        level=logging.DEBUG,
-    )
+    logger = logger or logging.getLogger(__name__)
 
     if policy is None:
         try:
@@ -298,16 +294,24 @@ def start_emsc_listener(policy=None):
             )
             raise
 
+    if db_path is None:
+        raise ValueError(
+            "the EMSC listener requires an explicit operational database path"
+        )
+
     # Operational runtime imports and construction occur only after policy
     # validation has succeeded at this startup boundary.
     from tornado import gen
     from tornado.ioloop import IOLoop
     from tornado.websocket import websocket_connect
 
-    from pyfinder.pyfinderconfig import pyfinderconfig
     from pyfinder.services.eventtracker import EventTracker
 
-    listener_config = pyfinderconfig.get("seismic-portal-listener", {})
+    if configuration is None:
+        from pyfinder.pyfinderconfig import pyfinderconfig
+
+        configuration = pyfinderconfig
+    listener_config = configuration.get("seismic-portal-listener", {})
     target_regions = normalize_target_regions(
         listener_config.get("target-regions")
     )
@@ -317,7 +321,7 @@ def start_emsc_listener(policy=None):
     echo_uri = listener_config["echo-uri"]
     ping_interval = listener_config["ping-interval"]
 
-    tracker = EventTracker("event_update_follow_up.db", logger=logger)
+    tracker = EventTracker(str(db_path), logger=logger)
     handoff = _make_eventtracker_handoff(tracker, policy, logger)
     processor = partial(
         process_emsc_message,

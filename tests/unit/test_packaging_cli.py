@@ -313,14 +313,14 @@ threading.Thread.start = reject_operation
 
         self.assertEqual(tuple(self.outside_directory.iterdir()), ())
 
-    def test_installed_console_rejects_invalid_grammar_and_unbootstrapped_run(self):
+    def test_installed_console_rejects_invalid_grammar_and_missing_runtime(self):
         script_path = self.installed_target / "bin" / "pyfinder"
         environment = self.installed_environment()
         cases = (
             (
                 ("continuous",),
-                "workflow execution requires the configured persistent "
-                "runtime bootstrap",
+                "required runtime directory does not exist: "
+                "/home/sysop/runtime/pyfinder",
             ),
             (("on-demand",), "one of the arguments"),
             (
@@ -539,8 +539,11 @@ class CommandDispatchTests(unittest.TestCase):
                     **{callable_name: workflow_callable}
                 )
 
+                runtime_context = object()
+
                 def bootstrap(workflow):
                     operations.append(("bootstrap", workflow))
+                    return runtime_context
 
                 def importer(requested_module):
                     operations.append(("import", requested_module))
@@ -566,9 +569,14 @@ class CommandDispatchTests(unittest.TestCase):
                     ],
                 )
                 if command == "continuous":
-                    workflow_callable.assert_called_once_with()
+                    workflow_callable.assert_called_once_with(
+                        runtime_context=runtime_context
+                    )
                 else:
-                    workflow_callable.assert_called_once_with(arguments)
+                    workflow_callable.assert_called_once_with(
+                        arguments,
+                        runtime_context=runtime_context,
+                    )
 
 
 if __name__ == "__main__":

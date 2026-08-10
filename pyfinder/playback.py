@@ -1,6 +1,5 @@
 from collections.abc import Mapping
 from copy import deepcopy
-import os
 import sys
 import json
 from datetime import datetime, timezone
@@ -12,6 +11,8 @@ from pyfinder.eventcontext import EventContext, EventContextError
 from pyfinder.services.scheduler import FollowUpScheduler
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.services.querypolicy import RRSMQueryPolicy
+from pyfinder.pyfinderconfig import pyfinderconfig
+from pyfinder.utils.customlogger import file_logger
 from pyfinder.utils.timeutils import get_epoch_time
 
 
@@ -296,17 +297,36 @@ class EventAlertWSPlaybackManager:
             self.index = 0
 
 
-def run_cli(arguments):
+def run_cli(arguments, *, runtime_context):
     """Run the existing playback workflow from parsed CLI arguments."""
     playback = None
     scheduler = None
+    tracker = None
+    scheduler_stopped = False
+    process_logger = file_logger(
+        runtime_context.process_log_path,
+        module_name="Playback",
+        rotate=True,
+        overwrite=False,
+    )
+    scheduler_logger = file_logger(
+        runtime_context.scheduler_log_path,
+        module_name="PlaybackFollowUpScheduler",
+        rotate=True,
+        overwrite=False,
+    )
+    application_configuration = runtime_context.isolated_configuration(
+        pyfinderconfig
+    )
 
     def handle_shutdown(signum, frame):
+        nonlocal scheduler_stopped
         print("\n[Main] Interrupt received. Shutting down...")
         if playback is not None:
             playback.pause()
         if scheduler is not None:
             scheduler.shutdown()
+            scheduler_stopped = True
 
     # The predefined list of events to be played back
     event_list = generate_event_list()
@@ -329,31 +349,44 @@ def run_cli(arguments):
         print("No events found for the specified IDs. Exiting.")
         return 1
 
-    # Start with a clean database
-    for file in ["test_playback.db", "test_playback.db-shm", "test_playback.db-wal"]:
-        if os.path.exists(file):
-            os.remove(file)
-    tracker = EventTracker("test_playback.db")
+    with runtime_context.playback_database() as database_path:
+        try:
+            tracker = EventTracker(str(database_path), logger=process_logger)
 
-    # Playback manager instance
-    playback = EventAlertWSPlaybackManager(
-        event_list=event_list, event_tracker=tracker, 
-        speedup_factor=1.0, default_services=["RRSM"])
+            # Playback manager instance
+            playback = EventAlertWSPlaybackManager(
+                event_list=event_list,
+                event_tracker=tracker,
+                speedup_factor=1.0,
+                default_services=["RRSM"],
+                logger=process_logger,
+            )
 
+            # Now start scheduler and playback
+            scheduler = FollowUpScheduler(
+                tracker=tracker,
+                logger=scheduler_logger,
+                configuration=application_configuration,
+            )
+            scheduler_thread = threading.Thread(
+                target=scheduler.run_forever,
+                daemon=True,
+            )
+            scheduler_thread.start()
 
-    # Now start scheduler and playback
-    scheduler = FollowUpScheduler(tracker=tracker)
-    scheduler_thread = threading.Thread(target=scheduler.run_forever, daemon=True)
-    scheduler_thread.start()
+            playback.start_auto()
 
-    playback.start_auto()
-
-    print("[Main] Running playback. Press Ctrl+C to exit.")
-    try:
-        while True:
-            time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        handle_shutdown(None, None)
+            print("[Main] Running playback. Press Ctrl+C to exit.")
+            try:
+                while True:
+                    time.sleep(1)
+            except (KeyboardInterrupt, SystemExit):
+                handle_shutdown(None, None)
+        finally:
+            if scheduler is not None and not scheduler_stopped:
+                scheduler.shutdown()
+            elif scheduler is None and tracker is not None:
+                tracker.close()
     return 0
 
 

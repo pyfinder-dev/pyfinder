@@ -9,6 +9,7 @@ the FinDer with the parametric datasets.
 """
 import sys
 import threading
+import logging
 
 from pyfinder.finderconfigs import (
     GlobalFinderConfigError,
@@ -17,21 +18,20 @@ from pyfinder.finderconfigs import (
 from pyfinder.services import seismiclistener
 from pyfinder.services.querypolicy import build_service_policies
 from pyfinder.services.scheduler import FollowUpScheduler
+from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.utils.customlogger import file_logger
 import signal
 import atexit
 import time
 _scheduler = None
 _listener_thread = None
+_launcher_logger = None
 
 
 def _graceful_shutdown(signum=None, frame=None):
-    try:
-        logger = file_logger("monitoring.log", module_name="ServiceLauncher")
-        logger.info(f"Received signal {signum}; shutting down...")
-    except Exception:
-        pass
-    global _scheduler, _listener_thread
+    global _scheduler, _listener_thread, _launcher_logger
+    logger = _launcher_logger or logging.getLogger(__name__)
+    logger.info(f"Received signal {signum}; shutting down...")
     # Stop scheduler if present
     try:
         if _scheduler is not None:
@@ -56,8 +56,32 @@ def _graceful_shutdown(signum=None, frame=None):
         raise
 
 
-def start_services():
-    logger = file_logger("monitoring.log", module_name="ServiceLauncher")
+def start_services(*, runtime_context):
+    """Start continuous services from one validated runtime context."""
+    global _launcher_logger
+    logger = file_logger(
+        runtime_context.process_log_path,
+        module_name="ServiceLauncher",
+        rotate=True,
+        overwrite=False,
+    )
+    listener_logger = file_logger(
+        runtime_context.listener_log_path,
+        module_name="SeismicListener",
+        rotate=True,
+        overwrite=False,
+        level=logging.DEBUG,
+    )
+    scheduler_logger = file_logger(
+        runtime_context.scheduler_log_path,
+        module_name="FollowUpScheduler",
+        rotate=True,
+        overwrite=False,
+    )
+    _launcher_logger = logger
+    application_configuration = runtime_context.isolated_configuration(
+        pyfinderconfig
+    )
 
     try:
         service_policies = build_service_policies()
@@ -80,7 +104,12 @@ def start_services():
 
     def start_listener():
         logger.info("Starting seismic listener...")
-        seismiclistener.start_emsc_listener(policy=rrsm_policy)
+        seismiclistener.start_emsc_listener(
+            policy=rrsm_policy,
+            db_path=runtime_context.operational_database_path,
+            logger=listener_logger,
+            configuration=application_configuration,
+        )
 
     global _listener_thread, _scheduler
     _listener_thread = threading.Thread(target=start_listener, daemon=False)
@@ -90,6 +119,9 @@ def start_services():
     _scheduler = FollowUpScheduler(
         service_policies=service_policies,
         finder_config_selector=finder_config_selector,
+        db_path=runtime_context.operational_database_path,
+        logger=scheduler_logger,
+        configuration=application_configuration,
     )
     try:
         _scheduler.run_forever()
@@ -98,9 +130,9 @@ def start_services():
 
 """ The main execution module for the pyfinder module. """
 if __name__ == "__main__":
-    # Register signal handlers for graceful shutdown
+    from pyfinder.cli import main
+
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
     atexit.register(_graceful_shutdown)
-    # Start the services
-    start_services()
+    sys.exit(main(["continuous", *sys.argv[1:]]))

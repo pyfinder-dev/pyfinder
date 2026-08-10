@@ -5,9 +5,12 @@ from dataclasses import dataclass
 import importlib
 import sys
 
+from pyfinder.runtime import RuntimeBootstrapError, bootstrap_process
 
-class RuntimeBootstrapUnavailable(RuntimeError):
-    """Report that workflow execution has no configured runtime boundary."""
+
+# Keep the earlier exception name importable for callers that treated the
+# command boundary's bootstrap failure as one public failure category.
+RuntimeBootstrapUnavailable = RuntimeBootstrapError
 
 
 @dataclass(frozen=True)
@@ -90,17 +93,8 @@ def build_parser():
 
 
 def bootstrap_runtime(workflow):
-    """Refuse execution until the persistent runtime policy is available.
-
-    Workflow imports intentionally occur after this boundary. The runtime
-    implementation will replace this failure with path and logging setup;
-    importing a workflow earlier could let dependencies configure relative
-    files before their persistent destinations are known.
-    """
-    raise RuntimeBootstrapUnavailable(
-        "workflow execution requires the configured persistent runtime "
-        "bootstrap"
-    )
+    """Validate fixed paths and own ParamWS logging before workflow import."""
+    return bootstrap_process(workflow)
 
 
 def dispatch(arguments, *, bootstrap=None, importer=None):
@@ -108,14 +102,17 @@ def dispatch(arguments, *, bootstrap=None, importer=None):
     target = _WORKFLOW_TARGETS[arguments.workflow]
     if bootstrap is None:
         bootstrap = bootstrap_runtime
-    bootstrap(arguments.workflow)
+    runtime_context = bootstrap(arguments.workflow)
     if importer is None:
         importer = importlib.import_module
     module = importer(target.module_name)
     workflow_callable = getattr(module, target.callable_name)
     if target.accepts_arguments:
-        return workflow_callable(arguments)
-    return workflow_callable()
+        return workflow_callable(
+            arguments,
+            runtime_context=runtime_context,
+        )
+    return workflow_callable(runtime_context=runtime_context)
 
 
 def main(argv=None):
@@ -128,7 +125,7 @@ def main(argv=None):
 
     try:
         return dispatch(arguments)
-    except RuntimeBootstrapUnavailable as error:
+    except RuntimeBootstrapError as error:
         parser.exit(2, "pyfinder: {0}\n".format(error))
 
 
