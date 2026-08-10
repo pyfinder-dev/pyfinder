@@ -71,6 +71,9 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         manager.finder_configuration = {"DATA_FOLDER": "offline-test"}
         manager.metadata = {}
         manager.logger = Mock()
+        manager.entry_kind = manager.ON_DEMAND
+        manager.event_context = None
+        manager.context_diagnostic = None
         return manager
 
     @staticmethod
@@ -85,6 +88,12 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
                   esm_provider, rrsm_records, esm_records, merged_records,
                   expect_execution=True):
         manager = self._manager()
+        if (
+            rrsm_event is not None
+            and hasattr(rrsm_provider, "set_event_data")
+            and rrsm_provider.get_event_data() is None
+        ):
+            rrsm_provider.set_event_data(rrsm_event)
 
         with ExitStack() as stack:
             rrsm_type = stack.enter_context(patch.object(
@@ -345,7 +354,8 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
 
     def test_absent_esm_result_is_an_empty_list_and_logs_zero_result(self):
         rrsm_event = _EventModel("rrsm")
-        rrsm_provider = object()
+        rrsm_provider = Mock(name="rrsm_provider")
+        rrsm_provider.get_event_data.return_value = rrsm_event
         rrsm_records = [{"source": "RRSM"}]
         merged_records = list(rrsm_records)
 

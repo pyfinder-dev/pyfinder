@@ -38,3 +38,19 @@ def normalize_iso8601(ts: str) -> datetime:
 
     dt = datetime.fromisoformat(ts)
     return dt.replace(tzinfo=tz) if tz else dt
+
+
+def get_epoch_time(time_str):
+    """Convert the supported event-time strings to epoch seconds."""
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+
+    for timestamp_format in formats:
+        try:
+            return datetime.strptime(time_str, timestamp_format).timestamp()
+        except ValueError:
+            pass

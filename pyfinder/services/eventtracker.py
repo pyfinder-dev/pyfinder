@@ -8,6 +8,7 @@ events, including registering, updating, and querying.
 
 from collections.abc import Mapping
 
+from pyfinder.eventcontext import EventContext, EventContextError
 from pyfinder.services.database import ThreadSafeDB
 from datetime import datetime, timedelta, timezone
 import json
@@ -59,6 +60,8 @@ class EventTracker:
         region = "region"
         emsc_latitude = "emsc_latitude"
         emsc_longitude = "emsc_longitude"
+        event_context = "event_context"
+        event_context_error = "event_context_error"
         
     def __init__(self, db_path="event_update_follow_up.db", logger=None):
         self._db = ThreadSafeDB(db_path)
@@ -115,6 +118,10 @@ class EventTracker:
         meta[self.Field.region] = None
         meta[self.Field.emsc_latitude] = None
         meta[self.Field.emsc_longitude] = None
+        meta[self.Field.event_context] = None
+        meta[self.Field.event_context_error] = (
+            "the persisted EMSC alert snapshot is missing"
+        )
         alert_json = meta.get(self.Field.emsc_alert_json)
         if alert_json:
             try:
@@ -123,13 +130,29 @@ class EventTracker:
                     region = parsed.get("flynn_region")
                     if region is not None:
                         meta[self.Field.region] = str(region)
-                    # Coordinate validation belongs to the computational-profile
-                    # selector. This adapter must preserve the persisted EMSC
-                    # values exactly so that boundary can make the decision.
+                    # Keep the legacy raw coordinate fields for current callers.
+                    # EventContext separately validates and copies the complete
+                    # authoritative alert before scheduler execution.
                     meta[self.Field.emsc_latitude] = parsed.get("lat")
                     meta[self.Field.emsc_longitude] = parsed.get("lon")
-            except (TypeError, ValueError):
-                pass
+                    try:
+                        meta[self.Field.event_context] = (
+                            EventContext.from_alert_mapping(
+                                parsed,
+                                scheduled_event_id=event_id,
+                            )
+                        )
+                        meta[self.Field.event_context_error] = None
+                    except EventContextError as error:
+                        meta[self.Field.event_context_error] = str(error)
+                else:
+                    meta[self.Field.event_context_error] = (
+                        "the persisted EMSC alert is not a mapping"
+                    )
+            except (TypeError, ValueError) as error:
+                meta[self.Field.event_context_error] = (
+                    "the persisted EMSC alert JSON is invalid: {0}".format(error)
+                )
         return meta
 
     def mark_failed(self, event_id, service, current_delay_time, error_message):

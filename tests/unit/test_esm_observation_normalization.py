@@ -18,8 +18,10 @@ _original_paramws_log_file = os.environ.get("PARAMWS_LOG_FILE")
 os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
+    from pyfinder.eventcontext import EventContext
     from pyfinder.pyfinderconfig import pyfinderconfig
     from pyfinder.utils.calculator import Calculator
+    from pyfinder.utils import dataformatter
     from pyfinder.utils.dataformatter import ESMShakeMapDataFormatter
     from pyfinder.utils.station_merger import StationMerger
 finally:
@@ -114,6 +116,36 @@ class ESMObservationNormalizationTests(unittest.TestCase):
         self.assertEqual(
             pyfinderconfig["general"]["component-selection"],
             "maximum-all",
+        )
+
+    def test_timestamp_comes_from_authoritative_event_context(self):
+        context = EventContext.from_alert_mapping(
+            {
+                "unid": "esm-event",
+                "lat": 45.0,
+                "lon": 12.0,
+                "mag": 5.5,
+                "depth": 10.0,
+                "time": "2026-08-10T10:11:12.250000Z",
+            },
+            scheduled_event_id="esm-event",
+        )
+        formatter = ESMShakeMapDataFormatter(
+            logger=Mock(),
+            configuration={"general": {"component-selection": "maximum-all"}},
+        )
+
+        records = formatter.extract_raw_stations(
+            event_data=context,
+            amplitudes=_Amplitudes([
+                _Station([_Component("HNE", 1.0)])
+            ]),
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0]["timestamp"],
+            dataformatter.get_epoch_time(context.get_origin_time()),
         )
 
     def test_maximum_all_can_select_vertical_and_records_provenance(self):

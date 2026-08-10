@@ -18,6 +18,7 @@ _original_paramws_log_file = os.environ.get("PARAMWS_LOG_FILE")
 os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
+    from pyfinder.eventcontext import EventContext
     from paramws.clients import (
         PeakMotionChannelData,
         PeakMotionData,
@@ -29,6 +30,7 @@ try:
         RRSM_PEAKMOTION_PGA_MIN,
         RRSMPeakMotionDataFormatter,
     )
+    from pyfinder.utils import dataformatter
     from pyfinder.utils.station_merger import (
         RawStationMeasurement,
         StationMerger,
@@ -105,7 +107,7 @@ class RRSMObservationNormalizationTests(unittest.TestCase):
         )
         peak_motion = _peak_motion(stations)
         records = formatter.extract_raw_stations(
-            event_data=peak_motion,
+            event_data=_Event(),
             amplitudes=peak_motion,
         )
         return records, logger
@@ -138,6 +140,43 @@ class RRSMObservationNormalizationTests(unittest.TestCase):
         self.assertEqual(record["source"], "RRSM")
         self.assertTrue(math.isfinite(record["pga"]))
         self.assertGreater(record["pga"], 0)
+
+    def test_context_timestamp_is_used_without_nested_event_access(self):
+        context = EventContext.from_alert_mapping(
+            {
+                "unid": "rrsm-event",
+                "lat": 45.0,
+                "lon": 12.0,
+                "mag": 5.5,
+                "depth": 10.0,
+                "time": "2026-08-10T10:11:12.250000Z",
+            },
+            scheduled_event_id="rrsm-event",
+        )
+        peak_motion = _peak_motion([
+            _station([_channel("HNE", 1.0)])
+        ])
+        formatter = RRSMPeakMotionDataFormatter(
+            logger=Mock(),
+            configuration={"general": {"component-selection": "maximum-all"}},
+        )
+
+        with patch.object(
+            peak_motion,
+            "get_event_data",
+            side_effect=AssertionError("nested RRSM event must not be read"),
+        ) as nested_event:
+            records = formatter.extract_raw_stations(
+                event_data=context,
+                amplitudes=peak_motion,
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0]["timestamp"],
+            dataformatter.get_epoch_time(context.get_origin_time()),
+        )
+        nested_event.assert_not_called()
 
     def test_common_provenance_fields_are_required(self):
         self.assertIn(

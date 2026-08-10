@@ -1,97 +1,127 @@
+from collections.abc import Mapping
+from copy import deepcopy
 import os
 import sys
 import argparse
 import json
-from datetime import datetime, timezone, timedelta
-from dateutil.parser import parse as parse_normalized_iso8601
-# Add the parent directory to the system path
-# to import the necessary modules
-if not os.path.abspath("../") in sys.path:
-    sys.path.insert(0, os.path.abspath("../"))
-
+from datetime import datetime
+import logging
 import threading
 import time
-from time import sleep
-from services.scheduler import FollowUpScheduler
-from services.eventtracker import EventTracker
-from services.querypolicy import RRSMQueryPolicy
+
+from pyfinder.eventcontext import EventContext, EventContextError
+from pyfinder.services.scheduler import FollowUpScheduler
+from pyfinder.services.eventtracker import EventTracker
+from pyfinder.services.querypolicy import RRSMQueryPolicy
+from pyfinder.utils.timeutils import get_epoch_time
 
 
 def generate_event_list():
+    """Return the known playback definitions available for completion.
+
+    Authentic origin and last-update timestamps are not available for these
+    definitions, so those fields remain absent. Playback validation identifies
+    each incomplete event without inventing scientific metadata.
     """
-    Generate a list of events for testing purposes.
-    """
-    base_time = datetime.now(timezone.utc)
     return [
         {
-            'source_id': '00000001', 'source_catalog': 'EMSC-RTS',
-            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
-            'time': (base_time + timedelta(seconds=0)).isoformat(),
-            'flynn_region': 'NORCIA, ITALY',
-            'lat': 42.84, 'lon': 13.11, 'depth': 10.0,
-            'evtype': 'ke', 'auth': 'SCSN', 'mag': 6.5, 'magtype': 'Mw',
-            'unid': '20161030_0000029', 'action': 'create'
+            "source_id": "00000001",
+            "source_catalog": "EMSC-RTS",
+            "flynn_region": "NORCIA, ITALY",
+            "lat": 42.84,
+            "lon": 13.11,
+            "depth": 10.0,
+            "evtype": "ke",
+            "auth": "SCSN",
+            "mag": 6.5,
+            "magtype": "Mw",
+            "unid": "20161030_0000029",
+            "action": "create",
         },
-
         {
-            'source_id': '00000002', 'source_catalog': 'EMSC-RTS',
-            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
-            'time': (base_time + timedelta(seconds=0)).isoformat(),
-            'flynn_region': 'PAZARCIK, TURKEY',
-            'lat': 37.17, 'lon': 37.08, 'depth': 20.0,
-            'evtype': 'ke', 'auth': 'SCSN', 'mag': 7.8, 'magtype': 'Mw',
-            'unid': '20230206_0000008', 'action': 'create'
+            "source_id": "00000002",
+            "source_catalog": "EMSC-RTS",
+            "flynn_region": "PAZARCIK, TURKEY",
+            "lat": 37.17,
+            "lon": 37.08,
+            "depth": 20.0,
+            "evtype": "ke",
+            "auth": "SCSN",
+            "mag": 7.8,
+            "magtype": "Mw",
+            "unid": "20230206_0000008",
+            "action": "create",
         },
-
         {
-            'source_id': '00000003', 'source_catalog': 'EMSC-RTS',
-            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
-            'time': (base_time + timedelta(seconds=0)).isoformat(),
-            'flynn_region': 'ELBISTAN, TURKEY',
-            'lat': 38.11, 'lon': 37.24, 'depth': 10.0,
-            'evtype': 'ke', 'auth': 'SCSN', 'mag': 7.5, 'magtype': 'Mw',
-            'unid': '20230206_0000222', 'action': 'create'
+            "source_id": "00000003",
+            "source_catalog": "EMSC-RTS",
+            "flynn_region": "ELBISTAN, TURKEY",
+            "lat": 38.11,
+            "lon": 37.24,
+            "depth": 10.0,
+            "evtype": "ke",
+            "auth": "SCSN",
+            "mag": 7.5,
+            "magtype": "Mw",
+            "unid": "20230206_0000222",
+            "action": "create",
         },
-
         {
-            'source_id': '00000004', 'source_catalog': 'EMSC-RTS',
-            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
-            'time': (base_time + timedelta(seconds=0)).isoformat(),
-            'flynn_region': 'CRETE, GREECE',
-            'lat': 35.72, 'lon': 25.91, 'depth': 53.0,
-            'evtype': 'ke', 'auth': 'SCSN', 'mag': 6.2, 'magtype': 'Mw',
-            'unid': '20250522_0000028', 'action': 'create'
+            "source_id": "00000004",
+            "source_catalog": "EMSC-RTS",
+            "flynn_region": "CRETE, GREECE",
+            "lat": 35.72,
+            "lon": 25.91,
+            "depth": 53.0,
+            "evtype": "ke",
+            "auth": "SCSN",
+            "mag": 6.2,
+            "magtype": "Mw",
+            "unid": "20250522_0000028",
+            "action": "create",
         },
-
         {
-            'source_id': '00000005', 'source_catalog': 'EMSC-RTS',
-            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
-            'time': (base_time + timedelta(seconds=0)).isoformat(),
-            'flynn_region': 'ISTANBUL, TURKEY',
-            'lat': 40.887, 'lon': 28.138, 'depth': 12.0,
-            'evtype': 'ke', 'auth': 'SCSN', 'mag': 6.2, 'magtype': 'Mw',
-            'unid': '20250423_0000104', 'action': 'create'
+            "source_id": "00000005",
+            "source_catalog": "EMSC-RTS",
+            "flynn_region": "ISTANBUL, TURKEY",
+            "lat": 40.887,
+            "lon": 28.138,
+            "depth": 12.0,
+            "evtype": "ke",
+            "auth": "SCSN",
+            "mag": 6.2,
+            "magtype": "Mw",
+            "unid": "20250423_0000104",
+            "action": "create",
         },
-
         {
-            'source_id': '00000006', 'source_catalog': 'EMSC-RTS',
-            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
-            'time': (base_time + timedelta(seconds=0)).isoformat(),
-            'flynn_region': 'MARMARA SEA, TURKEY',
-            'lat': 40.815, 'lon': 28.386, 'depth': 8.2,
-            'evtype': 'ke', 'auth': 'SCSN', 'mag': 4.2, 'magtype': 'ML',
-            'unid': '20250520_0000201', 'action': 'create'
+            "source_id": "00000006",
+            "source_catalog": "EMSC-RTS",
+            "flynn_region": "MARMARA SEA, TURKEY",
+            "lat": 40.815,
+            "lon": 28.386,
+            "depth": 8.2,
+            "evtype": "ke",
+            "auth": "SCSN",
+            "mag": 4.2,
+            "magtype": "ML",
+            "unid": "20250520_0000201",
+            "action": "create",
         },
-
         {
-            'source_id': '00000007', 'source_catalog': 'EMSC-RTS',
-            'lastupdate': (base_time + timedelta(seconds=0)).isoformat(),
-            'time': (base_time + timedelta(seconds=0)).isoformat(),
-            'flynn_region': 'WESTERN TURKEY',
-            'lat': 39.1855, 'lon': 28.1637, 'depth': 12.2,
-            'evtype': 'ke', 'auth': 'SCSN', 'mag': 4.5, 'magtype': 'ML',
-            'unid': '20250922_0000172', 'action': 'create'
-        },    
+            "source_id": "00000007",
+            "source_catalog": "EMSC-RTS",
+            "flynn_region": "WESTERN TURKEY",
+            "lat": 39.1855,
+            "lon": 28.1637,
+            "depth": 12.2,
+            "evtype": "ke",
+            "auth": "SCSN",
+            "mag": 4.5,
+            "magtype": "ML",
+            "unid": "20250922_0000172",
+            "action": "create",
+        },
     ]
 
 class EventAlertWSPlaybackManager:
@@ -101,7 +131,14 @@ class EventAlertWSPlaybackManager:
     The whole processing chain for the parametric dataset workflow is executed
     normally, so the RRSM and ESM web services will be actually called. 
     """
-    def __init__(self, event_list, event_tracker, speedup_factor=1.0, default_services=None):
+    def __init__(
+        self,
+        event_list,
+        event_tracker,
+        speedup_factor=1.0,
+        default_services=None,
+        logger=None,
+    ):
         """
         event_list: List of events to be played back, in the same JSON structure as the alerts from EMSC
         event_tracker: EventTracker instance used to persist playback schedules
@@ -109,14 +146,54 @@ class EventAlertWSPlaybackManager:
         speedup_factor: Speed multiplier for playback
         default_services: Default services if event doesn't specify
         """
-        self.event_list = sorted(event_list, key=lambda e: e['time'])
         self.event_tracker = event_tracker
         self.speedup_factor = speedup_factor
-        self.default_services = default_services or ["RRSM", "ESM"]  
+        self.default_services = default_services or ["RRSM", "ESM"]
+        self.logger = logger or logging.getLogger(__name__)
+        valid_events = []
+        for event in event_list:
+            validated_event = self._validated_event(event)
+            if validated_event is not None:
+                valid_events.append(validated_event)
+        self.event_list = sorted(
+            valid_events,
+            key=lambda event: get_epoch_time(event["time"]),
+        )
         self.index = 0
         self.running = False
         self._thread = None
         self._lock = threading.Lock()
+
+    def _validated_event(self, event):
+        """Return an isolated usable alert mapping or warn and ignore it."""
+        identity = event.get("unid") if isinstance(event, Mapping) else None
+        try:
+            if not isinstance(event, Mapping):
+                raise EventContextError("the playback event is not a mapping")
+            event_copy = deepcopy(dict(event))
+            EventContext.from_alert_mapping(
+                event_copy,
+                scheduled_event_id=event_copy.get("unid"),
+            )
+            last_update = event_copy.get("lastupdate")
+            if not isinstance(last_update, str) or not last_update.strip():
+                raise EventContextError(
+                    "last-update time is missing or not a string"
+                )
+            if get_epoch_time(last_update) is None:
+                raise EventContextError(
+                    "last-update time is not accepted by the current "
+                    "timestamp converter"
+                )
+            return event_copy
+        except EventContextError as error:
+            self.logger.warning(
+                "Ignoring playback event %r because its predefined metadata "
+                "is unusable: %s",
+                identity,
+                error,
+            )
+            return None
 
     def start_auto(self):
         """Start automatic playback."""
@@ -165,7 +242,10 @@ class EventAlertWSPlaybackManager:
 
             if self.index < len(self.event_list):
                 next_event = self.event_list[self.index]
-                sleep_seconds = (datetime.fromisoformat(next_event['time']) - datetime.fromisoformat(event['time'])).total_seconds()
+                sleep_seconds = (
+                    get_epoch_time(next_event["time"])
+                    - get_epoch_time(event["time"])
+                )
                 sleep_seconds /= self.speedup_factor
                 if sleep_seconds > 0:
                     time.sleep(min(sleep_seconds, 60))  # Sleep max 60 sec between events even if huge gaps
@@ -179,20 +259,20 @@ class EventAlertWSPlaybackManager:
 
     def _inject_event(self, event):
         """Internal helper to inject an event into system."""
-        # Override the event's lastupdate and time to current time
-        now = datetime.now(timezone.utc).isoformat()
-        event['lastupdate'] = now
-        event['time'] = now
+        event = self._validated_event(event)
+        if event is None:
+            return False
 
         # Use batch_register_from_policy for policy-based scheduling
         self.event_tracker.batch_register_from_policy(
             event_id=event['unid'],
-            origin_time=parse_normalized_iso8601(event['time']),
-            last_update_time=parse_normalized_iso8601(event['lastupdate']).isoformat(timespec='seconds'),
+            origin_time=event['time'],
+            last_update_time=event['lastupdate'],
             emsc_alert_json=json.dumps(event),
             policy=RRSMQueryPolicy()
         )
-        
+        return True
+
     def reset(self):
         """Reset to beginning."""
         self.pause()

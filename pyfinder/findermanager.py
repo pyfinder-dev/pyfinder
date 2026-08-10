@@ -12,6 +12,7 @@ utility as well as a runtime library.
 import os
 import sys
 import logging
+from pyfinder.eventcontext import EventContext
 from pyfinder.finderconfigs import (
     GlobalFinderConfigError,
     build_default_selector,
@@ -31,6 +32,31 @@ from pyfinder.utils.station_merger import StationMerger
 
 class FinDerManager:
     """ Class for managing the FinDer library and executable wrappers"""
+
+    ALERT_BACKED = "alert-backed"
+    ON_DEMAND = "on-demand"
+
+    @classmethod
+    def for_alert_context(
+        cls,
+        *,
+        event_context,
+        context_diagnostic=None,
+        **kwargs,
+    ):
+        """Construct a manager for persisted-alert execution."""
+        return cls(
+            entry_kind=cls.ALERT_BACKED,
+            event_context=event_context,
+            context_diagnostic=context_diagnostic,
+            **kwargs,
+        )
+
+    @classmethod
+    def for_on_demand(cls, **kwargs):
+        """Construct a manager for explicit event-ID-only execution."""
+        return cls(entry_kind=cls.ON_DEMAND, **kwargs)
+
     def __init__(
         self,
         options,
@@ -38,7 +64,25 @@ class FinDerManager:
         metadata=None,
         finder_configuration_name=None,
         finder_configuration=None,
+        *,
+        entry_kind,
+        event_context=None,
+        context_diagnostic=None,
     ):
+        if entry_kind not in (self.ALERT_BACKED, self.ON_DEMAND):
+            raise ValueError(
+                "FinDerManager requires an explicit alert-backed or "
+                "on-demand entry"
+            )
+        if entry_kind == self.ON_DEMAND and event_context is not None:
+            raise ValueError(
+                "On-demand construction cannot receive alert-backed context"
+            )
+
+        self.entry_kind = entry_kind
+        self.event_context = event_context
+        self.context_diagnostic = context_diagnostic
+
         # Options from the command line arguments
         self.options = options
 
@@ -68,6 +112,9 @@ class FinDerManager:
             level=logging.DEBUG
         )
 
+        if isinstance(self.event_context, EventContext):
+            self._populate_metadata_from_event_context(self.event_context)
+
         self._resolve_finder_configuration(
             finder_configuration_name=finder_configuration_name,
             finder_configuration=finder_configuration,
@@ -84,6 +131,17 @@ class FinDerManager:
         if name_supplied and configuration_supplied:
             self.finder_configuration_name = finder_configuration_name
             self.finder_configuration = finder_configuration
+            return
+
+        if (
+            self.entry_kind == self.ALERT_BACKED
+            and not isinstance(self.event_context, EventContext)
+        ):
+            # The run boundary reports the unusable alert context. Avoiding
+            # selector construction here prevents that failure from becoming a
+            # misleading computational-profile global fallback.
+            self.finder_configuration_name = None
+            self.finder_configuration = None
             return
 
         try:
@@ -104,8 +162,12 @@ class FinDerManager:
             latitude = None
             longitude = None
         else:
-            latitude = self.metadata.get("emsc_latitude")
-            longitude = self.metadata.get("emsc_longitude")
+            if self.entry_kind == self.ALERT_BACKED:
+                latitude = self.event_context.get_latitude()
+                longitude = self.event_context.get_longitude()
+            else:
+                latitude = self.metadata.get("emsc_latitude")
+                longitude = self.metadata.get("emsc_longitude")
 
         decision = selector.resolve(
             latitude=latitude,
@@ -113,6 +175,15 @@ class FinDerManager:
         )
         self.finder_configuration_name = decision.configuration_name
         self.finder_configuration = decision.configuration
+
+    def _populate_metadata_from_event_context(self, event_context):
+        """Copy authoritative earthquake values into solution metadata."""
+        self.metadata["origin_time"] = event_context.get_origin_time()
+        self.metadata["longitude"] = event_context.get_longitude()
+        self.metadata["latitude"] = event_context.get_latitude()
+        self.metadata["magnitude"] = event_context.get_magnitude()
+        self.metadata["depth"] = event_context.get_depth()
+        self.metadata["magnitude_type"] = event_context.get_magnitude_type()
         
     def set_finder_data_dirs(self, working_dir, finder_event_id):
         """ Set the FinDer data directories using the event id from FinDer run """
@@ -257,6 +328,32 @@ class FinDerManager:
         # Check if the event_id is not None
         if not event_id:
             raise ValueError("An event_id must be provided intead of None")
+
+        if self.entry_kind == self.ALERT_BACKED:
+            if not isinstance(self.event_context, EventContext):
+                diagnostic = self.context_diagnostic or (
+                    "the persisted EMSC alert context is missing or unusable"
+                )
+                self.logger.critical(
+                    "Cannot process alert-backed event %s because its "
+                    "authoritative EMSC alert context is unusable: %s. "
+                    "Provider acquisition was not started.",
+                    event_id,
+                    diagnostic,
+                )
+                return None
+            if self.event_context.get_event_id() != event_id:
+                self.logger.critical(
+                    "Cannot process alert-backed event %s because its "
+                    "authoritative context belongs to %s. Provider acquisition "
+                    "was not started.",
+                    event_id,
+                    self.event_context.get_event_id(),
+                )
+                return None
+            authoritative_event = self.event_context
+        else:
+            authoritative_event = None
         
         # Create the RRSM and ESM clients
         self.logger.info(f"Querying the RRSM and ESM web services for event {event_id}")
@@ -299,7 +396,9 @@ class FinDerManager:
                 configuration=self.configuration,
             )
             esm_raw = esm_formatter.extract_raw_stations(
-                event_data=_esm_event, amplitudes=_esm_amplitude)
+                event_data=(authoritative_event or _esm_event),
+                amplitudes=_esm_amplitude,
+            )
 
         if not esm_raw:
             self.logger.error(
@@ -318,8 +417,15 @@ class FinDerManager:
                 logger=self.logger,
                 configuration=self.configuration,
             )
+            rrsm_normalization_event = authoritative_event
+            if rrsm_normalization_event is None:
+                # Until on-demand execution selects one common context, retain
+                # the historical RRSM timestamp carried by PeakMotionData.
+                rrsm_normalization_event = _rrsm_amplitude.get_event_data()
             rrsm_raw = rrsm_formatter.extract_raw_stations(
-                event_data=_rrsm_amplitude, amplitudes=_rrsm_amplitude)
+                event_data=rrsm_normalization_event,
+                amplitudes=_rrsm_amplitude,
+            )
 
         if not rrsm_raw:
             self.logger.error(
@@ -327,8 +433,12 @@ class FinDerManager:
                 f"event {event_id}")
         self.logger.info("Normalized observations extracted.")
 
-        # ESM gets the priority over RRSM for event
-        _event_data = _esm_event if _esm_event else _rrsm_event
+        # Alert-backed execution keeps its persisted EMSC context. The existing
+        # provider preference remains only for explicit on-demand execution
+        # until provider-priority selection is introduced at that boundary.
+        _event_data = authoritative_event
+        if _event_data is None:
+            _event_data = _esm_event if _esm_event else _rrsm_event
 
         # Collect more metadata for the solution. The scheduler already 
         # should have dumped some fields in the dict:
@@ -337,16 +447,21 @@ class FinDerManager:
         #         "delay_until_next_query": delay,}
         self.logger.info("Collecting metadata ...")
         try:
-            self.metadata['origin_time'] = _event_data.get_origin_time()
-            self.metadata['longitude'] = _event_data.get_longitude()
-            self.metadata['latitude'] = _event_data.get_latitude()
-            self.metadata['magnitude'] = _event_data.get_magnitude()
-            self.metadata['depth'] = _event_data.get_depth()
-        
-            if hasattr(_event_data, "get_magnitude_type"):
-                self.metadata['magnitude_type'] = _event_data.get_magnitude_type()
+            if isinstance(_event_data, EventContext):
+                self._populate_metadata_from_event_context(_event_data)
             else:
-                self.metadata['magnitude_type'] = ""
+                self.metadata['origin_time'] = _event_data.get_origin_time()
+                self.metadata['longitude'] = _event_data.get_longitude()
+                self.metadata['latitude'] = _event_data.get_latitude()
+                self.metadata['magnitude'] = _event_data.get_magnitude()
+                self.metadata['depth'] = _event_data.get_depth()
+
+                if hasattr(_event_data, "get_magnitude_type"):
+                    self.metadata['magnitude_type'] = (
+                        _event_data.get_magnitude_type()
+                    )
+                else:
+                    self.metadata['magnitude_type'] = ""
         except Exception as e:
             self.logger.error(f"Error collecting metadata: {e}")
         self.logger.info(f"Calculation metadata: {self.metadata}")
@@ -569,7 +684,10 @@ if __name__ == '__main__':
     
     # Execute the FinDer manager, which will call either the FinDer library 
     # or executable based on the options
-    manager = FinDerManager(options=options, configuration=pyfinderconfig)
+    manager = FinDerManager.for_on_demand(
+        options=options,
+        configuration=pyfinderconfig,
+    )
     solution = manager.run(event_id=options["event_id"])
     if solution is not None:
         print(f"FinDer solution: {solution}")

@@ -21,8 +21,13 @@ _original_paramws_log_file = os.environ.get("PARAMWS_LOG_FILE")
 os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
-    from paramws.clients import (PeakMotionData, ShakeMapEventData,
-                                 ShakeMapStationAmplitudes)
+    from paramws.clients import (
+        PeakMotionChannelData,
+        PeakMotionData,
+        PeakMotionStationData,
+        ShakeMapEventData,
+        ShakeMapStationAmplitudes,
+    )
     from pyfinder import finderexec, findermanager
     from pyfinder.utils import dataformatter
 finally:
@@ -35,14 +40,15 @@ finally:
 class _EventModel:
     """Small event double exposing only the manager's metadata interface."""
 
-    def __init__(self, name):
+    def __init__(self, name, origin_time=None):
         self.name = name
+        self.origin_time = origin_time or f"{name}-origin"
         self.get_event_data = Mock(
             side_effect=AssertionError(
                 "The separate ParamWS event must not be treated as amplitudes"))
 
     def get_origin_time(self):
-        return f"{self.name}-origin"
+        return self.origin_time
 
     def get_longitude(self):
         return 12.5
@@ -74,6 +80,9 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         manager.finder_configuration = {"DATA_FOLDER": "offline-test"}
         manager.metadata = {}
         manager.logger = Mock()
+        manager.entry_kind = manager.ON_DEMAND
+        manager.event_context = None
+        manager.context_diagnostic = None
         return manager
 
     def _exercise(self, rrsm_result, esm_result, *, rrsm_raw=None,
@@ -122,8 +131,10 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         }
 
     def test_rrsm_keeps_tuple_event_separate_from_peak_motion_dataset(self):
-        rrsm_event = _EventModel("rrsm")
-        peak_motion = object()
+        rrsm_event = _EventModel("rrsm-top-level")
+        nested_event = _EventModel("rrsm-nested")
+        peak_motion = Mock(name="peak_motion")
+        peak_motion.get_event_data.return_value = nested_event
         rrsm_datasets = {"peak_motion": peak_motion}
 
         observed = self._exercise(
@@ -135,13 +146,14 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         observed["rrsm_type"].assert_called_once_with()
         observed["rrsm_client"].query.assert_called_once_with(
             event_id=self.event_id)
+        peak_motion.get_event_data.assert_called_once_with()
         rrsm_event.get_event_data.assert_not_called()
         observed["rrsm_formatter_type"].assert_called_once_with(
             logger=observed["manager"].logger,
             configuration=observed["manager"].configuration,
         )
         observed["rrsm_formatter"].assert_called_once_with(
-            event_data=peak_motion,
+            event_data=nested_event,
             amplitudes=peak_motion,
         )
         self.assertIsNot(
@@ -150,7 +162,7 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(
             observed["manager"].metadata["origin_time"],
-            "rrsm-origin",
+            "rrsm-top-level-origin",
         )
         self.assertEqual(observed["manager"].metadata["RRSM_status"],
                          "Success")
@@ -206,8 +218,10 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
 
     def test_non_200_codes_retain_partial_event_and_dataset_values(self):
         rrsm_event = _EventModel("rrsm")
+        nested_event = _EventModel("rrsm-nested")
         esm_event = _EventModel("esm")
-        peak_motion = object()
+        peak_motion = Mock(name="peak_motion")
+        peak_motion.get_event_data.return_value = nested_event
         station_amplitudes = object()
 
         observed = self._exercise(
@@ -223,12 +237,86 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         self.assertEqual(observed["manager"].metadata["ESM_status"],
                          "Failed with HTTP 502")
         observed["rrsm_formatter"].assert_called_once_with(
-            event_data=peak_motion,
+            event_data=nested_event,
             amplitudes=peak_motion,
         )
         observed["esm_formatter"].assert_called_once_with(
             event_data=esm_event,
             amplitudes=station_amplitudes,
+        )
+
+    def test_on_demand_rrsm_record_uses_nested_peak_motion_timestamp(self):
+        top_level_event = _EventModel(
+            "rrsm-top-level",
+            origin_time="2020-01-02T03:04:05.000000Z",
+        )
+        nested_event = _EventModel(
+            "rrsm-nested",
+            origin_time="2021-02-03T04:05:06.000000Z",
+        )
+        channel = PeakMotionChannelData({
+            "channel-code": "HHE",
+            "pga-value": 1.0,
+        })
+        station = PeakMotionStationData({
+            "network-code": "NW",
+            "station-code": "STA",
+            "location-code": "",
+            "station-latitude": 45.0,
+            "station-longitude": 12.0,
+        })
+        station.add_channel(channel)
+        peak_motion = PeakMotionData()
+        peak_motion.set_event_data(nested_event)
+        peak_motion.add_station(station)
+        manager = self._manager()
+        manager.configuration = {
+            "general": {"component-selection": "maximum-all"},
+            "finder-executable": {"finder-live-mode": False},
+        }
+
+        with patch.object(
+                findermanager, "RRSMPeakMotionClient") as rrsm_type, \
+                patch.object(
+                    findermanager, "ESMShakeMapClient") as esm_type, \
+                patch.object(
+                    findermanager, "StationMerger") as merger_type, \
+                patch.object(
+                    peak_motion,
+                    "get_event_data",
+                    wraps=peak_motion.get_event_data,
+                ) as nested_access:
+            rrsm_type.return_value.query.return_value = (
+                200,
+                top_level_event,
+                {"peak_motion": peak_motion},
+            )
+            esm_type.return_value.query.return_value = (
+                404,
+                None,
+                {"station_amplitudes": None},
+            )
+            merger_type.return_value.merge.return_value = []
+
+            result = manager.process_event(self.event_id)
+
+        self.assertIsNone(result)
+        nested_access.assert_called_once_with()
+        rrsm_records = merger_type.return_value.merge.call_args.kwargs[
+            "rrsm_data"
+        ]
+        self.assertEqual(len(rrsm_records), 1)
+        self.assertEqual(
+            rrsm_records[0]["timestamp"],
+            dataformatter.get_epoch_time(nested_event.get_origin_time()),
+        )
+        self.assertNotEqual(
+            rrsm_records[0]["timestamp"],
+            dataformatter.get_epoch_time(top_level_event.get_origin_time()),
+        )
+        self.assertEqual(
+            manager.metadata["origin_time"],
+            top_level_event.get_origin_time(),
         )
 
     def test_missing_required_dataset_keys_fail_visibly(self):

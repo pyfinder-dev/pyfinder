@@ -4,6 +4,7 @@ import ast
 import builtins
 from datetime import datetime, timezone
 import inspect
+import json
 from pathlib import Path
 import sqlite3
 import sys
@@ -13,6 +14,7 @@ import types
 import unittest
 from unittest import mock
 
+from pyfinder.eventcontext import EventContext
 from pyfinder.services import eventtracker as eventtracker_module
 from pyfinder.services import database as database_module
 from pyfinder.services import scheduler as scheduler_module
@@ -125,10 +127,13 @@ class ManagerFactory:
         self.constructions = []
         self.run_event_ids = []
 
-    def __call__(
+    def for_alert_context(
         self,
+        *,
         options,
         metadata,
+        event_context,
+        context_diagnostic,
         finder_configuration_name=None,
         finder_configuration=None,
     ):
@@ -136,6 +141,8 @@ class ManagerFactory:
             {
                 "options": options,
                 "metadata": metadata,
+                "event_context": event_context,
+                "context_diagnostic": context_diagnostic,
                 "finder_configuration_name": finder_configuration_name,
                 "finder_configuration": finder_configuration,
             }
@@ -193,6 +200,18 @@ def event_metadata(
     longitude=7.5,
 ):
     """Return the smallest valid metadata shape used by the scheduler."""
+    context = EventContext.from_alert_mapping(
+        {
+            "unid": EVENT_ID,
+            "lat": latitude,
+            "lon": longitude,
+            "mag": 5.5,
+            "depth": 10.0,
+            "time": "2026-08-06T09:55:00Z",
+            "magtype": "Mw",
+        },
+        scheduled_event_id=EVENT_ID,
+    )
     return {
         EventTracker.Field.current_delay_time: delay,
         EventTracker.Field.next_delay_time: next_delay,
@@ -201,6 +220,8 @@ def event_metadata(
         EventTracker.Field.region: "TEST REGION",
         EventTracker.Field.emsc_latitude: latitude,
         EventTracker.Field.emsc_longitude: longitude,
+        EventTracker.Field.event_context: context,
+        EventTracker.Field.event_context_error: None,
     }
 
 
@@ -369,9 +390,73 @@ class SchedulerDispatchTests(unittest.TestCase):
 
 
 class SchedulerExecutionTests(unittest.TestCase):
+    def test_persisted_context_survives_scheduler_manager_handoff(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        stored_tracker = EventTracker(
+            temporary_directory.name + "/events.db",
+            logger=mock.Mock(),
+        )
+        alert = {
+            "unid": EVENT_ID,
+            "lat": "46.25",
+            "lon": "7.75",
+            "mag": "5.8",
+            "depth": "11.5",
+            "time": "2026-08-10T08:15:30.250000Z",
+            "magtype": "Mw",
+            "flynn_region": "TEST REGION",
+        }
+        try:
+            stored_tracker.register_new_schedule(
+                event_id=EVENT_ID,
+                service=SERVICE,
+                origin_time="2026-08-10T08:15:30+00:00",
+                last_update_time="2026-08-10T08:16:00+00:00",
+                current_delay_time=DELAY,
+                next_delay_time=15,
+                next_query_time="2026-08-10T09:00:00+00:00",
+                emsc_alert_json=json.dumps(alert),
+            )
+            metadata = stored_tracker.get_event_meta(
+                EVENT_ID,
+                SERVICE,
+                DELAY,
+            )
+        finally:
+            stored_tracker.close()
+            temporary_directory.cleanup()
+
+        tracker = make_tracker(metadata=metadata)
+        manager = ManagerFactory(result={"solution": "usable"})
+        selector = SelectorDouble()
+        scheduler = make_scheduler(
+            tracker,
+            ImmediateExecutor(),
+            manager,
+            finder_config_selector=selector,
+        )
+
+        scheduler.run_once()
+
+        context = manager.constructions[0]["event_context"]
+        self.assertIs(context, metadata[EventTracker.Field.event_context])
+        self.assertEqual(context.get_event_id(), EVENT_ID)
+        self.assertEqual(context.get_latitude(), 46.25)
+        self.assertEqual(context.get_longitude(), 7.75)
+        self.assertEqual(context.get_magnitude(), 5.8)
+        self.assertEqual(context.get_depth(), 11.5)
+        self.assertEqual(context.get_origin_time(), alert["time"])
+        self.assertEqual(context.get_magnitude_type(), "Mw")
+        self.assertEqual(
+            selector.resolve_calls,
+            [{"latitude": 46.25, "longitude": 7.75}],
+        )
+
     def test_selection_uses_only_emsc_coordinates_and_reaches_manager(self):
         metadata = event_metadata(latitude="46.25", longitude="7.75")
         metadata[EventTracker.Field.region] = "FLYNN REGION IS NOT A COORDINATE"
+        metadata[EventTracker.Field.emsc_latitude] = -10.0
+        metadata[EventTracker.Field.emsc_longitude] = 120.0
         tracker = make_tracker(metadata=metadata)
         selected_configuration = {
             "DATA_FOLDER": "selected-data",
@@ -393,10 +478,14 @@ class SchedulerExecutionTests(unittest.TestCase):
 
         self.assertEqual(
             selector.resolve_calls,
-            [{"latitude": "46.25", "longitude": "7.75"}],
+            [{"latitude": 46.25, "longitude": 7.75}],
         )
         self.assertEqual(len(manager.constructions), 1)
         construction = manager.constructions[0]
+        self.assertIs(
+            construction["event_context"],
+            metadata[EventTracker.Field.event_context],
+        )
         self.assertEqual(
             construction["finder_configuration_name"],
             "switzerland-alpine",
@@ -407,6 +496,34 @@ class SchedulerExecutionTests(unittest.TestCase):
         )
         self.assertEqual(manager.run_event_ids, [EVENT_ID])
         tracker.mark_completed.assert_called_once()
+
+    def test_unusable_context_skips_selector_and_reaches_alert_failure_entry(self):
+        metadata = event_metadata()
+        metadata[EventTracker.Field.event_context] = None
+        metadata[EventTracker.Field.event_context_error] = "invalid origin time"
+        tracker = make_tracker(metadata=metadata)
+        selector = SelectorDouble()
+        manager = ManagerFactory(result=None)
+        scheduler = make_scheduler(
+            tracker,
+            ImmediateExecutor(),
+            manager,
+            finder_config_selector=selector,
+        )
+
+        scheduler.run_once()
+
+        self.assertEqual(selector.resolve_calls, [])
+        self.assertEqual(len(manager.constructions), 1)
+        construction = manager.constructions[0]
+        self.assertIsNone(construction["event_context"])
+        self.assertEqual(
+            construction["context_diagnostic"],
+            "invalid origin time",
+        )
+        self.assertEqual(manager.run_event_ids, [EVENT_ID])
+        tracker.increment_retry_count.assert_called_once()
+        tracker.mark_completed.assert_not_called()
 
     def test_normal_global_fallback_runs_one_manager_and_completes(self):
         tracker = make_tracker()

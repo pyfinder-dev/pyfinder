@@ -22,7 +22,9 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
     from paramws.clients import FeltReportEventData, FeltReportIntensityData
+    from pyfinder.eventcontext import EventContext
     from pyfinder.utils.calculator import Calculator
+    from pyfinder.utils import dataformatter
     from pyfinder.utils.dataformatter import EMSCFeltReportDataFormatter
 finally:
     if _original_paramws_log_file is None:
@@ -314,6 +316,37 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
         self.assertGreater(record["pga"], 0)
         self.assertEqual(logger.warning.call_count, 0)
         self.assertEqual(logger.error.call_count, 0)
+
+    def test_authoritative_event_context_supplies_felt_event_values(self):
+        context = EventContext.from_alert_mapping(
+            {
+                "unid": "event-one",
+                "lat": 44.5,
+                "lon": 9.5,
+                "mag": 5.75,
+                "depth": 12.0,
+                "time": "2026-08-10T10:11:12.250000Z",
+            },
+            scheduled_event_id="event-one",
+        )
+
+        with patch.object(
+                Calculator, "haversine", return_value=25.0) as haversine, \
+                patch.object(
+                    Calculator, "I_Allen2012_Rhypo",
+                    return_value=6.0) as allen:
+            records, _logger = self._extract(
+                event_data=context,
+                felt_reports=_felt_reports([_row(corrected=6.0)]),
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0]["timestamp"],
+            dataformatter.get_epoch_time(context.get_origin_time()),
+        )
+        haversine.assert_called_once_with(44.5, 9.5, 45.0, 10.0)
+        allen.assert_called_once_with(5.75, 12.0, 25.0)
 
     def test_missing_and_none_corrected_values_use_raw_with_warning(self):
         records, logger = self._extract([

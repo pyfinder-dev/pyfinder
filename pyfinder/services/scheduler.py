@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+from pyfinder.eventcontext import EventContext
 from pyfinder.finderconfigs import (
     GlobalFinderConfigError,
     build_default_selector,
@@ -294,15 +295,30 @@ class FollowUpScheduler:
             current_delay_time,
         )
         try:
-            decision = self.finder_config_selector.resolve(
-                latitude=event_meta.get(EventTracker.Field.emsc_latitude),
-                longitude=event_meta.get(EventTracker.Field.emsc_longitude),
+            event_context = event_meta.get(EventTracker.Field.event_context)
+            context_diagnostic = event_meta.get(
+                EventTracker.Field.event_context_error
             )
-            finder_manager = self._finder_manager_class(
-                options=finder_options,
-                metadata=solution_metadata,
-                finder_configuration_name=decision.configuration_name,
-                finder_configuration=decision.configuration,
+            manager_arguments = {
+                "options": finder_options,
+                "metadata": solution_metadata,
+                "event_context": event_context,
+                "context_diagnostic": context_diagnostic,
+            }
+            if isinstance(event_context, EventContext):
+                decision = self.finder_config_selector.resolve(
+                    latitude=event_context.get_latitude(),
+                    longitude=event_context.get_longitude(),
+                )
+                manager_arguments.update(
+                    finder_configuration_name=decision.configuration_name,
+                    finder_configuration=decision.configuration,
+                )
+
+            finder_manager = (
+                self._finder_manager_class.for_alert_context(
+                    **manager_arguments
+                )
             )
             finder_solution = finder_manager.run(event_id=event_id)
         except Exception as error:

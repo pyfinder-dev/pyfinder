@@ -3,7 +3,6 @@
 for the FinDer executable. """
 
 import numpy as np
-import datetime
 import logging
 import math
 import numbers
@@ -11,6 +10,7 @@ from typing import List, Tuple
 import fnmatch
 from typing import Union
 from .calculator import Calculator
+from .timeutils import get_epoch_time
 from pyfinder.pyfinderconfig import pyfinderconfig
 from paramws.clients import (FeltReportEventData, FeltReportIntensityData,
                              PeakMotionData, ShakeMapEventData,
@@ -26,18 +26,6 @@ RRSM_PEAKMOTION_PGV_MIN = 0.000001
 RRSM_PEAKMOTION_PGV_MAX = 1.0 # m/s
 RRSM_PEAKMOTION_PGV_BROADBAND_MIN = 0.000001
 RRSM_PEAKMOTION_PGV_BROADBAND_MAX = 0.013 # m/s
-
-def get_epoch_time(time_str):
-    """ Convert the time string to epoch time. """
-    formats = ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S.%f",
-               "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S",]
-
-    for fmt in formats:
-        try:
-            return datetime.datetime.strptime(time_str, fmt).timestamp()
-        except ValueError:
-            pass
-    
 
 class FinDerFormatterFromRawList:
 
@@ -858,8 +846,9 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
         values cannot discard valid siblings or stop later stations.
         Used for merging the station data from different services.
         """
-        peak_motions = event_data
-        event_data = peak_motions.get_event_data()
+        # PeakMotionData owns the station hierarchy, while event_data remains
+        # the authoritative context selected for this complete attempt.
+        peak_motions = amplitudes
 
         raw_stations = []
         component_selection = self._component_selection()

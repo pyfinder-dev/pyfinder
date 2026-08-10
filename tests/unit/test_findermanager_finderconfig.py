@@ -21,6 +21,7 @@ os.environ["PARAMWS_LOG_FILE"] = str(
 )
 try:
     from pyfinder import finderexec, findermanager
+    from pyfinder.eventcontext import EventContext
     from pyfinder.finderconfigs import GlobalFinderConfigError
 finally:
     if _original_paramws_log_file is None:
@@ -72,6 +73,20 @@ class ProviderEventDouble:
 
 
 class FinDerManagerFinderConfigTests(unittest.TestCase):
+    def event_context(self):
+        return EventContext.from_alert_mapping(
+            {
+                "unid": "event-1",
+                "lat": 46.2,
+                "lon": 7.3,
+                "mag": 6.1,
+                "depth": 9.5,
+                "time": "2026-08-10T08:15:30.250000Z",
+                "magtype": "Mw",
+            },
+            scheduled_event_id="event-1",
+        )
+
     def application_configuration(self):
         return {
             "finder-executable": {
@@ -88,6 +103,8 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         metadata=None,
         finder_configuration_name=None,
         finder_configuration=None,
+        event_context=None,
+        alert_backed=False,
     ):
         with mock.patch.object(
             findermanager.customlogger,
@@ -98,13 +115,19 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             "build_default_selector",
             selector_builder,
         ):
-            return findermanager.FinDerManager(
-                options={"use_library": False},
-                configuration=self.application_configuration(),
-                metadata=metadata,
-                finder_configuration_name=finder_configuration_name,
-                finder_configuration=finder_configuration,
-            )
+            arguments = {
+                "options": {"use_library": False},
+                "configuration": self.application_configuration(),
+                "metadata": metadata,
+                "finder_configuration_name": finder_configuration_name,
+                "finder_configuration": finder_configuration,
+            }
+            if alert_backed:
+                return findermanager.FinDerManager.for_alert_context(
+                    event_context=event_context,
+                    **arguments,
+                )
+            return findermanager.FinDerManager.for_on_demand(**arguments)
 
     def test_complete_supplied_decision_bypasses_selector_and_operations(self):
         logger = mock.Mock()
@@ -168,7 +191,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             finderexec,
             "FinDerExecutable",
         ) as executable_type:
-            manager = findermanager.FinDerManager(
+            manager = findermanager.FinDerManager.for_on_demand(
                 options={"use_library": False},
                 configuration=self.application_configuration(),
                 metadata={"emsc_latitude": "46.2", "emsc_longitude": "7.3"},
@@ -201,6 +224,90 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         selector.resolve.assert_called_once_with(latitude=None, longitude=None)
         self.assertEqual(manager.finder_configuration_name, "global")
         self.assertIs(manager.finder_configuration, selector.configuration)
+
+    def test_alert_context_populates_metadata_and_selects_its_epicenter_once(self):
+        context = self.event_context()
+        logger = mock.Mock()
+        selector = SelectorDouble(
+            name="regional",
+            configuration={"DATA_FOLDER": "regional-data"},
+        )
+
+        manager = self.construct_manager(
+            logger=logger,
+            selector_builder=mock.Mock(return_value=selector),
+            event_context=context,
+            alert_backed=True,
+        )
+
+        selector.resolve.assert_called_once_with(latitude=46.2, longitude=7.3)
+        self.assertIs(manager.event_context, context)
+        self.assertEqual(
+            manager.metadata,
+            {
+                "origin_time": "2026-08-10T08:15:30.250000Z",
+                "longitude": 7.3,
+                "latitude": 46.2,
+                "magnitude": 6.1,
+                "depth": 9.5,
+                "magnitude_type": "Mw",
+            },
+        )
+
+    def test_missing_alert_context_fails_critically_before_provider_construction(self):
+        logger = mock.Mock()
+        selector_builder = mock.Mock()
+        manager = self.construct_manager(
+            logger=logger,
+            selector_builder=selector_builder,
+            event_context=None,
+            alert_backed=True,
+        )
+
+        with mock.patch.object(
+            findermanager,
+            "RRSMPeakMotionClient",
+        ) as rrsm_client, mock.patch.object(
+            findermanager,
+            "ESMShakeMapClient",
+        ) as esm_client:
+            result = manager.run(event_id="event-1")
+
+        self.assertIsNone(result)
+        logger.critical.assert_called_once()
+        self.assertIn(
+            "authoritative EMSC alert context",
+            logger.critical.call_args.args[0],
+        )
+        selector_builder.assert_not_called()
+        rrsm_client.assert_not_called()
+        esm_client.assert_not_called()
+
+    def test_missing_context_cannot_select_on_demand_implicitly(self):
+        logger = mock.Mock()
+        manager = self.construct_manager(
+            logger=logger,
+            selector_builder=mock.Mock(),
+            finder_configuration_name="global",
+            finder_configuration={"DATA_FOLDER": "global-data"},
+            event_context=None,
+            alert_backed=True,
+        )
+
+        self.assertEqual(manager.entry_kind, manager.ALERT_BACKED)
+        self.assertIsNone(manager.process_event("event-1"))
+        logger.critical.assert_called_once()
+
+    def test_explicit_on_demand_entry_remains_reachable(self):
+        manager = self.construct_manager(
+            logger=mock.Mock(),
+            selector_builder=mock.Mock(),
+            finder_configuration_name="global",
+            finder_configuration={"DATA_FOLDER": "global-data"},
+        )
+
+        self.assertEqual(manager.entry_kind, manager.ON_DEMAND)
+        self.assertIsNone(manager.event_context)
 
     def test_partial_handoff_is_ignored_and_always_resolves_global(self):
         supplied_mapping = {"DATA_FOLDER": "must-not-be-used"}
@@ -255,7 +362,8 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
 
     def exercise_executable_boundary(self, manager):
         provider_event = ProviderEventDouble()
-        peak_motion = object()
+        peak_motion = mock.Mock(name="peak_motion")
+        peak_motion.get_event_data.return_value = provider_event
         merged_amplitudes = ["merged-normalized"]
         executable_instance = mock.Mock()
         executable_instance.execute.side_effect = ExecutableBoundaryReached(
@@ -347,6 +455,88 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         self.exercise_executable_boundary(manager)
 
         selector.resolve.assert_called_once_with(latitude=1.0, longitude=2.0)
+
+    def test_alert_context_replaces_contradictory_provider_models_everywhere(self):
+        context = self.event_context()
+        manager = self.construct_manager(
+            logger=mock.Mock(),
+            selector_builder=mock.Mock(),
+            finder_configuration_name="regional",
+            finder_configuration={"DATA_FOLDER": "regional-data"},
+            event_context=context,
+            alert_backed=True,
+        )
+        rrsm_event = mock.Mock(name="contradictory_rrsm_event")
+        esm_event = mock.Mock(name="contradictory_esm_event")
+        rrsm_amplitudes = mock.Mock(name="rrsm_amplitudes")
+        rrsm_amplitudes.get_event_data.side_effect = AssertionError(
+            "alert-backed RRSM must not read nested provider event metadata"
+        )
+        esm_amplitudes = object()
+        executable = mock.Mock()
+        executable.execute.side_effect = ExecutableBoundaryReached()
+
+        with mock.patch.object(
+            findermanager,
+            "RRSMPeakMotionClient",
+        ) as rrsm_type, mock.patch.object(
+            findermanager,
+            "ESMShakeMapClient",
+        ) as esm_type, mock.patch.object(
+            findermanager.RRSMPeakMotionDataFormatter,
+            "extract_raw_stations",
+            return_value=["rrsm"],
+        ) as rrsm_extract, mock.patch.object(
+            findermanager.ESMShakeMapDataFormatter,
+            "extract_raw_stations",
+            return_value=["esm"],
+        ) as esm_extract, mock.patch.object(
+            findermanager,
+            "StationMerger",
+        ) as merger_type, mock.patch.object(
+            finderexec,
+            "FinDerExecutable",
+            return_value=executable,
+        ):
+            rrsm_type.return_value.query.return_value = (
+                200,
+                rrsm_event,
+                {"peak_motion": rrsm_amplitudes},
+            )
+            esm_type.return_value.query.return_value = (
+                200,
+                esm_event,
+                {"station_amplitudes": esm_amplitudes},
+            )
+            merger_type.return_value.merge.return_value = ["merged"]
+
+            with self.assertRaises(ExecutableBoundaryReached):
+                manager.process_event("event-1")
+
+        rrsm_extract.assert_called_once_with(
+            event_data=context,
+            amplitudes=rrsm_amplitudes,
+        )
+        esm_extract.assert_called_once_with(
+            event_data=context,
+            amplitudes=esm_amplitudes,
+        )
+        executable.execute.assert_called_once_with(
+            event_data=context,
+            amplitudes=["merged"],
+        )
+        self.assertEqual(manager.metadata["origin_time"], context.get_origin_time())
+        self.assertEqual(manager.metadata["latitude"], context.get_latitude())
+        self.assertEqual(manager.metadata["longitude"], context.get_longitude())
+        self.assertEqual(manager.metadata["magnitude"], context.get_magnitude())
+        self.assertEqual(manager.metadata["depth"], context.get_depth())
+        self.assertEqual(
+            manager.metadata["magnitude_type"],
+            context.get_magnitude_type(),
+        )
+        rrsm_event.get_origin_time.assert_not_called()
+        esm_event.get_origin_time.assert_not_called()
+        rrsm_amplitudes.get_event_data.assert_not_called()
 
 
 if __name__ == "__main__":
