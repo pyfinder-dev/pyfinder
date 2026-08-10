@@ -14,13 +14,27 @@ NORCIA_ITALY_EVENT_ID = "20161030_0000029"
 ESM_SHAKEMAP_SERVICE = "ESM_ShakeMap"
 RRSM_PEAK_MOTION_SERVICE = "RRSM_PeakMotion"
 RRSM_SHAKEMAP_SERVICE = "RRSM_ShakeMap"
-EMSC_FEELT_REPORT_SERVICE = "EMSC_FeltReport"
+EMSC_FELT_REPORT_SERVICE = "EMSC_FeltReport"
+
+SHIPPED_SERVICE_PRIORITY = (
+    ESM_SHAKEMAP_SERVICE,
+    RRSM_PEAK_MOTION_SERVICE,
+    EMSC_FELT_REPORT_SERVICE,
+)
 
 
 pyfinderconfig = {
     "general": {
-        # Web services ordered by priority
-        "services": [ESM_SHAKEMAP_SERVICE, RRSM_PEAK_MOTION_SERVICE, EMSC_FEELT_REPORT_SERVICE],
+        # Enabled services are a membership list. Their order does not express
+        # scientific preference; that is owned separately by services-priority.
+        "services-enabled": [
+            ESM_SHAKEMAP_SERVICE,
+            RRSM_PEAK_MOTION_SERVICE,
+        ],
+
+        # This order is shared by event-context selection and cross-source
+        # observation merging. A service can have priority without being enabled.
+        "services-priority": list(SHIPPED_SERVICE_PRIORITY),
 
         # Choose the greatest valid acceleration from either every component
         # or only non-vertical components. The same application-wide setting
