@@ -45,6 +45,7 @@ from pyfinder.utils.dataformatter import (
     get_epoch_time,
 )
 from pyfinder.utils.station_merger import StationMerger
+from pyfinder.workspace import build_augmented_event_id
 
 
 _DEPENDENCY_MODEL_ERRORS = (
@@ -340,16 +341,7 @@ class FinDerManager:
 
     def _build_augmented_event_id(self, event_id, delay_minutes):
         self.logger.info(f"Building augmented event id for {event_id} with delay {delay_minutes} minutes.")
-
-        if delay_minutes is not None:
-            # e.g., "t00010" for 10 min
-            appendix = f"t{int(delay_minutes):05d}"  
-        else:
-            # fallback if delay is undefined
-            appendix = "t00000"  
-        
-        # e.g., "20230101_013045_t00010"
-        return f"{event_id}_{appendix}"
+        return build_augmented_event_id(event_id, delay_minutes)
 
     def _configured_enabled_services(self):
         """Return unique recognized enabled services in configured order."""
@@ -818,6 +810,13 @@ class FinDerManager:
         else:
             # Call the FinDer executable
             self.logger.info("Starting FinDer executable")
+            scheduled_delay = None
+            if self.entry_kind == self.ALERT_BACKED:
+                scheduled_delay = self.metadata.get("current_delay")
+            augmented_event_id = self._build_augmented_event_id(
+                event_id,
+                scheduled_delay,
+            )
             from pyfinder.finderexec import FinDerExecutable
             finder_executable = FinDerExecutable(
                 options=self.options,
@@ -829,6 +828,7 @@ class FinDerManager:
             executable = finder_executable.execute(
                 event_data=_event_data,
                 amplitudes=_amplitude_data,
+                augmented_event_id=augmented_event_id,
             )
             
             # Check if the executable was successful

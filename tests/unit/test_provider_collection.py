@@ -299,6 +299,7 @@ class ProviderCollectionTests(unittest.TestCase):
         executable_type.return_value.execute.assert_called_once_with(
             event_data=manager.event_context,
             amplitudes=felt_records,
+            augmented_event_id="provider-event_t00000",
         )
 
     def test_instrumental_and_felt_mapping_reaches_handoff_unchanged(self):
@@ -373,6 +374,7 @@ class ProviderCollectionTests(unittest.TestCase):
         executable_type.return_value.execute.assert_called_once_with(
             event_data=manager.event_context,
             amplitudes=merged_records,
+            augmented_event_id="provider-event_t00000",
         )
         self.assertEqual(
             set(manager.metadata["provider_outcomes"]),

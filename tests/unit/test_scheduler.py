@@ -510,6 +510,7 @@ class SchedulerExecutionTests(unittest.TestCase):
         )
         self.assertIs(construction["configuration"], scheduler.configuration)
         self.assertIs(construction["logger"], scheduler.logger)
+        self.assertEqual(construction["metadata"]["current_delay"], DELAY)
         self.assertEqual(manager.run_event_ids, [EVENT_ID])
         tracker.mark_completed.assert_called_once()
 

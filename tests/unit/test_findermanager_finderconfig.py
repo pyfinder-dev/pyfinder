@@ -409,6 +409,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         executable_instance.execute.assert_called_once_with(
             event_data=manager.event_context,
             amplitudes=merged_amplitudes,
+            augmented_event_id="event-1_t00000",
         )
         self.assertIsNot(manager.event_context, provider_event)
         return executable_type
@@ -443,7 +444,11 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         manager = self.construct_manager(
             logger=logger,
             selector_builder=selector_builder,
-            metadata={"emsc_latitude": 1.0, "emsc_longitude": 2.0},
+            metadata={
+                "emsc_latitude": 1.0,
+                "emsc_longitude": 2.0,
+                "current_delay": 99,
+            },
         )
 
         with mock.patch.object(
@@ -460,6 +465,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         manager = self.construct_manager(
             logger=mock.Mock(),
             selector_builder=mock.Mock(),
+            metadata={"current_delay": 10},
             finder_configuration_name="regional",
             finder_configuration={"DATA_FOLDER": "regional-data"},
             event_context=context,
@@ -523,6 +529,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         executable.execute.assert_called_once_with(
             event_data=context,
             amplitudes=["merged"],
+            augmented_event_id="event-1_t00010",
         )
         self.assertEqual(manager.metadata["origin_time"], context.get_origin_time())
         self.assertEqual(manager.metadata["latitude"], context.get_latitude())

@@ -257,6 +257,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
+            augmented_event_id="handoff-event_t00000",
         )
         self.assertIsNot(observed["manager"].event_context, esm_event)
         executable_amplitudes = (
@@ -292,6 +293,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
+            augmented_event_id="handoff-event_t00000",
         )
         self.assertIsNot(
             observed["executable"].execute.call_args.kwargs["amplitudes"],
@@ -319,6 +321,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
+            augmented_event_id="handoff-event_t00000",
         )
         errors = self._messages(observed["manager"].logger.error)
         self.assertFalse(any(
@@ -353,6 +356,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
+            augmented_event_id="handoff-event_t00000",
         )
         self.assertEqual(
             observed["manager"].metadata["provider_outcomes"][
@@ -437,6 +441,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
+            augmented_event_id="handoff-event_t00000",
         )
         self.assertEqual(
             observed["manager"].metadata["provider_outcomes"]["ESM_ShakeMap"][
@@ -582,6 +587,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
                 observed["executable"].execute.assert_called_once_with(
                     event_data=observed["manager"].event_context,
                     amplitudes=esm_records + rrsm_records,
+                    augmented_event_id="handoff-event_t00000",
                 )
                 if persisted_context is not None:
                     self.assertIs(

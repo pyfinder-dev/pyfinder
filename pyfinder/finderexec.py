@@ -22,6 +22,7 @@ from pyfinder.utils.dataformatter import (RRSMPeakMotionDataFormatter,
                                           FinDerFormatterFromRawList,
                                           get_epoch_time)
 from pyfinder.utils.station_merger import RawStationMeasurement
+from pyfinder.workspace import select_workspace_path
 
 class FinDerExecutable(object):
     """ Class for executing the FinDer executable. """
@@ -147,26 +148,33 @@ class FinDerExecutable(object):
             log_file=log_file, module_name="pyfinder", 
             overwrite=overwrite_log_file, rotate=rotate_log_file)
 
-    def _prepare_workspace(self, event_id):
+    def _prepare_workspace(self, augmented_event_id):
         """ 
         Parepares the working environment for running the FinDer executable.
         FinDer needs a working directory to write its output and a specific
         config file configured for this event.
         """
         output_root_folder = self.get_configured_root_folder()
+        workspace = select_workspace_path(
+            output_root_folder,
+            augmented_event_id,
+        )
         # Creating the configured directory is the authoritative permission
         # check. Filesystem errors propagate; execution never selects a CWD or
         # home-directory substitute.
         os.makedirs(output_root_folder, exist_ok=True)
 
-        # Create a working directory with the event id that is currently being processed
-        self.working_directory = os.path.join(output_root_folder, str(event_id))
+        # Reusing an event-and-delay workspace retains every existing FinDer
+        # file. PyFinder only rewrites the two invocation files it owns.
+        self.working_directory = str(workspace)
         os.makedirs(self.working_directory, exist_ok=True)
         
         # Initialize the logger with a log file inside the working directory
         self._initialize_logger()
         self.logger.info("START... Initiated with '{}'".format(self.options['command_line_args']))
-        self.logger.info("Event ID: {}".format(event_id))
+        self.logger.info(
+            "Augmented event ID: {}".format(augmented_event_id)
+        )
         self.logger.info("FinDer executable path: {}".format(self.executable_path))
         self.logger.info("Output root folder: {}".format(output_root_folder))
 
@@ -416,11 +424,32 @@ class FinDerExecutable(object):
         self.logger.info(f"{self.finder_solution}")
         self.logger.info("The actual FinDer solution is stored in the FinderSolution object.")
 
-   
-    def execute(self, amplitudes, event_data):
+    def materialize_inputs(
+        self,
+        amplitudes,
+        event_data,
+        *,
+        augmented_event_id,
+    ):
+        """Write the existing FinDer configuration and input data files."""
+        self._prepare_workspace(augmented_event_id)
+        data_path, self.finder_used_channels = self._write_data_for_finder(
+            amplitudes,
+            event_data,
+        )
+        return self.finder_file_config_path, data_path
+
+    def execute(self, amplitudes, event_data, *, augmented_event_id):
         """ Runs the FinDer executable. Entry point for the class. """
         # The start time of the execution
         _exec_start = datetime.now()
+
+        # Workspace identity is supplied by the manager. Validate it before
+        # checking resources or preparing any invocation-owned files.
+        select_workspace_path(
+            self.get_configured_root_folder(),
+            augmented_event_id,
+        )
 
         # Check if the executable exists
         self._check_finder_executable()
@@ -432,12 +461,11 @@ class FinDerExecutable(object):
         # Get the event id to create the working directory
         event_id = event_data.get_event_id()
         
-        # Prepare the workspace for the FinDer executable output
-        self._prepare_workspace(event_id)
-
-        # Write the data to the working directory
-        my_data0_path, self.finder_used_channels = \
-            self._write_data_for_finder(amplitudes, event_data)
+        self.materialize_inputs(
+            amplitudes,
+            event_data,
+            augmented_event_id=augmented_event_id,
+        )
         
         try:
             # Execute the FinDer executable
