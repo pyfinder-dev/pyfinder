@@ -663,7 +663,14 @@ class FinDerManager:
                 if status_code == 200
                 else "Failed with HTTP " + str(status_code)
             )
-    
+
+    def _merge_available_results(self, available_results):
+        """Hand normalized instrumental lists to the current merger."""
+        return StationMerger().merge(
+            esm_data=available_results.get(ESM_SHAKEMAP_SERVICE, []),
+            rrsm_data=available_results.get(RRSM_PEAK_MOTION_SERVICE, []),
+        )
+
     def process_event(self, event_id) -> FinderSolution:
         """ Process data associated with an event_id """
         # Check if the event_id is not None
@@ -743,23 +750,45 @@ class FinDerManager:
         )
         self.logger.info("Normalized observations extracted.")
 
-        # The current merger supports instrumental ESM and RRSM records only.
-        # Felt results remain visible in available_results for the later
-        # cross-source merger without entering its coordinate fallback.
-        esm_raw = self.available_results.get(ESM_SHAKEMAP_SERVICE, [])
-        rrsm_raw = self.available_results.get(RRSM_PEAK_MOTION_SERVICE, [])
         _event_data = authoritative_event
 
         self._populate_metadata_from_event_context(_event_data)
         self.logger.info(f"Calculation metadata: {self.metadata}")
 
+        if not any(self.available_results.values()):
+            self.logger.error(
+                "All normalized observation sources produced zero usable "
+                "records for event %s. FinDer cannot be run.",
+                event_id,
+            )
+            return None
+
+        # The current merger accepts only instrumental ESM and RRSM records.
+        # Felt observations remain available for diagnostics and for the
+        # future cross-source merger, but must not enter the current merger's
+        # coordinate-based behavior.
+        instrumental_results = any(
+            self.available_results.get(service_name, [])
+            for service_name in (
+                ESM_SHAKEMAP_SERVICE,
+                RRSM_PEAK_MOTION_SERVICE,
+            )
+        )
+        if not instrumental_results:
+            self.logger.error(
+                "FinDer cannot currently process event %s because only felt "
+                "observations were usable; the current instrumental merger "
+                "does not accept felt observations.",
+                event_id,
+            )
+            return None
+
         # The downstream handoff is always the merged normalized list. An
         # empty normalized source must never cause its raw provider model to
         # bypass this boundary and reach a direct provider formatter.
         self.logger.info("Merging the ESM and RRSM data")
-        _amplitude_data = StationMerger().merge(
-            esm_data=esm_raw,
-            rrsm_data=rrsm_raw,
+        _amplitude_data = self._merge_available_results(
+            self.available_results
         )
         self.logger.info("Merge completed")
 
@@ -773,13 +802,17 @@ class FinDerManager:
                     "metadata.")
             if not _amplitude_data:
                 self.logger.error(
-                    "|- Reason: All normalized observation sources produced "
-                    "zero usable records.")
+                    "|- Reason: The merged normalized observation list is "
+                    "empty.")
             self.logger.warning(f"|- event_id: {event_id}")
             self.logger.warning(
-                f"|- ESM normalized observations: {len(esm_raw)}")
+                "|- ESM normalized observations: %s",
+                len(self.available_results.get(ESM_SHAKEMAP_SERVICE, [])),
+            )
             self.logger.warning(
-                f"|- RRSM normalized observations: {len(rrsm_raw)}")
+                "|- RRSM normalized observations: %s",
+                len(self.available_results.get(RRSM_PEAK_MOTION_SERVICE, [])),
+            )
             self.logger.warning(
                 "|- Provider outcomes: %s",
                 self.metadata["provider_outcomes"],

@@ -20,6 +20,12 @@ os.environ["PARAMWS_LOG_FILE"] = str(
 try:
     from paramws.clients import PeakMotionData, ShakeMapStationAmplitudes
     from pyfinder import finderexec, findermanager
+    from pyfinder.eventcontext import EventContext
+    from pyfinder.pyfinderconfig import (
+        EMSC_FELT_REPORT_SERVICE,
+        ESM_SHAKEMAP_SERVICE,
+        RRSM_PEAK_MOTION_SERVICE,
+    )
 finally:
     if _original_paramws_log_file is None:
         os.environ.pop("PARAMWS_LOG_FILE", None)
@@ -95,8 +101,14 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
 
     def _exercise(self, *, rrsm_event, esm_event, rrsm_provider,
                   esm_provider, rrsm_records, esm_records, merged_records,
-                  expect_execution=True):
+                  expect_execution=True, enabled=None, rrsm_code=200,
+                  esm_code=200, entry_kind=None, event_context=None):
         manager = self._manager()
+        if enabled is not None:
+            manager.configuration["general"]["services-enabled"] = enabled
+        if entry_kind is not None:
+            manager.entry_kind = entry_kind
+            manager.event_context = event_context
         if (
             rrsm_event is not None
             and hasattr(rrsm_provider, "set_event_data")
@@ -133,16 +145,21 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             ))
             merger_type = stack.enter_context(patch.object(
                 findermanager, "StationMerger"))
+            handoff = stack.enter_context(patch.object(
+                manager,
+                "_merge_available_results",
+                wraps=manager._merge_available_results,
+            ))
             executable_type = stack.enter_context(patch.object(
                 finderexec, "FinDerExecutable"))
 
             rrsm_type.return_value.query.return_value = (
-                200,
+                rrsm_code,
                 rrsm_event,
                 {"peak_motion": rrsm_provider},
             )
             esm_type.return_value.query.return_value = (
-                200,
+                esm_code,
                 esm_event,
                 {"station_amplitudes": esm_provider},
             )
@@ -167,6 +184,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             "esm_direct_format": esm_direct_format,
             "artificial_point_format": artificial_point_format,
             "merger_type": merger_type,
+            "handoff": handoff,
             "executable_type": executable_type,
             "executable": executable,
         }
@@ -197,6 +215,15 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             esm_data=esm_records,
             rrsm_data=rrsm_records,
         )
+        handoff_mapping = observed["handoff"].call_args.args[0]
+        self.assertIs(handoff_mapping, observed["manager"].available_results)
+        self.assertIs(handoff_mapping[ESM_SHAKEMAP_SERVICE], esm_records)
+        self.assertIs(handoff_mapping[RRSM_PEAK_MOTION_SERVICE], rrsm_records)
+        merger_arguments = (
+            observed["merger_type"].return_value.merge.call_args.kwargs
+        )
+        self.assertIs(merger_arguments["esm_data"], esm_records)
+        self.assertIs(merger_arguments["rrsm_data"], rrsm_records)
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
@@ -333,15 +360,22 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         )
 
         self.assertIsNone(observed["result"])
-        observed["merger_type"].return_value.merge.assert_called_once_with(
-            esm_data=[],
-            rrsm_data=[],
-        )
+        observed["handoff"].assert_not_called()
+        observed["merger_type"].assert_not_called()
         observed["executable_type"].assert_not_called()
         observed["executable"].execute.assert_not_called()
         observed["esm_direct_format"].assert_not_called()
         observed["rrsm_direct_format"].assert_not_called()
         observed["artificial_point_format"].assert_not_called()
+        outcomes = observed["manager"].metadata["provider_outcomes"]
+        self.assertEqual(
+            set(outcomes),
+            {ESM_SHAKEMAP_SERVICE, RRSM_PEAK_MOTION_SERVICE},
+        )
+        self.assertTrue(all(
+            outcome["normalized_count"] == 0
+            for outcome in outcomes.values()
+        ))
 
         errors = self._messages(observed["manager"].logger.error)
         self.assertTrue(any(
@@ -392,6 +426,137 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             ],
             "invalid-result",
         )
+
+    def test_disabled_service_is_absent_and_attempted_empty_service_is_kept(self):
+        _rrsm_provider, esm_provider = self._provider_models()
+        esm_records = [{"source": "ESM"}]
+
+        observed = self._exercise(
+            rrsm_event=None,
+            esm_event=_EventModel("esm"),
+            rrsm_provider=None,
+            esm_provider=esm_provider,
+            rrsm_records=[],
+            esm_records=esm_records,
+            merged_records=list(esm_records),
+            enabled=[ESM_SHAKEMAP_SERVICE],
+        )
+
+        mapping = observed["handoff"].call_args.args[0]
+        self.assertEqual(list(mapping), [ESM_SHAKEMAP_SERVICE])
+        self.assertIs(mapping[ESM_SHAKEMAP_SERVICE], esm_records)
+        self.assertNotIn(RRSM_PEAK_MOTION_SERVICE, mapping)
+
+        observed = self._exercise(
+            rrsm_event=_EventModel("rrsm"),
+            esm_event=_EventModel("esm"),
+            rrsm_provider=None,
+            esm_provider=esm_provider,
+            rrsm_records=[],
+            esm_records=esm_records,
+            merged_records=list(esm_records),
+        )
+
+        mapping = observed["handoff"].call_args.args[0]
+        self.assertIn(RRSM_PEAK_MOTION_SERVICE, mapping)
+        self.assertIs(mapping[RRSM_PEAK_MOTION_SERVICE],
+                      observed["manager"].available_results[
+                          RRSM_PEAK_MOTION_SERVICE])
+        self.assertEqual(mapping[RRSM_PEAK_MOTION_SERVICE], [])
+
+    def test_usable_non_200_provider_result_reaches_downstream_execution(self):
+        rrsm_provider, _esm_provider = self._provider_models()
+        rrsm_records = [{"source": "RRSM"}]
+
+        observed = self._exercise(
+            rrsm_event=_EventModel("rrsm"),
+            esm_event=None,
+            rrsm_provider=rrsm_provider,
+            esm_provider=None,
+            rrsm_records=rrsm_records,
+            esm_records=[],
+            merged_records=list(rrsm_records),
+            rrsm_code=503,
+        )
+
+        observed["handoff"].assert_called_once_with(
+            observed["manager"].available_results
+        )
+        observed["executable"].execute.assert_called_once()
+        outcome = observed["manager"].metadata["provider_outcomes"][
+            RRSM_PEAK_MOTION_SERVICE
+        ]
+        self.assertEqual(outcome["status_code"], 503)
+        self.assertEqual(outcome["normalized_count"], 1)
+        self.assertIsNone(outcome["failure_kind"])
+
+    def test_current_merger_receives_only_instrumental_provider_lists(self):
+        manager = self._manager()
+        esm_records = [{"source": "ESM"}]
+        rrsm_records = [{"source": "RRSM"}]
+        felt_records = [{"source": "EMSC"}]
+        available_results = {
+            ESM_SHAKEMAP_SERVICE: esm_records,
+            RRSM_PEAK_MOTION_SERVICE: rrsm_records,
+            EMSC_FELT_REPORT_SERVICE: felt_records,
+        }
+
+        with patch.object(findermanager, "StationMerger") as merger_type:
+            merged = object()
+            merger_type.return_value.merge.return_value = merged
+
+            result = manager._merge_available_results(available_results)
+
+        self.assertIs(result, merged)
+        merger_type.return_value.merge.assert_called_once_with(
+            esm_data=esm_records,
+            rrsm_data=rrsm_records,
+        )
+        arguments = merger_type.return_value.merge.call_args.kwargs
+        self.assertNotIn(felt_records, arguments.values())
+
+    def test_alert_and_on_demand_entries_use_the_same_mapping_handoff(self):
+        for source_kind, entry_kind in (
+            ("continuous", findermanager.FinDerManager.ALERT_BACKED),
+            ("playback", findermanager.FinDerManager.ALERT_BACKED),
+            ("on-demand", findermanager.FinDerManager.ON_DEMAND),
+        ):
+            with self.subTest(source_kind=source_kind):
+                rrsm_provider, esm_provider = self._provider_models()
+                rrsm_records = [{"source": "RRSM"}]
+                esm_records = [{"source": "ESM"}]
+                persisted_context = None
+                if entry_kind == findermanager.FinDerManager.ALERT_BACKED:
+                    persisted_context = EventContext.from_provider_model(
+                        _EventModel("persisted"),
+                        requested_event_id=self.event_id,
+                    )
+
+                observed = self._exercise(
+                    rrsm_event=_EventModel("rrsm"),
+                    esm_event=_EventModel("esm"),
+                    rrsm_provider=rrsm_provider,
+                    esm_provider=esm_provider,
+                    rrsm_records=rrsm_records,
+                    esm_records=esm_records,
+                    merged_records=esm_records + rrsm_records,
+                    entry_kind=entry_kind,
+                    event_context=persisted_context,
+                )
+
+                mapping = observed["handoff"].call_args.args[0]
+                self.assertIs(mapping, observed["manager"].available_results)
+                self.assertIs(mapping[ESM_SHAKEMAP_SERVICE], esm_records)
+                self.assertIs(mapping[RRSM_PEAK_MOTION_SERVICE], rrsm_records)
+                observed["executable"].execute.assert_called_once_with(
+                    event_data=observed["manager"].event_context,
+                    amplitudes=esm_records + rrsm_records,
+                )
+                if persisted_context is not None:
+                    self.assertIs(
+                        observed["manager"].event_context,
+                        persisted_context,
+                    )
 
 
 if __name__ == "__main__":

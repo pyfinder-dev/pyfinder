@@ -17,7 +17,7 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log"
 )
 try:
-    from pyfinder import findermanager
+    from pyfinder import finderexec, findermanager
     from pyfinder.eventcontext import EventContext
     from pyfinder.pyfinderconfig import (
         EMSC_FELT_REPORT_SERVICE,
@@ -234,6 +234,129 @@ class ProviderCollectionTests(unittest.TestCase):
             },
         )
         self.assertEqual(outcome["normalized_count"], 1)
+
+    def test_felt_only_records_remain_visible_and_stop_before_merger(self):
+        manager = self.manager(enabled=[EMSC_FELT_REPORT_SERVICE])
+        felt_provider = object()
+        felt_records = [{"source": "EMSC"}]
+        with mock.patch.object(
+            findermanager, "EMSCFeltReportClient"
+        ) as felt_type, mock.patch.object(
+            manager,
+            "_normalize_provider",
+            return_value=felt_records,
+        ), mock.patch.object(
+            manager, "_merge_available_results"
+        ) as handoff, mock.patch.object(
+            findermanager, "StationMerger"
+        ) as merger_type, mock.patch.object(
+            findermanager.FinDerFormatterFromRawList, "format"
+        ) as artificial_point_format, mock.patch.object(
+            finderexec, "FinDerExecutable"
+        ) as executable_type:
+            felt_type.return_value.query.return_value = (
+                200,
+                ProviderEvent(),
+                {"felt_intensities": object()},
+            )
+            felt_type.return_value.get_feltreports.return_value = felt_provider
+
+            result = manager.process_event(EVENT_ID)
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            manager.available_results,
+            {EMSC_FELT_REPORT_SERVICE: felt_records},
+        )
+        self.assertIs(
+            manager.available_results[EMSC_FELT_REPORT_SERVICE],
+            felt_records,
+        )
+        outcome = manager.metadata["provider_outcomes"][
+            EMSC_FELT_REPORT_SERVICE
+        ]
+        self.assertEqual(outcome["normalized_count"], 1)
+        self.assertIsNone(outcome["failure_kind"])
+        handoff.assert_not_called()
+        merger_type.assert_not_called()
+        artificial_point_format.assert_not_called()
+        executable_type.assert_not_called()
+
+    def test_instrumental_and_felt_mapping_reaches_handoff_unchanged(self):
+        manager = self.manager(enabled=[
+            ESM_SHAKEMAP_SERVICE,
+            EMSC_FELT_REPORT_SERVICE,
+        ])
+        esm_provider = object()
+        felt_provider = object()
+        esm_records = [{"source": "ESM"}]
+        felt_records = [{"source": "EMSC"}]
+
+        def normalize(service_name, event_context, value):
+            if service_name == ESM_SHAKEMAP_SERVICE:
+                self.assertIs(value, esm_provider)
+                return esm_records
+            self.assertIs(value, felt_provider)
+            return felt_records
+
+        with mock.patch.object(
+            findermanager, "ESMShakeMapClient"
+        ) as esm_type, mock.patch.object(
+            findermanager, "EMSCFeltReportClient"
+        ) as felt_type, mock.patch.object(
+            manager,
+            "_normalize_provider",
+            side_effect=normalize,
+        ), mock.patch.object(
+            findermanager, "StationMerger"
+        ) as merger_type, mock.patch.object(
+            manager,
+            "_merge_available_results",
+            wraps=manager._merge_available_results,
+        ) as handoff, mock.patch.object(
+            finderexec, "FinDerExecutable"
+        ) as executable_type:
+            esm_type.return_value.query.return_value = (
+                200,
+                ProviderEvent(),
+                {"station_amplitudes": esm_provider},
+            )
+            felt_type.return_value.query.return_value = (
+                200,
+                ProviderEvent(),
+                {"felt_intensities": object()},
+            )
+            felt_type.return_value.get_feltreports.return_value = felt_provider
+            merger_type.return_value.merge.return_value = esm_records
+            executable_type.return_value.execute.side_effect = RuntimeError(
+                "downstream boundary reached"
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "downstream boundary reached"
+            ):
+                manager.process_event(EVENT_ID)
+
+        mapping = handoff.call_args.args[0]
+        self.assertIs(mapping, manager.available_results)
+        self.assertEqual(
+            list(mapping),
+            [ESM_SHAKEMAP_SERVICE, EMSC_FELT_REPORT_SERVICE],
+        )
+        self.assertIs(mapping[ESM_SHAKEMAP_SERVICE], esm_records)
+        self.assertIs(mapping[EMSC_FELT_REPORT_SERVICE], felt_records)
+        merger_type.return_value.merge.assert_called_once_with(
+            esm_data=esm_records,
+            rrsm_data=[],
+        )
+        executable_type.return_value.execute.assert_called_once_with(
+            event_data=manager.event_context,
+            amplitudes=esm_records,
+        )
+        self.assertEqual(
+            set(manager.metadata["provider_outcomes"]),
+            {ESM_SHAKEMAP_SERVICE, EMSC_FELT_REPORT_SERVICE},
+        )
 
     def test_query_exception_is_contained_and_later_provider_is_attempted(self):
         manager = self.manager(enabled=[
