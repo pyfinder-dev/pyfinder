@@ -12,23 +12,48 @@ utility as well as a runtime library.
 import os
 import sys
 import logging
-from pyfinder.eventcontext import EventContext
+from collections.abc import Mapping
+
+from pyfinder.eventcontext import (
+    EventContext,
+    EventContextError,
+    ProviderModelAccessError,
+)
 from pyfinder.finderconfigs import (
     GlobalFinderConfigError,
     build_default_selector,
 )
-from pyfinder.pyfinderconfig import pyfinderconfig
+from pyfinder.pyfinderconfig import (
+    EMSC_FELT_REPORT_SERVICE,
+    ESM_SHAKEMAP_SERVICE,
+    RRSM_PEAK_MOTION_SERVICE,
+    pyfinderconfig,
+)
+from pyfinder.service_priority import resolve_service_priority
 from pyfinder.utils import customlogger
-from paramws.clients import (RRSMPeakMotionClient, 
-                             RRSMShakeMapClient,
-                             EMSCFeltReportClient,
-                             ESMShakeMapClient)
+from paramws.clients import (
+    EMSCFeltReportClient,
+    ESMShakeMapClient,
+    RRSMPeakMotionClient,
+)
 from pyfinder.finderutils import (FinderChannelList, FinderSolution)
-from pyfinder.utils.dataformatter import (RRSMPeakMotionDataFormatter,
-                                          ESMShakeMapDataFormatter,
-                                          FinDerFormatterFromRawList,
-                                          get_epoch_time)
+from pyfinder.utils.dataformatter import (
+    EMSCFeltReportDataFormatter,
+    ESMShakeMapDataFormatter,
+    FinDerFormatterFromRawList,
+    RRSMPeakMotionDataFormatter,
+    get_epoch_time,
+)
 from pyfinder.utils.station_merger import StationMerger
+
+
+_DEPENDENCY_MODEL_ERRORS = (
+    AttributeError,
+    IndexError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
 
 class FinDerManager:
     """ Class for managing the FinDer library and executable wrappers"""
@@ -133,6 +158,16 @@ class FinDerManager:
             self.finder_configuration = finder_configuration
             return
 
+        if self.entry_kind == self.ON_DEMAND:
+            if name_supplied != configuration_supplied:
+                self.logger.critical(
+                    "Incomplete FinDer configuration handoff was ignored; "
+                    "on-demand selection will use its provider context"
+                )
+            self.finder_configuration_name = None
+            self.finder_configuration = None
+            return
+
         if (
             self.entry_kind == self.ALERT_BACKED
             and not isinstance(self.event_context, EventContext)
@@ -144,6 +179,15 @@ class FinDerManager:
             self.finder_configuration = None
             return
 
+        if name_supplied != configuration_supplied:
+            self.logger.critical(
+                "Incomplete FinDer configuration handoff was ignored; using "
+                "the authoritative alert epicenter"
+            )
+        self._resolve_finder_configuration_from_context(self.event_context)
+
+    def _resolve_finder_configuration_from_context(self, event_context):
+        """Resolve one complete FinDer profile from a usable event context."""
         try:
             selector = build_default_selector(logger=self.logger)
         except GlobalFinderConfigError:
@@ -154,24 +198,9 @@ class FinDerManager:
             )
             raise
 
-        if name_supplied != configuration_supplied:
-            self.logger.critical(
-                "Incomplete FinDer configuration handoff; ignoring the "
-                "supplied member and using the global fallback"
-            )
-            latitude = None
-            longitude = None
-        else:
-            if self.entry_kind == self.ALERT_BACKED:
-                latitude = self.event_context.get_latitude()
-                longitude = self.event_context.get_longitude()
-            else:
-                latitude = self.metadata.get("emsc_latitude")
-                longitude = self.metadata.get("emsc_longitude")
-
         decision = selector.resolve(
-            latitude=latitude,
-            longitude=longitude,
+            latitude=event_context.get_latitude(),
+            longitude=event_context.get_longitude(),
         )
         self.finder_configuration_name = decision.configuration_name
         self.finder_configuration = decision.configuration
@@ -322,6 +351,318 @@ class FinDerManager:
         
         # e.g., "20230101_013045_t00010"
         return f"{event_id}_{appendix}"
+
+    def _configured_enabled_services(self):
+        """Return unique recognized enabled services in configured order."""
+        configured = self.configuration.get("general", {}).get(
+            "services-enabled",
+            [],
+        )
+        if not isinstance(configured, list):
+            self.logger.critical(
+                "The configured services-enabled value must be a list; no "
+                "observation provider can be queried"
+            )
+            return []
+
+        recognized = []
+        for service_name in configured:
+            if service_name not in (
+                ESM_SHAKEMAP_SERVICE,
+                RRSM_PEAK_MOTION_SERVICE,
+                EMSC_FELT_REPORT_SERVICE,
+            ):
+                self.logger.critical(
+                    "Unsupported enabled observation service %r was skipped",
+                    service_name,
+                )
+                continue
+            if service_name not in recognized:
+                recognized.append(service_name)
+        return recognized
+
+    @staticmethod
+    def _new_provider_outcome():
+        """Create the stable diagnostic fields for one provider attempt."""
+        return {
+            "status_code": None,
+            "normalized_count": 0,
+            "failure_kind": None,
+            "diagnostic": None,
+            "event_context_usable": False,
+            "context_diagnostic": None,
+        }
+
+    @staticmethod
+    def _append_diagnostic(outcome, diagnostic):
+        """Retain multiple useful provider diagnostics without extra fields."""
+        if outcome["diagnostic"]:
+            outcome["diagnostic"] += f"; {diagnostic}"
+        else:
+            outcome["diagnostic"] = diagnostic
+
+    def _record_provider_failure(
+        self,
+        service_name,
+        outcome,
+        failure_kind,
+        diagnostic,
+        *,
+        exc_info=False,
+    ):
+        """Record and report one contained provider observation failure."""
+        outcome["failure_kind"] = failure_kind
+        self._append_diagnostic(outcome, diagnostic)
+        self.logger.error(
+            "%s observation acquisition failed: %s",
+            service_name,
+            diagnostic,
+            exc_info=exc_info,
+        )
+
+    def _acquire_provider(self, service_name, event_id):
+        """Query one recognized provider and adapt its two public results."""
+        outcome = self._new_provider_outcome()
+        acquired = {
+            "event_context": None,
+            "scientific_value": None,
+            "outcome": outcome,
+        }
+
+        try:
+            if service_name == ESM_SHAKEMAP_SERVICE:
+                client = ESMShakeMapClient()
+            elif service_name == RRSM_PEAK_MOTION_SERVICE:
+                client = RRSMPeakMotionClient()
+            else:
+                client = EMSCFeltReportClient()
+            query_result = client.query(event_id=event_id)
+        except Exception as error:
+            self._record_provider_failure(
+                service_name,
+                outcome,
+                "exception",
+                f"client construction or query raised {error!r}",
+                exc_info=True,
+            )
+            return acquired
+
+        if not isinstance(query_result, tuple) or len(query_result) != 3:
+            self._record_provider_failure(
+                service_name,
+                outcome,
+                "invalid-result",
+                "query did not return the expected three-item tuple",
+            )
+            return acquired
+
+        status_code, event_candidate, datasets = query_result
+        outcome["status_code"] = status_code
+        if status_code != 200:
+            self._append_diagnostic(
+                outcome,
+                f"provider returned aggregate status {status_code!r}",
+            )
+
+        try:
+            acquired["event_context"] = EventContext.from_provider_model(
+                event_candidate,
+                requested_event_id=event_id,
+            )
+        except (EventContextError, ProviderModelAccessError) as error:
+            outcome["context_diagnostic"] = str(error)
+            self.logger.error(
+                "%s event context candidate is unusable: %s",
+                service_name,
+                error,
+            )
+        else:
+            outcome["event_context_usable"] = True
+
+        if service_name == EMSC_FELT_REPORT_SERVICE:
+            try:
+                felt_reports = client.get_feltreports()
+            except Exception as error:
+                self._record_provider_failure(
+                    service_name,
+                    outcome,
+                    "exception",
+                    f"single-event felt view raised {error!r}",
+                    exc_info=True,
+                )
+                return acquired
+            if felt_reports is None:
+                self._record_provider_failure(
+                    service_name,
+                    outcome,
+                    "invalid-result",
+                    "single-event felt view is missing",
+                )
+                return acquired
+            acquired["scientific_value"] = felt_reports
+            return acquired
+
+        if not isinstance(datasets, Mapping):
+            self._record_provider_failure(
+                service_name,
+                outcome,
+                "invalid-result",
+                "query datasets value is not a mapping",
+            )
+            return acquired
+
+        dataset_key = (
+            "station_amplitudes"
+            if service_name == ESM_SHAKEMAP_SERVICE
+            else "peak_motion"
+        )
+        try:
+            if dataset_key not in datasets:
+                self._record_provider_failure(
+                    service_name,
+                    outcome,
+                    "invalid-result",
+                    f"query datasets are missing {dataset_key!r}",
+                )
+                return acquired
+            scientific_value = datasets[dataset_key]
+        except _DEPENDENCY_MODEL_ERRORS as error:
+            self._record_provider_failure(
+                service_name,
+                outcome,
+                "exception",
+                f"query dataset access raised {error!r}",
+                exc_info=True,
+            )
+            return acquired
+
+        if scientific_value is None:
+            self._record_provider_failure(
+                service_name,
+                outcome,
+                "invalid-result",
+                f"query dataset {dataset_key!r} is missing",
+            )
+            return acquired
+
+        acquired["scientific_value"] = scientific_value
+        return acquired
+
+    def _acquire_enabled_providers(self, event_id):
+        """Attempt every recognized enabled provider exactly once."""
+        acquired = {}
+        for service_name in self._configured_enabled_services():
+            acquired[service_name] = self._acquire_provider(
+                service_name,
+                event_id,
+            )
+        return acquired
+
+    def _select_on_demand_context(self, acquired):
+        """Select the first queried usable candidate in scientific priority."""
+        configured_priority = self.configuration.get("general", {}).get(
+            "services-priority"
+        )
+        for service_name in resolve_service_priority(
+            configured_priority,
+            logger=self.logger,
+        ):
+            provider_result = acquired.get(service_name)
+            if (
+                provider_result is not None
+                and provider_result["event_context"] is not None
+            ):
+                return provider_result["event_context"]
+        return None
+
+    def _normalize_provider(self, service_name, event_context, value):
+        """Normalize one provider value with the common event context."""
+        if service_name == ESM_SHAKEMAP_SERVICE:
+            formatter = ESMShakeMapDataFormatter(
+                logger=self.logger,
+                configuration=self.configuration,
+            )
+            return formatter.extract_raw_stations(
+                event_data=event_context,
+                amplitudes=value,
+            )
+        if service_name == RRSM_PEAK_MOTION_SERVICE:
+            formatter = RRSMPeakMotionDataFormatter(
+                logger=self.logger,
+                configuration=self.configuration,
+            )
+            return formatter.extract_raw_stations(
+                event_data=event_context,
+                amplitudes=value,
+            )
+
+        formatter = EMSCFeltReportDataFormatter(logger=self.logger)
+        return formatter.extract_raw_stations(
+            event_data=event_context,
+            felt_reports=value,
+        )
+
+    def _normalize_acquired_providers(self, acquired, event_context, event_id):
+        """Build normalized available results and complete provider outcomes."""
+        available_results = {}
+        for service_name, provider_result in acquired.items():
+            outcome = provider_result["outcome"]
+            normalized = []
+            value = provider_result["scientific_value"]
+            if value is not None:
+                try:
+                    normalized = self._normalize_provider(
+                        service_name,
+                        event_context,
+                        value,
+                    )
+                except ProviderModelAccessError as error:
+                    self._record_provider_failure(
+                        service_name,
+                        outcome,
+                        "exception",
+                        f"provider model access failed: {error}",
+                        exc_info=True,
+                    )
+                    normalized = []
+
+                if not isinstance(normalized, list):
+                    raise TypeError(
+                        f"{service_name} normalizer must return a list"
+                    )
+
+            if not normalized and outcome["failure_kind"] is None:
+                diagnostic = (
+                    f"{service_name} produced zero usable normalized "
+                    f"observations for event {event_id}"
+                )
+                self._append_diagnostic(outcome, diagnostic)
+                self.logger.error(diagnostic)
+
+            outcome["normalized_count"] = len(normalized)
+            available_results[service_name] = normalized
+        return available_results
+
+    def _store_provider_outcomes(self, acquired):
+        """Expose provider outcomes and retain legacy display status fields."""
+        outcomes = {
+            service_name: provider_result["outcome"]
+            for service_name, provider_result in acquired.items()
+        }
+        self.metadata["provider_outcomes"] = outcomes
+
+        for service_name, metadata_key in (
+            (ESM_SHAKEMAP_SERVICE, "ESM_status"),
+            (RRSM_PEAK_MOTION_SERVICE, "RRSM_status"),
+        ):
+            if service_name not in outcomes:
+                continue
+            status_code = outcomes[service_name]["status_code"]
+            self.metadata[metadata_key] = (
+                "Success"
+                if status_code == 200
+                else "Failed with HTTP " + str(status_code)
+            )
     
     def process_event(self, event_id) -> FinderSolution:
         """ Process data associated with an event_id """
@@ -355,115 +696,61 @@ class FinDerManager:
         else:
             authoritative_event = None
         
-        # Create the RRSM and ESM clients
-        self.logger.info(f"Querying the RRSM and ESM web services for event {event_id}")
-        rrsm_client = RRSMPeakMotionClient()
-        _rrsm_code, _rrsm_event, _rrsm_datasets = rrsm_client.query(
-            event_id=event_id)
-        _rrsm_amplitude = _rrsm_datasets["peak_motion"]
+        self.logger.info(
+            "Querying configured observation services for event %s",
+            event_id,
+        )
+        acquired = self._acquire_enabled_providers(event_id)
+        self._store_provider_outcomes(acquired)
+        self.available_results = {
+            service_name: [] for service_name in acquired
+        }
 
-        # Log the RRSM status
-        self.logger.info(f"RRSM event status: {_rrsm_event is not None} ")
-        self.logger.info(f"RRSM amplitude status: {_rrsm_amplitude is not None} ")
+        if authoritative_event is None:
+            authoritative_event = self._select_on_demand_context(acquired)
+            if authoritative_event is None:
+                diagnostic = (
+                    "normalization was not attempted because no enabled "
+                    "provider supplied a usable event context"
+                )
+                for provider_result in acquired.values():
+                    self._append_diagnostic(
+                        provider_result["outcome"],
+                        diagnostic,
+                    )
+                self.logger.error(
+                    "FinDer cannot process on-demand event %s because no "
+                    "usable provider event context was returned",
+                    event_id,
+                )
+                return None
 
-        # Create the ESM client
-        self.logger.info(f"Querying the ESM web services for event {event_id}")
-        esm_client = ESMShakeMapClient()
-        _esm_code, _esm_event, _esm_datasets = esm_client.query(
-            event_id=event_id)
-        _esm_amplitude = _esm_datasets["station_amplitudes"]
-        self.logger.info(f"ESM event status: {_esm_event is not None} ")
-        self.logger.info(f"ESM amplitude status: {_esm_amplitude is not None} ")
+            self.event_context = authoritative_event
+            self._populate_metadata_from_event_context(authoritative_event)
+            if (
+                self.finder_configuration_name is None
+                or self.finder_configuration is None
+            ):
+                self._resolve_finder_configuration_from_context(
+                    authoritative_event
+                )
 
-        # Is the connection successful?
-        if _rrsm_code != 200:
-            self.metadata['RRSM_status'] = "Failed with HTTP " + str(_rrsm_code)
-            # raise ConnectionError("Connection to the RRSM web service failed")
-        else:
-            self.metadata['RRSM_status'] = "Success"
-
-        if _esm_code != 200:
-            self.metadata['ESM_status'] = "Failed with HTTP " + str(_esm_code)
-            # raise ConnectionError("Connection to the ESM web service failed")
-        else:
-            self.metadata['ESM_status'] = "Success"
-        
         self.logger.info("Extracting normalized observations ...")
-        esm_raw = []
-        if _esm_event and _esm_amplitude:
-            esm_formatter = ESMShakeMapDataFormatter(
-                logger=self.logger,
-                configuration=self.configuration,
-            )
-            esm_raw = esm_formatter.extract_raw_stations(
-                event_data=(authoritative_event or _esm_event),
-                amplitudes=_esm_amplitude,
-            )
-
-        if not esm_raw:
-            self.logger.error(
-                f"ESM produced zero usable normalized observations for "
-                f"event {event_id}")
-        
-        # ##############################################
-        # # Hack for M. Boese's playbacks to run only the RRSM part.
-        # esm_raw = None
-        # _esm_event = None
-        # ##############################################
-
-        rrsm_raw = []
-        if _rrsm_event and _rrsm_amplitude:
-            rrsm_formatter = RRSMPeakMotionDataFormatter(
-                logger=self.logger,
-                configuration=self.configuration,
-            )
-            rrsm_normalization_event = authoritative_event
-            if rrsm_normalization_event is None:
-                # Until on-demand execution selects one common context, retain
-                # the historical RRSM timestamp carried by PeakMotionData.
-                rrsm_normalization_event = _rrsm_amplitude.get_event_data()
-            rrsm_raw = rrsm_formatter.extract_raw_stations(
-                event_data=rrsm_normalization_event,
-                amplitudes=_rrsm_amplitude,
-            )
-
-        if not rrsm_raw:
-            self.logger.error(
-                f"RRSM produced zero usable normalized observations for "
-                f"event {event_id}")
+        self.available_results = self._normalize_acquired_providers(
+            acquired,
+            authoritative_event,
+            event_id,
+        )
         self.logger.info("Normalized observations extracted.")
 
-        # Alert-backed execution keeps its persisted EMSC context. The existing
-        # provider preference remains only for explicit on-demand execution
-        # until provider-priority selection is introduced at that boundary.
+        # The current merger supports instrumental ESM and RRSM records only.
+        # Felt results remain visible in available_results for the later
+        # cross-source merger without entering its coordinate fallback.
+        esm_raw = self.available_results.get(ESM_SHAKEMAP_SERVICE, [])
+        rrsm_raw = self.available_results.get(RRSM_PEAK_MOTION_SERVICE, [])
         _event_data = authoritative_event
-        if _event_data is None:
-            _event_data = _esm_event if _esm_event else _rrsm_event
 
-        # Collect more metadata for the solution. The scheduler already 
-        # should have dumped some fields in the dict:
-        # solution_metadata = {
-        #         "last_query_time": str(event_meta['last_query_time']),
-        #         "delay_until_next_query": delay,}
-        self.logger.info("Collecting metadata ...")
-        try:
-            if isinstance(_event_data, EventContext):
-                self._populate_metadata_from_event_context(_event_data)
-            else:
-                self.metadata['origin_time'] = _event_data.get_origin_time()
-                self.metadata['longitude'] = _event_data.get_longitude()
-                self.metadata['latitude'] = _event_data.get_latitude()
-                self.metadata['magnitude'] = _event_data.get_magnitude()
-                self.metadata['depth'] = _event_data.get_depth()
-
-                if hasattr(_event_data, "get_magnitude_type"):
-                    self.metadata['magnitude_type'] = (
-                        _event_data.get_magnitude_type()
-                    )
-                else:
-                    self.metadata['magnitude_type'] = ""
-        except Exception as e:
-            self.logger.error(f"Error collecting metadata: {e}")
+        self._populate_metadata_from_event_context(_event_data)
         self.logger.info(f"Calculation metadata: {self.metadata}")
 
         # The downstream handoff is always the merged normalized list. An
@@ -489,16 +776,14 @@ class FinDerManager:
                     "|- Reason: All normalized observation sources produced "
                     "zero usable records.")
             self.logger.warning(f"|- event_id: {event_id}")
-            self.logger.warning(f"|- ESM event: {_esm_event is not None}")
-            self.logger.warning(f"|- ESM amplitude: {_esm_amplitude is not None}")
-            self.logger.warning(f"|- RRSM event: {_rrsm_event is not None}")
-            self.logger.warning(f"|- RRSM amplitude: {_rrsm_amplitude is not None}")
             self.logger.warning(
                 f"|- ESM normalized observations: {len(esm_raw)}")
             self.logger.warning(
                 f"|- RRSM normalized observations: {len(rrsm_raw)}")
-            self.logger.warning(f"|- ESM code: {_esm_code}")
-            self.logger.warning(f"|- RRSM code: {_rrsm_code}")
+            self.logger.warning(
+                "|- Provider outcomes: %s",
+                self.metadata["provider_outcomes"],
+            )
 
             return None
 

@@ -4,7 +4,7 @@ import os
 import sys
 import argparse
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import threading
 import time
@@ -17,12 +17,15 @@ from pyfinder.utils.timeutils import get_epoch_time
 
 
 def generate_event_list():
-    """Return the known playback definitions available for completion.
+    """Return complete known alerts for one playback registration run.
 
-    Authentic origin and last-update timestamps are not available for these
-    definitions, so those fields remain absent. Playback validation identifies
-    each incomplete event without inventing scientific metadata.
+    Historical origin times remain fixed scientific metadata. The shared
+    last-update value identifies the current replay and is intentionally
+    generated independently from those origins.
     """
+    replay_last_update = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
     return [
         {
             "source_id": "00000001",
@@ -37,6 +40,8 @@ def generate_event_list():
             "magtype": "Mw",
             "unid": "20161030_0000029",
             "action": "create",
+            "time": "2016-10-30T06:40:18.3Z",
+            "lastupdate": replay_last_update,
         },
         {
             "source_id": "00000002",
@@ -51,6 +56,8 @@ def generate_event_list():
             "magtype": "Mw",
             "unid": "20230206_0000008",
             "action": "create",
+            "time": "2023-02-06T01:17:36.1Z",
+            "lastupdate": replay_last_update,
         },
         {
             "source_id": "00000003",
@@ -65,6 +72,8 @@ def generate_event_list():
             "magtype": "Mw",
             "unid": "20230206_0000222",
             "action": "create",
+            "time": "2023-02-06T10:24:49.6Z",
+            "lastupdate": replay_last_update,
         },
         {
             "source_id": "00000004",
@@ -79,6 +88,8 @@ def generate_event_list():
             "magtype": "Mw",
             "unid": "20250522_0000028",
             "action": "create",
+            "time": "2025-05-22T03:19:34.6Z",
+            "lastupdate": replay_last_update,
         },
         {
             "source_id": "00000005",
@@ -93,6 +104,8 @@ def generate_event_list():
             "magtype": "Mw",
             "unid": "20250423_0000104",
             "action": "create",
+            "time": "2025-04-23T09:49:11.93Z",
+            "lastupdate": replay_last_update,
         },
         {
             "source_id": "00000006",
@@ -107,6 +120,8 @@ def generate_event_list():
             "magtype": "ML",
             "unid": "20250520_0000201",
             "action": "create",
+            "time": "2025-05-20T20:36:52.26Z",
+            "lastupdate": replay_last_update,
         },
         {
             "source_id": "00000007",
@@ -121,6 +136,8 @@ def generate_event_list():
             "magtype": "ML",
             "unid": "20250922_0000172",
             "action": "create",
+            "time": "2025-09-22T09:02:44.04Z",
+            "lastupdate": replay_last_update,
         },
     ]
 

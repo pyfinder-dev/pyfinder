@@ -37,8 +37,11 @@ class _EventModel:
     def __init__(self, name):
         self.name = name
 
+    def get_event_id(self):
+        return "handoff-event"
+
     def get_origin_time(self):
-        return f"{self.name}-origin"
+        return "2026-08-10T08:15:30.250000Z"
 
     def get_longitude(self):
         return 12.5
@@ -66,7 +69,13 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         # selection are independent of the observation-handoff boundary.
         manager = object.__new__(findermanager.FinDerManager)
         manager.options = {"use_library": False}
-        manager.configuration = {}
+        manager.configuration = {
+            "general": {
+                "services-enabled": ["ESM_ShakeMap", "RRSM_PeakMotion"],
+                "services-priority": ["ESM_ShakeMap", "RRSM_PeakMotion"],
+                "component-selection": "maximum-all",
+            }
+        }
         manager.finder_configuration_name = "offline-test"
         manager.finder_configuration = {"DATA_FOLDER": "offline-test"}
         manager.metadata = {}
@@ -189,9 +198,10 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             rrsm_data=rrsm_records,
         )
         observed["executable"].execute.assert_called_once_with(
-            event_data=esm_event,
+            event_data=observed["manager"].event_context,
             amplitudes=merged_records,
         )
+        self.assertIsNot(observed["manager"].event_context, esm_event)
         executable_amplitudes = (
             observed["executable"].execute.call_args.kwargs["amplitudes"])
         self.assertIsInstance(executable_amplitudes, list)
@@ -225,10 +235,8 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             esm_data=[],
             rrsm_data=rrsm_records,
         )
-        # Event preference remains ESM-over-RRSM even when ESM contributes no
-        # usable normalized observation.
         observed["executable"].execute.assert_called_once_with(
-            event_data=esm_event,
+            event_data=observed["manager"].event_context,
             amplitudes=merged_records,
         )
         self.assertIsNot(
@@ -258,7 +266,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             rrsm_data=[],
         )
         observed["executable"].execute.assert_called_once_with(
-            event_data=esm_event,
+            event_data=observed["manager"].event_context,
             amplitudes=merged_records,
         )
         errors = self._messages(observed["manager"].logger.error)
@@ -273,7 +281,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             for message in errors
         ), errors)
 
-    def test_absent_rrsm_logs_error_and_usable_esm_still_reaches_finder(self):
+    def test_absent_rrsm_records_invalid_outcome_and_esm_reaches_finder(self):
         esm_event = _EventModel("esm")
         _rrsm_provider, esm_provider = self._provider_models()
         esm_records = [{"source": "ESM"}]
@@ -295,15 +303,15 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             rrsm_data=[],
         )
         observed["executable"].execute.assert_called_once_with(
-            event_data=esm_event,
+            event_data=observed["manager"].event_context,
             amplitudes=merged_records,
         )
-        errors = self._messages(observed["manager"].logger.error)
-        self.assertTrue(any(
-            "RRSM" in message
-            and "zero usable normalized observations" in message
-            for message in errors
-        ), errors)
+        self.assertEqual(
+            observed["manager"].metadata["provider_outcomes"][
+                "RRSM_PeakMotion"
+            ]["failure_kind"],
+            "invalid-result",
+        )
 
     def test_truthy_provider_models_cannot_replace_empty_normalized_lists(self):
         rrsm_event = _EventModel("rrsm")
@@ -352,7 +360,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             for message in errors
         ), errors)
 
-    def test_absent_esm_result_is_an_empty_list_and_logs_zero_result(self):
+    def test_absent_esm_result_is_empty_with_invalid_result_outcome(self):
         rrsm_event = _EventModel("rrsm")
         rrsm_provider = Mock(name="rrsm_provider")
         rrsm_provider.get_event_data.return_value = rrsm_event
@@ -375,15 +383,15 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             rrsm_data=rrsm_records,
         )
         observed["executable"].execute.assert_called_once_with(
-            event_data=rrsm_event,
+            event_data=observed["manager"].event_context,
             amplitudes=merged_records,
         )
-        errors = self._messages(observed["manager"].logger.error)
-        self.assertTrue(any(
-            "ESM" in message
-            and "zero usable normalized observations" in message
-            for message in errors
-        ), errors)
+        self.assertEqual(
+            observed["manager"].metadata["provider_outcomes"]["ESM_ShakeMap"][
+                "failure_kind"
+            ],
+            "invalid-result",
+        )
 
 
 if __name__ == "__main__":

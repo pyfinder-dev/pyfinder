@@ -42,10 +42,15 @@ class _EventModel:
 
     def __init__(self, name, origin_time=None):
         self.name = name
-        self.origin_time = origin_time or f"{name}-origin"
+        self.origin_time = (
+            origin_time or "2026-08-10T08:15:30.250000Z"
+        )
         self.get_event_data = Mock(
             side_effect=AssertionError(
                 "The separate ParamWS event must not be treated as amplitudes"))
+
+    def get_event_id(self):
+        return "test-event"
 
     def get_origin_time(self):
         return self.origin_time
@@ -75,7 +80,13 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
         # part of this dependency-boundary test.
         manager = object.__new__(findermanager.FinDerManager)
         manager.options = {"use_library": False}
-        manager.configuration = {}
+        manager.configuration = {
+            "general": {
+                "services-enabled": ["RRSM_PeakMotion", "ESM_ShakeMap"],
+                "services-priority": ["ESM_ShakeMap", "RRSM_PeakMotion"],
+                "component-selection": "maximum-all",
+            }
+        }
         manager.finder_configuration_name = "offline-test"
         manager.finder_configuration = {"DATA_FOLDER": "offline-test"}
         manager.metadata = {}
@@ -130,104 +141,39 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
             "merger_type": merger_type,
         }
 
-    def test_rrsm_keeps_tuple_event_separate_from_peak_motion_dataset(self):
-        rrsm_event = _EventModel("rrsm-top-level")
-        nested_event = _EventModel("rrsm-nested")
-        peak_motion = Mock(name="peak_motion")
-        peak_motion.get_event_data.return_value = nested_event
-        rrsm_datasets = {"peak_motion": peak_motion}
-
-        observed = self._exercise(
-            (200, rrsm_event, rrsm_datasets),
-            (404, None, {"station_amplitudes": None}),
-            rrsm_raw=["rrsm-raw"],
-        )
-
-        observed["rrsm_type"].assert_called_once_with()
-        observed["rrsm_client"].query.assert_called_once_with(
-            event_id=self.event_id)
-        peak_motion.get_event_data.assert_called_once_with()
-        rrsm_event.get_event_data.assert_not_called()
-        observed["rrsm_formatter_type"].assert_called_once_with(
-            logger=observed["manager"].logger,
-            configuration=observed["manager"].configuration,
-        )
-        observed["rrsm_formatter"].assert_called_once_with(
-            event_data=nested_event,
-            amplitudes=peak_motion,
-        )
-        self.assertIsNot(
-            observed["rrsm_formatter"].call_args.kwargs["amplitudes"],
-            rrsm_datasets,
-        )
-        self.assertEqual(
-            observed["manager"].metadata["origin_time"],
-            "rrsm-top-level-origin",
-        )
-        self.assertEqual(observed["manager"].metadata["RRSM_status"],
-                         "Success")
-
-    def test_esm_keeps_event_separate_from_station_amplitude_dataset(self):
+    def test_public_datasets_remain_separate_from_event_candidates(self):
+        rrsm_event = _EventModel("rrsm")
         esm_event = _EventModel("esm")
+        peak_motion = Mock(name="peak_motion")
         station_amplitudes = object()
-        esm_datasets = {"station_amplitudes": station_amplitudes}
 
         observed = self._exercise(
-            (503, None, {"peak_motion": None}),
-            (200, esm_event, esm_datasets),
+            (200, rrsm_event, {"peak_motion": peak_motion}),
+            (200, esm_event, {"station_amplitudes": station_amplitudes}),
+            rrsm_raw=["rrsm-raw"],
             esm_raw=["esm-raw"],
         )
 
-        observed["esm_type"].assert_called_once_with()
+        observed["rrsm_client"].query.assert_called_once_with(
+            event_id=self.event_id)
         observed["esm_client"].query.assert_called_once_with(
             event_id=self.event_id)
-        observed["esm_formatter_type"].assert_called_once_with(
-            logger=observed["manager"].logger,
-            configuration=observed["manager"].configuration,
+        common_context = observed["manager"].event_context
+        observed["rrsm_formatter"].assert_called_once_with(
+            event_data=common_context,
+            amplitudes=peak_motion,
         )
         observed["esm_formatter"].assert_called_once_with(
-            event_data=esm_event,
+            event_data=common_context,
             amplitudes=station_amplitudes,
         )
-        self.assertIsNot(
-            observed["esm_formatter"].call_args.kwargs["amplitudes"],
-            esm_datasets,
-        )
-        self.assertEqual(
-            observed["manager"].metadata["origin_time"],
-            "esm-origin",
-        )
-        self.assertEqual(observed["manager"].metadata["ESM_status"],
-                         "Success")
+        rrsm_event.get_event_data.assert_not_called()
+        esm_event.get_event_data.assert_not_called()
 
-    def test_esm_requested_none_dataset_is_not_treated_as_amplitudes(self):
-        esm_event = _EventModel("esm")
+    def test_non_200_usable_results_retain_status_and_normalize(self):
         observed = self._exercise(
-            (404, None, {"peak_motion": None}),
-            (200, esm_event, {"station_amplitudes": None}),
-        )
-
-        observed["esm_client"].query.assert_called_once_with(
-            event_id=self.event_id)
-        observed["esm_formatter"].assert_not_called()
-        observed["merger_type"].return_value.merge.assert_called_once_with(
-            esm_data=[],
-            rrsm_data=[],
-        )
-        self.assertIsNone(observed["result"])
-
-    def test_non_200_codes_retain_partial_event_and_dataset_values(self):
-        rrsm_event = _EventModel("rrsm")
-        nested_event = _EventModel("rrsm-nested")
-        esm_event = _EventModel("esm")
-        peak_motion = Mock(name="peak_motion")
-        peak_motion.get_event_data.return_value = nested_event
-        station_amplitudes = object()
-
-        observed = self._exercise(
-            (503, rrsm_event, {"peak_motion": peak_motion}),
-            (502, esm_event,
-             {"station_amplitudes": station_amplitudes}),
+            (503, _EventModel("rrsm"), {"peak_motion": object()}),
+            (502, _EventModel("esm"), {"station_amplitudes": object()}),
             rrsm_raw=["rrsm-raw"],
             esm_raw=["esm-raw"],
         )
@@ -236,165 +182,69 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
                          "Failed with HTTP 503")
         self.assertEqual(observed["manager"].metadata["ESM_status"],
                          "Failed with HTTP 502")
-        observed["rrsm_formatter"].assert_called_once_with(
-            event_data=nested_event,
-            amplitudes=peak_motion,
+        self.assertEqual(
+            observed["manager"].metadata["provider_outcomes"][
+                "RRSM_PeakMotion"
+            ]["normalized_count"],
+            1,
         )
-        observed["esm_formatter"].assert_called_once_with(
-            event_data=esm_event,
-            amplitudes=station_amplitudes,
+        self.assertEqual(
+            observed["manager"].metadata["provider_outcomes"][
+                "ESM_ShakeMap"
+            ]["normalized_count"],
+            1,
         )
 
-    def test_on_demand_rrsm_record_uses_nested_peak_motion_timestamp(self):
-        top_level_event = _EventModel(
-            "rrsm-top-level",
-            origin_time="2020-01-02T03:04:05.000000Z",
+    def test_malformed_dataset_is_contained_and_other_provider_continues(self):
+        observed = self._exercise(
+            (200, _EventModel("rrsm"), None),
+            (200, _EventModel("esm"), {"station_amplitudes": object()}),
+            esm_raw=["esm-raw"],
         )
-        nested_event = _EventModel(
-            "rrsm-nested",
-            origin_time="2021-02-03T04:05:06.000000Z",
+
+        observed["rrsm_formatter"].assert_not_called()
+        observed["esm_formatter"].assert_called_once()
+        self.assertEqual(
+            observed["manager"].metadata["provider_outcomes"][
+                "RRSM_PeakMotion"
+            ]["failure_kind"],
+            "invalid-result",
         )
-        channel = PeakMotionChannelData({
-            "channel-code": "HHE",
-            "pga-value": 1.0,
-        })
-        station = PeakMotionStationData({
-            "network-code": "NW",
-            "station-code": "STA",
-            "location-code": "",
-            "station-latitude": 45.0,
-            "station-longitude": 12.0,
-        })
-        station.add_channel(channel)
-        peak_motion = PeakMotionData()
-        peak_motion.set_event_data(nested_event)
-        peak_motion.add_station(station)
+
+    def test_query_failure_is_contained_without_retry(self):
         manager = self._manager()
-        manager.configuration = {
-            "general": {"component-selection": "maximum-all"},
-            "finder-executable": {"finder-live-mode": False},
-        }
-
         with patch.object(
                 findermanager, "RRSMPeakMotionClient") as rrsm_type, \
                 patch.object(
                     findermanager, "ESMShakeMapClient") as esm_type, \
                 patch.object(
-                    findermanager, "StationMerger") as merger_type, \
-                patch.object(
-                    peak_motion,
-                    "get_event_data",
-                    wraps=peak_motion.get_event_data,
-                ) as nested_access:
-            rrsm_type.return_value.query.return_value = (
-                200,
-                top_level_event,
-                {"peak_motion": peak_motion},
+                    findermanager.ESMShakeMapDataFormatter,
+                    "extract_raw_stations",
+                    return_value=["esm"],
+                ), \
+                patch.object(findermanager, "StationMerger") as merger_type:
+            rrsm_type.return_value.query.side_effect = ConnectionError(
+                "transport exhausted"
             )
             esm_type.return_value.query.return_value = (
-                404,
-                None,
-                {"station_amplitudes": None},
+                200,
+                _EventModel("esm"),
+                {"station_amplitudes": object()},
             )
             merger_type.return_value.merge.return_value = []
 
-            result = manager.process_event(self.event_id)
+            self.assertIsNone(manager.process_event(self.event_id))
 
-        self.assertIsNone(result)
-        nested_access.assert_called_once_with()
-        rrsm_records = merger_type.return_value.merge.call_args.kwargs[
-            "rrsm_data"
-        ]
-        self.assertEqual(len(rrsm_records), 1)
+        rrsm_type.return_value.query.assert_called_once_with(
+            event_id=self.event_id)
+        esm_type.return_value.query.assert_called_once_with(
+            event_id=self.event_id)
         self.assertEqual(
-            rrsm_records[0]["timestamp"],
-            dataformatter.get_epoch_time(nested_event.get_origin_time()),
+            manager.metadata["provider_outcomes"]["RRSM_PeakMotion"][
+                "failure_kind"
+            ],
+            "exception",
         )
-        self.assertNotEqual(
-            rrsm_records[0]["timestamp"],
-            dataformatter.get_epoch_time(top_level_event.get_origin_time()),
-        )
-        self.assertEqual(
-            manager.metadata["origin_time"],
-            top_level_event.get_origin_time(),
-        )
-
-    def test_missing_required_dataset_keys_fail_visibly(self):
-        cases = (
-            ((200, _EventModel("rrsm"), {}),
-             (200, _EventModel("esm"),
-              {"station_amplitudes": object()}),
-             "peak_motion"),
-            ((404, None, {"peak_motion": None}),
-             (200, _EventModel("esm"), {}),
-             "station_amplitudes"),
-        )
-
-        for rrsm_result, esm_result, missing_key in cases:
-            with self.subTest(missing_key=missing_key), \
-                    patch.object(
-                        findermanager,
-                        "RRSMPeakMotionClient",
-                    ) as rrsm_type, \
-                    patch.object(
-                        findermanager,
-                        "ESMShakeMapClient",
-                    ) as esm_type:
-                rrsm_type.return_value.query.return_value = rrsm_result
-                esm_type.return_value.query.return_value = esm_result
-
-                with self.assertRaisesRegex(KeyError, missing_key):
-                    self._manager().process_event(self.event_id)
-
-                rrsm_type.return_value.query.assert_called_once_with(
-                    event_id=self.event_id)
-                if missing_key == "peak_motion":
-                    esm_type.assert_not_called()
-                else:
-                    esm_type.return_value.query.assert_called_once_with(
-                        event_id=self.event_id)
-
-    def test_non_mapping_datasets_fail_visibly(self):
-        with patch.object(
-                findermanager, "RRSMPeakMotionClient") as rrsm_type, \
-                patch.object(
-                    findermanager, "ESMShakeMapClient") as esm_type:
-            rrsm_type.return_value.query.return_value = (
-                200, _EventModel("rrsm"), None)
-
-            with self.assertRaises(TypeError):
-                self._manager().process_event(self.event_id)
-
-            rrsm_type.return_value.query.assert_called_once_with(
-                event_id=self.event_id)
-            esm_type.assert_not_called()
-
-    def test_transport_and_content_failures_propagate_without_query_retry(self):
-        failures = (
-            ConnectionError("transport exhausted"),
-            ValueError("invalid ParamWS content"),
-        )
-
-        for failure in failures:
-            with self.subTest(failure=type(failure).__name__), \
-                    patch.object(
-                        findermanager,
-                        "RRSMPeakMotionClient",
-                    ) as rrsm_type, \
-                    patch.object(
-                        findermanager,
-                        "ESMShakeMapClient",
-                    ) as esm_type:
-                rrsm_type.return_value.query.side_effect = failure
-
-                with self.assertRaises(type(failure)) as raised:
-                    self._manager().process_event(self.event_id)
-
-                self.assertIs(raised.exception, failure)
-                rrsm_type.assert_called_once_with()
-                rrsm_type.return_value.query.assert_called_once_with(
-                    event_id=self.event_id)
-                esm_type.assert_not_called()
 
     def test_paramws_models_are_the_public_exported_class_objects(self):
         self.assertIs(dataformatter.PeakMotionData, PeakMotionData)

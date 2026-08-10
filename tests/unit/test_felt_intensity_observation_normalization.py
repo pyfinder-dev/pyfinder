@@ -22,7 +22,7 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
     from paramws.clients import FeltReportEventData, FeltReportIntensityData
-    from pyfinder.eventcontext import EventContext
+    from pyfinder.eventcontext import EventContext, ProviderModelAccessError
     from pyfinder.utils.calculator import Calculator
     from pyfinder.utils import dataformatter
     from pyfinder.utils.dataformatter import EMSCFeltReportDataFormatter
@@ -775,7 +775,7 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
             )
         logger.error.assert_not_called()
 
-        with self.assertRaises(AttributeError):
+        with self.assertRaises(ProviderModelAccessError):
             formatter.extract_raw_stations(
                 event_data=_event(),
                 felt_reports=None,
@@ -788,14 +788,14 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
                 "intensities": [_row()],
             },
         })
-        with self.assertRaises(TypeError):
+        with self.assertRaises(ProviderModelAccessError):
             formatter.extract_raw_stations(
                 event_data=_event(),
                 felt_reports=multi_event_dataset,
             )
         logger.error.assert_not_called()
 
-        with self.assertRaises(AttributeError):
+        with self.assertRaises(ProviderModelAccessError):
             formatter.extract_raw_stations(
                 event_data=_event(),
                 felt_reports=_felt_reports([object()]),

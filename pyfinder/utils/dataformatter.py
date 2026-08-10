@@ -11,6 +11,7 @@ import fnmatch
 from typing import Union
 from .calculator import Calculator
 from .timeutils import get_epoch_time
+from pyfinder.eventcontext import ProviderModelAccessError
 from pyfinder.pyfinderconfig import pyfinderconfig
 from paramws.clients import (FeltReportEventData, FeltReportIntensityData,
                              PeakMotionData, ShakeMapEventData,
@@ -141,6 +142,28 @@ class BaseDataFormatter(object):
                 self.logger.debug(message)
             else:
                 self.logger.info(message)
+
+    @staticmethod
+    def _provider_value(provider_model, getter_name, *args):
+        """Read one dependency-owned accessor through an explicit boundary."""
+        try:
+            getter = getattr(provider_model, getter_name)
+            return getter(*args)
+        except (AttributeError, IndexError, KeyError, TypeError,
+                ValueError) as error:
+            raise ProviderModelAccessError(
+                f"public model accessor {getter_name} failed"
+            ) from error
+
+    @classmethod
+    def _provider_collection(cls, provider_model, getter_name):
+        """Read one list-valued dependency accessor and validate its shape."""
+        collection = cls._provider_value(provider_model, getter_name)
+        if not isinstance(collection, list):
+            raise ProviderModelAccessError(
+                f"public model accessor {getter_name} did not return a list"
+            )
+        return collection
     
     def safe_sort(self, paired_list, key_index=0, reverse=False):
         """
@@ -229,7 +252,7 @@ class EMSCFeltReportDataFormatter(BaseDataFormatter):
 
     def _coordinate(self, row, row_index, coordinate_name, minimum, maximum):
         """Validate one row coordinate without coercion or range rewriting."""
-        coordinate = row.get(coordinate_name)
+        coordinate = self._provider_value(row, "get", coordinate_name)
         coordinate_label = {
             "lat": "latitude",
             "lon": "longitude",
@@ -256,7 +279,7 @@ class EMSCFeltReportDataFormatter(BaseDataFormatter):
         Normalize the requested event's EMSC felt-intensity rows.
 
         Rows remain independent and in provider order. Dependency model access
-        errors are deliberately not caught or converted into an empty success.
+        failures cross the explicit public-model boundary for orchestration.
         """
         event_identity = self._event_identity(event_data)
         event_latitude = event_data.get_latitude()
@@ -280,15 +303,24 @@ class EMSCFeltReportDataFormatter(BaseDataFormatter):
         # behavior by converting the matching event origin time once and
         # reusing it without introducing new timestamp policy here.
         time_epoch = get_epoch_time(event_time)
-        intensity_rows = felt_reports.get_intensities()
+        intensity_rows = self._provider_collection(
+            felt_reports,
+            "get_intensities",
+        )
         raw_stations = []
+        missing = object()
 
         for row_index, row in enumerate(intensity_rows):
-            corrected_intensity = row.get("corrected")
-            if corrected_intensity is None:
-                selected_intensity = row.get("raw")
+            corrected_intensity = self._provider_value(
+                row,
+                "get",
+                "corrected",
+                missing,
+            )
+            if corrected_intensity is missing or corrected_intensity is None:
+                selected_intensity = self._provider_value(row, "get", "raw")
                 corrected_reason = (
-                    "missing" if "corrected" not in row else "None")
+                    "missing" if corrected_intensity is missing else "None")
                 self.logger.warning(
                     f"EMSC felt row {row_index} using raw intensity fallback "
                     f"{selected_intensity!r}: corrected is "
@@ -410,11 +442,10 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
             return "maximum-all"
         return component_selection
 
-    @staticmethod
-    def _station_identity(station):
+    def _station_identity(self, station):
         """Build the most useful station identity available for diagnostics."""
-        network_code = station.get_network_code()
-        station_code = station.get_station_code()
+        network_code = self._provider_value(station, "get_network_code")
+        station_code = self._provider_value(station, "get_station_code")
         identity_parts = [
             str(code).lstrip(".")
             for code in (network_code, station_code)
@@ -425,8 +456,10 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
     def _coordinate(self, station, coordinate_name, minimum, maximum,
                     station_identity):
         """Validate one ESM coordinate without changing its meaning."""
-        getter = getattr(station, f"get_{coordinate_name}")
-        provider_coordinate = getter()
+        provider_coordinate = self._provider_value(
+            station,
+            f"get_{coordinate_name}",
+        )
         if provider_coordinate is None:
             self.logger.warning(
                 f"ESM station {station_identity} rejected: missing "
@@ -455,12 +488,18 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
 
     def _valid_acceleration(self, station_identity, component):
         """Return valid provider and normalized ESM accelerations."""
-        component_name = component.get_component_name()
+        component_name = self._provider_value(
+            component,
+            "get_component_name",
+        )
         component_identity = (
             str(component_name) if component_name not in (None, "")
             else "unknown component"
         )
-        provider_acceleration = component.get_acceleration()
+        provider_acceleration = self._provider_value(
+            component,
+            "get_acceleration",
+        )
         diagnostic_prefix = (
             f"ESM station {station_identity} component {component_identity} "
             "rejected: "
@@ -522,7 +561,7 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
         time_epoch = get_epoch_time(event_data.get_origin_time())
         component_selection = self._component_selection()
 
-        stations = amplitudes.get_stations()
+        stations = self._provider_collection(amplitudes, "get_stations")
         
         for station in stations:
             station_identity = self._station_identity(station)
@@ -533,10 +572,13 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
             if latitude is None or longitude is None:
                 continue
 
-            components = station.get_components()
+            components = self._provider_collection(station, "get_components")
             eligible_components = []
             for component in components:
-                component_name = component.get_component_name()
+                component_name = self._provider_value(
+                    component,
+                    "get_component_name",
+                )
                 if (component_selection == "maximum-horizontal"
                         and str(component_name).endswith("Z")):
                     continue
@@ -574,9 +616,16 @@ class ESMShakeMapDataFormatter(BaseDataFormatter):
                 continue
 
             # Strip codes
-            network_code = (station.get_network_code() or "").lstrip(".")
-            station_code = (station.get_station_code() or "").lstrip(".")
-            channel_code = selected_channel.get_component_name().lstrip(".")
+            network_code = (
+                self._provider_value(station, "get_network_code") or ""
+            ).lstrip(".")
+            station_code = (
+                self._provider_value(station, "get_station_code") or ""
+            ).lstrip(".")
+            channel_code = self._provider_value(
+                selected_channel,
+                "get_component_name",
+            ).lstrip(".")
 
             location_code = ""
             if "." in channel_code:
@@ -757,9 +806,9 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
         identity_parts = [
             self._provider_code(provider_code)
             for provider_code in (
-                station.get_network_code(),
-                station.get_station_code(),
-                station.get_location_code(),
+                self._provider_value(station, "get_network_code"),
+                self._provider_value(station, "get_station_code"),
+                self._provider_value(station, "get_location_code"),
             )
         ]
         return ".".join(
@@ -768,8 +817,10 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
     def _coordinate(self, station, coordinate_name, minimum, maximum,
                     station_identity):
         """Validate one RRSM coordinate without rewriting its convention."""
-        getter = getattr(station, f"get_{coordinate_name}")
-        provider_coordinate = getter()
+        provider_coordinate = self._provider_value(
+            station,
+            f"get_{coordinate_name}",
+        )
         if provider_coordinate is None:
             self.logger.warning(
                 f"RRSM station {station_identity} rejected: missing "
@@ -799,7 +850,7 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
 
     def _valid_pga(self, station_identity, component_identity, channel):
         """Return one exact valid RRSM provider PGA, otherwise warn and omit it."""
-        provider_pga = channel.get_channel_pga()
+        provider_pga = self._provider_value(channel, "get_channel_pga")
         diagnostic_prefix = (
             f"RRSM station {station_identity} component "
             f"{component_identity or 'unknown component'} rejected: "
@@ -853,7 +904,8 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
         raw_stations = []
         component_selection = self._component_selection()
 
-        for station_data in peak_motions.get_stations():
+        for station_data in self._provider_collection(
+                peak_motions, "get_stations"):
             station_identity = self._station_identity(station_data)
             latitude = self._coordinate(
                 station_data, "latitude", -90, 90, station_identity)
@@ -862,11 +914,14 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
             if latitude is None or longitude is None:
                 continue
 
-            channels = station_data.get_channels()
+            channels = self._provider_collection(
+                station_data,
+                "get_channels",
+            )
             eligible_channels = []
             for channel in channels:
                 channel_code = self._provider_code(
-                    channel.get_channel_code())
+                    self._provider_value(channel, "get_channel_code"))
                 if (component_selection == "maximum-horizontal"
                         and channel_code.endswith("Z")):
                     continue
@@ -901,11 +956,11 @@ class RRSMPeakMotionDataFormatter(BaseDataFormatter):
                 continue
 
             network_code = self._provider_code(
-                station_data.get_network_code())
+                self._provider_value(station_data, "get_network_code"))
             station_code = self._provider_code(
-                station_data.get_station_code())
+                self._provider_value(station_data, "get_station_code"))
             location_code = self._provider_code(
-                station_data.get_location_code())
+                self._provider_value(station_data, "get_location_code"))
             timestamp = get_epoch_time(event_data.get_origin_time())
 
             raw_stations.append(RawStationMeasurement(

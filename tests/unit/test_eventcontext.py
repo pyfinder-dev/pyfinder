@@ -9,7 +9,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from pyfinder.eventcontext import EventContext, EventContextError
+from pyfinder.eventcontext import (
+    EventContext,
+    EventContextError,
+    ProviderModelAccessError,
+)
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.utils import dataformatter
 from pyfinder.utils import timeutils
@@ -34,6 +38,28 @@ def alert_mapping(**changes):
     }
     alert.update(changes)
     return alert
+
+
+class ProviderEventModel:
+    """Expose the public getter variants used by ParamWS event models."""
+
+    def get_event_unid(self):
+        return EVENT_ID
+
+    def get_latitude(self):
+        return "46.25"
+
+    def get_longitude(self):
+        return "7.75"
+
+    def get_magnitude(self):
+        return "5.6"
+
+    def get_depth(self):
+        return "12.5"
+
+    def get_event_time(self):
+        return "2026-08-10T08:15:30.250000Z"
 
 
 class EventContextValidationTests(unittest.TestCase):
@@ -116,6 +142,46 @@ print(EventContext.__name__)
         )
 
         self.assertEqual(context.get_magnitude_type(), "")
+
+    def test_provider_model_is_copied_through_the_same_validation_policy(self):
+        context = EventContext.from_provider_model(
+            ProviderEventModel(),
+            requested_event_id=EVENT_ID,
+        )
+
+        self.assertEqual(context.get_event_id(), EVENT_ID)
+        self.assertEqual(context.get_latitude(), 46.25)
+        self.assertEqual(context.get_longitude(), 7.75)
+        self.assertEqual(context.get_magnitude(), 5.6)
+        self.assertEqual(context.get_depth(), 12.5)
+        self.assertEqual(
+            context.get_origin_time(),
+            "2026-08-10T08:15:30.250000Z",
+        )
+        self.assertEqual(context.get_magnitude_type(), "")
+
+    def test_unusable_provider_candidate_is_rejected_without_provider_imports(self):
+        candidate = ProviderEventModel()
+        candidate.get_event_unid = mock.Mock(return_value="another-event")
+
+        with self.assertRaises(EventContextError):
+            EventContext.from_provider_model(
+                candidate,
+                requested_event_id=EVENT_ID,
+            )
+
+    def test_provider_accessor_failure_has_explicit_dependency_boundary(self):
+        candidate = ProviderEventModel()
+        dependency_error = TypeError("malformed dependency accessor")
+        candidate.get_latitude = mock.Mock(side_effect=dependency_error)
+
+        with self.assertRaises(ProviderModelAccessError) as raised:
+            EventContext.from_provider_model(
+                candidate,
+                requested_event_id=EVENT_ID,
+            )
+
+        self.assertIs(raised.exception.__cause__, dependency_error)
 
     def test_every_required_invalid_category_is_rejected(self):
         invalid_cases = {

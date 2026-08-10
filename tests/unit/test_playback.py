@@ -6,6 +6,7 @@ import inspect
 import json
 import tempfile
 import unittest
+import urllib.request
 from unittest import mock
 
 from pyfinder import playback
@@ -153,29 +154,50 @@ class PlaybackMetadataTests(unittest.TestCase):
                 historical_event["lastupdate"],
             )
 
-    def test_builtin_event_generation_uses_no_current_clock_or_fabricated_data(self):
+    def test_builtin_events_have_exact_verified_static_origins(self):
+        expected_origins = {
+            "20161030_0000029": "2016-10-30T06:40:18.3Z",
+            "20230206_0000008": "2023-02-06T01:17:36.1Z",
+            "20230206_0000222": "2023-02-06T10:24:49.6Z",
+            "20250522_0000028": "2025-05-22T03:19:34.6Z",
+            "20250423_0000104": "2025-04-23T09:49:11.93Z",
+            "20250520_0000201": "2025-05-20T20:36:52.26Z",
+            "20250922_0000172": "2025-09-22T09:02:44.04Z",
+        }
+
         definitions = playback.generate_event_list()
 
         self.assertEqual(
-            [event["unid"] for event in definitions],
-            [
-                "20161030_0000029",
-                "20230206_0000008",
-                "20230206_0000222",
-                "20250522_0000028",
-                "20250423_0000104",
-                "20250520_0000201",
-                "20250922_0000172",
-            ],
+            {event["unid"]: event["time"] for event in definitions},
+            expected_origins,
         )
-        for event in definitions:
-            self.assertNotIn("time", event)
-            self.assertNotIn("lastupdate", event)
-        source = inspect.getsource(playback.generate_event_list)
-        self.assertNotIn("datetime.now", source)
-        self.assertNotIn("timedelta", source)
 
-    def test_incomplete_builtins_warn_by_id_without_mutation(self):
+    def test_replay_clock_changes_lastupdate_without_changing_origins(self):
+        first_clock = datetime(2030, 1, 2, 3, 4, 5, 6000,
+                               tzinfo=timezone.utc)
+        second_clock = datetime(2040, 6, 7, 8, 9, 10, 11000,
+                                tzinfo=timezone.utc)
+
+        with mock.patch("pyfinder.playback.datetime") as controlled_datetime:
+            controlled_datetime.now.return_value = first_clock
+            first = playback.generate_event_list()
+            controlled_datetime.now.return_value = second_clock
+            second = playback.generate_event_list()
+
+        self.assertEqual(
+            [event["time"] for event in first],
+            [event["time"] for event in second],
+        )
+        self.assertEqual(
+            {event["lastupdate"] for event in first},
+            {"2030-01-02T03:04:05.006000Z"},
+        )
+        self.assertEqual(
+            {event["lastupdate"] for event in second},
+            {"2040-06-07T08:09:10.011000Z"},
+        )
+
+    def test_complete_builtins_validate_without_mutating_definitions(self):
         definitions = playback.generate_event_list()
         original = deepcopy(definitions)
         logger = mock.Mock()
@@ -186,41 +208,23 @@ class PlaybackMetadataTests(unittest.TestCase):
             logger=logger,
         )
 
-        self.assertEqual(manager.event_list, [])
+        self.assertEqual(len(manager.event_list), 7)
         self.assertEqual(definitions, original)
-        self.assertEqual(logger.warning.call_count, len(definitions))
-        warnings = [str(call) for call in logger.warning.call_args_list]
-        for event in definitions:
-            self.assertTrue(
-                any(event["unid"] in warning for warning in warnings),
-                warnings,
-            )
+        logger.warning.assert_not_called()
 
-    def test_completed_copy_of_builtin_proceeds_while_others_remain_rejected(self):
-        definitions = playback.generate_event_list()
-        original = deepcopy(definitions)
-        completed = deepcopy(definitions[0])
-        completed["time"] = "2016-10-30T06:40:18.000000Z"
-        completed["lastupdate"] = "2016-10-30T06:41:00.000000Z"
-        tracker = mock.Mock()
-        logger = mock.Mock()
+    def test_builtin_generation_performs_no_runtime_metadata_query(self):
+        source = inspect.getsource(playback.generate_event_list)
+        with mock.patch.object(
+            urllib.request,
+            "urlopen",
+            side_effect=AssertionError("playback attempted a live lookup"),
+        ) as urlopen:
+            definitions = playback.generate_event_list()
 
-        manager = EventAlertWSPlaybackManager(
-            [completed, *definitions[1:]],
-            tracker,
-            logger=logger,
-        )
-
-        self.assertEqual(
-            [event["unid"] for event in manager.event_list],
-            [completed["unid"]],
-        )
-        self.assertEqual(logger.warning.call_count, len(definitions) - 1)
-        self.assertTrue(manager._inject_event(manager.event_list[0]))
-        tracker.batch_register_from_policy.assert_called_once()
-        self.assertEqual(definitions, original)
-        self.assertNotIn("time", definitions[0])
-        self.assertNotIn("lastupdate", definitions[0])
+        self.assertEqual(len(definitions), 7)
+        urlopen.assert_not_called()
+        self.assertNotIn("EMSCFeltReportClient", source)
+        self.assertNotIn("query(", source)
 
 
 if __name__ == "__main__":

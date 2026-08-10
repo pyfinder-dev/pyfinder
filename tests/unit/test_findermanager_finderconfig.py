@@ -53,8 +53,11 @@ class SelectorDouble:
 class ProviderEventDouble:
     """Expose provider metadata that must never drive profile selection."""
 
+    def get_event_id(self):
+        return "event-1"
+
     def get_origin_time(self):
-        return "2026-08-08T12:00:00+00:00"
+        return "2026-08-08T12:00:00.000000Z"
 
     def get_longitude(self):
         return 120.0
@@ -89,6 +92,11 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
 
     def application_configuration(self):
         return {
+            "general": {
+                "services-enabled": ["RRSM_PeakMotion", "ESM_ShakeMap"],
+                "services-priority": ["ESM_ShakeMap", "RRSM_PeakMotion"],
+                "component-selection": "maximum-all",
+            },
             "finder-executable": {
                 "finder-temp-data-dir": "/tmp/finder-data",
                 "finder-temp-dir": "/tmp/finder",
@@ -158,7 +166,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         esm_client.assert_not_called()
         executable_type.assert_not_called()
 
-    def test_omitted_decision_builds_after_logger_and_resolves_emsc_once(self):
+    def test_omitted_on_demand_decision_defers_until_provider_context(self):
         events = []
         logger = mock.Mock()
         selector = SelectorDouble(
@@ -170,12 +178,6 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             events.append("logger")
             return logger
 
-        def build_selector(*, logger):
-            events.append("selector")
-            self.assertIs(logger, expected_logger)
-            return selector
-
-        expected_logger = logger
         with mock.patch.object(
             findermanager.customlogger,
             "file_logger",
@@ -183,7 +185,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         ), mock.patch.object(
             findermanager,
             "build_default_selector",
-            side_effect=build_selector,
+            return_value=selector,
         ) as selector_builder, mock.patch.object(
             findermanager,
             "RRSMPeakMotionClient",
@@ -197,21 +199,15 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
                 metadata={"emsc_latitude": "46.2", "emsc_longitude": "7.3"},
             )
 
-        self.assertEqual(events, ["logger", "selector"])
-        selector_builder.assert_called_once_with(logger=logger)
-        selector.resolve.assert_called_once_with(
-            latitude="46.2",
-            longitude="7.3",
-        )
-        self.assertEqual(manager.finder_configuration_name, "regional")
-        self.assertIs(
-            manager.finder_configuration,
-            selector.configuration,
-        )
+        self.assertEqual(events, ["logger"])
+        selector_builder.assert_not_called()
+        selector.resolve.assert_not_called()
+        self.assertIsNone(manager.finder_configuration_name)
+        self.assertIsNone(manager.finder_configuration)
         rrsm_client.assert_not_called()
         executable_type.assert_not_called()
 
-    def test_omitted_coordinates_use_selector_global_decision(self):
+    def test_omitted_coordinates_do_not_create_global_on_demand_decision(self):
         logger = mock.Mock()
         selector = SelectorDouble()
         selector_builder = mock.Mock(return_value=selector)
@@ -221,9 +217,10 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             selector_builder=selector_builder,
         )
 
-        selector.resolve.assert_called_once_with(latitude=None, longitude=None)
-        self.assertEqual(manager.finder_configuration_name, "global")
-        self.assertIs(manager.finder_configuration, selector.configuration)
+        selector_builder.assert_not_called()
+        selector.resolve.assert_not_called()
+        self.assertIsNone(manager.finder_configuration_name)
+        self.assertIsNone(manager.finder_configuration)
 
     def test_alert_context_populates_metadata_and_selects_its_epicenter_once(self):
         context = self.event_context()
@@ -309,7 +306,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         self.assertEqual(manager.entry_kind, manager.ON_DEMAND)
         self.assertIsNone(manager.event_context)
 
-    def test_partial_handoff_is_ignored_and_always_resolves_global(self):
+    def test_partial_handoff_is_ignored_and_resolution_remains_deferred(self):
         supplied_mapping = {"DATA_FOLDER": "must-not-be-used"}
         cases = (
             ("name only", "regional", None),
@@ -329,32 +326,30 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
                     finder_configuration=supplied_configuration,
                 )
 
-                selector_builder.assert_called_once_with(logger=logger)
-                selector.resolve.assert_called_once_with(
-                    latitude=None,
-                    longitude=None,
-                )
+                selector_builder.assert_not_called()
+                selector.resolve.assert_not_called()
                 logger.critical.assert_called_once()
-                self.assertEqual(manager.finder_configuration_name, "global")
-                self.assertIs(
-                    manager.finder_configuration,
-                    selector.configuration,
-                )
-                self.assertIsNot(
-                    manager.finder_configuration,
-                    supplied_configuration,
-                )
+                self.assertIsNone(manager.finder_configuration_name)
+                self.assertIsNone(manager.finder_configuration)
 
-    def test_global_validation_error_is_logged_and_reraised(self):
+    def test_deferred_global_validation_error_is_logged_and_reraised(self):
         logger = mock.Mock()
         error = GlobalFinderConfigError("global unusable")
         selector_builder = mock.Mock(side_effect=error)
+        manager = self.construct_manager(
+            logger=logger,
+            selector_builder=mock.Mock(),
+        )
 
-        with self.assertRaises(GlobalFinderConfigError) as raised:
-            self.construct_manager(
-                logger=logger,
-                selector_builder=selector_builder,
-            )
+        with mock.patch.object(
+            findermanager,
+            "build_default_selector",
+            selector_builder,
+        ):
+            with self.assertRaises(GlobalFinderConfigError) as raised:
+                manager._resolve_finder_configuration_from_context(
+                    self.event_context()
+                )
 
         self.assertIs(raised.exception, error)
         logger.critical.assert_called_once()
@@ -414,9 +409,10 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             finder_configuration=manager.finder_configuration,
         )
         executable_instance.execute.assert_called_once_with(
-            event_data=provider_event,
+            event_data=manager.event_context,
             amplitudes=merged_amplitudes,
         )
+        self.assertIsNot(manager.event_context, provider_event)
         return executable_type
 
     def test_regional_and_global_decisions_each_use_one_executable(self):
@@ -439,7 +435,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
                 selector_builder.assert_not_called()
                 self.assertEqual(executable_type.call_count, 1)
 
-    def test_provider_coordinates_never_trigger_another_selection(self):
+    def test_on_demand_provider_context_triggers_one_regional_selection(self):
         logger = mock.Mock()
         selector = SelectorDouble(
             name="regional",
@@ -452,9 +448,14 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             metadata={"emsc_latitude": 1.0, "emsc_longitude": 2.0},
         )
 
-        self.exercise_executable_boundary(manager)
+        with mock.patch.object(
+            findermanager,
+            "build_default_selector",
+            return_value=selector,
+        ):
+            self.exercise_executable_boundary(manager)
 
-        selector.resolve.assert_called_once_with(latitude=1.0, longitude=2.0)
+        selector.resolve.assert_called_once_with(latitude=-35.0, longitude=120.0)
 
     def test_alert_context_replaces_contradictory_provider_models_everywhere(self):
         context = self.event_context()
@@ -534,8 +535,8 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             manager.metadata["magnitude_type"],
             context.get_magnitude_type(),
         )
-        rrsm_event.get_origin_time.assert_not_called()
-        esm_event.get_origin_time.assert_not_called()
+        # Provider metadata is inspected for outcome diagnostics, but it does
+        # not replace the alert context used by any scientific consumer.
         rrsm_amplitudes.get_event_data.assert_not_called()
 
 

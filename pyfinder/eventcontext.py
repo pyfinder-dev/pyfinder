@@ -7,6 +7,19 @@ import math
 from pyfinder.utils.timeutils import get_epoch_time
 
 
+_PUBLIC_MODEL_ACCESS_ERRORS = (
+    AttributeError,
+    IndexError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
+
+
+class ProviderModelAccessError(Exception):
+    """Report a failure while reading a dependency-owned public model."""
+
+
 class EventContextError(ValueError):
     """Report that authoritative event metadata cannot form a usable context."""
 
@@ -29,17 +42,94 @@ class EventContext:
         if not isinstance(alert, Mapping):
             raise EventContextError("the persisted EMSC alert is not a mapping")
 
-        event_id = cls._event_identifier(alert.get("unid"), "alert event ID")
+        return cls._from_values(
+            event_id=alert.get("unid"),
+            expected_event_id=scheduled_event_id,
+            latitude=alert.get("lat"),
+            longitude=alert.get("lon"),
+            magnitude=alert.get("mag"),
+            depth=alert.get("depth"),
+            origin_time=alert.get("time"),
+            magnitude_type=alert.get("magtype"),
+            source_label="alert",
+        )
+
+    @classmethod
+    def from_provider_model(cls, event_model, *, requested_event_id):
+        """Copy and validate one provider's public event model."""
+        if event_model is None:
+            raise EventContextError("the provider event candidate is missing")
+
+        return cls._from_values(
+            event_id=cls._provider_value(
+                event_model,
+                ("get_event_id", "get_event_unid"),
+                "event identifier",
+            ),
+            expected_event_id=requested_event_id,
+            latitude=cls._provider_value(
+                event_model,
+                ("get_latitude",),
+                "latitude",
+            ),
+            longitude=cls._provider_value(
+                event_model,
+                ("get_longitude",),
+                "longitude",
+            ),
+            magnitude=cls._provider_value(
+                event_model,
+                ("get_magnitude",),
+                "magnitude",
+            ),
+            depth=cls._provider_value(
+                event_model,
+                ("get_depth",),
+                "depth",
+            ),
+            origin_time=cls._provider_value(
+                event_model,
+                ("get_origin_time", "get_event_time"),
+                "origin time",
+            ),
+            magnitude_type=cls._provider_value(
+                event_model,
+                ("get_magnitude_type",),
+                "magnitude type",
+                required=False,
+            ),
+            source_label="provider",
+        )
+
+    @classmethod
+    def _from_values(
+        cls,
+        *,
+        event_id,
+        expected_event_id,
+        latitude,
+        longitude,
+        magnitude,
+        depth,
+        origin_time,
+        magnitude_type,
+        source_label,
+    ):
+        """Validate copied values shared by alert and provider boundaries."""
+        event_id = cls._event_identifier(
+            event_id,
+            f"{source_label} event ID",
+        )
         scheduled_id = cls._event_identifier(
-            scheduled_event_id,
-            "scheduled event ID",
+            expected_event_id,
+            "requested event ID",
         )
         if event_id != scheduled_id:
             raise EventContextError(
-                "the alert event ID does not match the scheduled event ID"
+                f"the {source_label} event ID does not match the requested "
+                "event ID"
             )
 
-        origin_time = alert.get("time")
         if not isinstance(origin_time, str) or not origin_time.strip():
             raise EventContextError("origin time is missing or not a string")
         if get_epoch_time(origin_time) is None:
@@ -47,7 +137,6 @@ class EventContext:
                 "origin time is not accepted by the current timestamp converter"
             )
 
-        magnitude_type = alert.get("magtype")
         if magnitude_type is None:
             magnitude_type = ""
         else:
@@ -56,26 +145,55 @@ class EventContext:
         return cls(
             _event_id=event_id,
             _latitude=cls._number(
-                alert.get("lat"),
+                latitude,
                 "latitude",
                 minimum=-90,
                 maximum=90,
             ),
             _longitude=cls._number(
-                alert.get("lon"),
+                longitude,
                 "longitude",
                 minimum=-180,
                 maximum=180,
             ),
-            _magnitude=cls._number(alert.get("mag"), "magnitude"),
+            _magnitude=cls._number(magnitude, "magnitude"),
             _depth=cls._number(
-                alert.get("depth"),
+                depth,
                 "depth",
                 minimum=0,
             ),
             _origin_time=origin_time,
             _magnitude_type=magnitude_type,
         )
+
+    @staticmethod
+    def _provider_value(event_model, getter_names, label, required=True):
+        """Read one public provider value without importing provider models."""
+        found_getter = False
+        for getter_name in getter_names:
+            try:
+                getter = getattr(event_model, getter_name, None)
+            except _PUBLIC_MODEL_ACCESS_ERRORS as error:
+                raise ProviderModelAccessError(
+                    f"provider {label} accessor lookup failed"
+                ) from error
+            if not callable(getter):
+                continue
+            found_getter = True
+            try:
+                value = getter()
+            except _PUBLIC_MODEL_ACCESS_ERRORS as error:
+                raise ProviderModelAccessError(
+                    f"provider {label} accessor failed"
+                ) from error
+            if value is not None:
+                return value
+
+        if required and not found_getter:
+            raise EventContextError(
+                f"provider event candidate has no public {label} getter"
+            )
+        return None
 
     @staticmethod
     def _event_identifier(value, label):
