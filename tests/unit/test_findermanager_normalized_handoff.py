@@ -145,6 +145,16 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             ))
             merger_type = stack.enter_context(patch.object(
                 findermanager, "StationMerger"))
+            priority_resolver = stack.enter_context(patch.object(
+                findermanager,
+                "resolve_service_priority",
+                wraps=findermanager.resolve_service_priority,
+            ))
+            context_selector = stack.enter_context(patch.object(
+                manager,
+                "_select_on_demand_context",
+                wraps=manager._select_on_demand_context,
+            ))
             handoff = stack.enter_context(patch.object(
                 manager,
                 "_merge_available_results",
@@ -184,6 +194,8 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             "esm_direct_format": esm_direct_format,
             "artificial_point_format": artificial_point_format,
             "merger_type": merger_type,
+            "priority_resolver": priority_resolver,
+            "context_selector": context_selector,
             "handoff": handoff,
             "executable_type": executable_type,
             "executable": executable,
@@ -192,6 +204,23 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
     @staticmethod
     def _messages(log_method):
         return [str(call.args[0]) for call in log_method.call_args_list]
+
+    def _assert_mapping_merger(self, observed):
+        mapping = observed["manager"].available_results
+        handoff_mapping, handoff_priority = observed["handoff"].call_args.args
+        self.assertIs(handoff_mapping, mapping)
+        observed["merger_type"].assert_called_once_with(
+            service_priority=handoff_priority,
+            logger=observed["manager"].logger,
+        )
+        observed["merger_type"].return_value.merge.assert_called_once_with(
+            mapping
+        )
+        self.assertEqual(
+            handoff_priority,
+            observed["manager"].configuration["general"]["services-priority"],
+        )
+        return mapping, handoff_priority
 
     def test_both_normalized_lists_reach_merger_and_only_merge_reaches_finder(self):
         rrsm_event = _EventModel("rrsm")
@@ -211,19 +240,20 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             merged_records=merged_records,
         )
 
-        observed["merger_type"].return_value.merge.assert_called_once_with(
-            esm_data=esm_records,
-            rrsm_data=rrsm_records,
+        handoff_mapping, handoff_priority = self._assert_mapping_merger(
+            observed
         )
-        handoff_mapping = observed["handoff"].call_args.args[0]
         self.assertIs(handoff_mapping, observed["manager"].available_results)
         self.assertIs(handoff_mapping[ESM_SHAKEMAP_SERVICE], esm_records)
         self.assertIs(handoff_mapping[RRSM_PEAK_MOTION_SERVICE], rrsm_records)
-        merger_arguments = (
-            observed["merger_type"].return_value.merge.call_args.kwargs
+        observed["priority_resolver"].assert_called_once_with(
+            observed["manager"].configuration["general"]["services-priority"],
+            logger=observed["manager"].logger,
         )
-        self.assertIs(merger_arguments["esm_data"], esm_records)
-        self.assertIs(merger_arguments["rrsm_data"], rrsm_records)
+        self.assertIs(
+            observed["context_selector"].call_args.args[1],
+            handoff_priority,
+        )
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
@@ -258,10 +288,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             and "zero usable normalized observations" in message
             for message in errors
         ), errors)
-        observed["merger_type"].return_value.merge.assert_called_once_with(
-            esm_data=[],
-            rrsm_data=rrsm_records,
-        )
+        self._assert_mapping_merger(observed)
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
@@ -288,10 +315,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             merged_records=merged_records,
         )
 
-        observed["merger_type"].return_value.merge.assert_called_once_with(
-            esm_data=esm_records,
-            rrsm_data=[],
-        )
+        self._assert_mapping_merger(observed)
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
@@ -325,10 +349,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         )
 
         observed["rrsm_extract"].assert_not_called()
-        observed["merger_type"].return_value.merge.assert_called_once_with(
-            esm_data=esm_records,
-            rrsm_data=[],
-        )
+        self._assert_mapping_merger(observed)
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
@@ -412,10 +433,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         )
 
         observed["esm_extract"].assert_not_called()
-        observed["merger_type"].return_value.merge.assert_called_once_with(
-            esm_data=[],
-            rrsm_data=rrsm_records,
-        )
+        self._assert_mapping_merger(observed)
         observed["executable"].execute.assert_called_once_with(
             event_data=observed["manager"].event_context,
             amplitudes=merged_records,
@@ -442,7 +460,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             enabled=[ESM_SHAKEMAP_SERVICE],
         )
 
-        mapping = observed["handoff"].call_args.args[0]
+        mapping, _priority = self._assert_mapping_merger(observed)
         self.assertEqual(list(mapping), [ESM_SHAKEMAP_SERVICE])
         self.assertIs(mapping[ESM_SHAKEMAP_SERVICE], esm_records)
         self.assertNotIn(RRSM_PEAK_MOTION_SERVICE, mapping)
@@ -457,7 +475,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             merged_records=list(esm_records),
         )
 
-        mapping = observed["handoff"].call_args.args[0]
+        mapping, _priority = self._assert_mapping_merger(observed)
         self.assertIn(RRSM_PEAK_MOTION_SERVICE, mapping)
         self.assertIs(mapping[RRSM_PEAK_MOTION_SERVICE],
                       observed["manager"].available_results[
@@ -479,9 +497,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             rrsm_code=503,
         )
 
-        observed["handoff"].assert_called_once_with(
-            observed["manager"].available_results
-        )
+        self._assert_mapping_merger(observed)
         observed["executable"].execute.assert_called_once()
         outcome = observed["manager"].metadata["provider_outcomes"][
             RRSM_PEAK_MOTION_SERVICE
@@ -490,7 +506,7 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         self.assertEqual(outcome["normalized_count"], 1)
         self.assertIsNone(outcome["failure_kind"])
 
-    def test_current_merger_receives_only_instrumental_provider_lists(self):
+    def test_merger_receives_exact_full_mapping_and_resolved_priority(self):
         manager = self._manager()
         esm_records = [{"source": "ESM"}]
         rrsm_records = [{"source": "RRSM"}]
@@ -501,19 +517,30 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             EMSC_FELT_REPORT_SERVICE: felt_records,
         }
 
+        service_priority = [
+            RRSM_PEAK_MOTION_SERVICE,
+            ESM_SHAKEMAP_SERVICE,
+            EMSC_FELT_REPORT_SERVICE,
+        ]
         with patch.object(findermanager, "StationMerger") as merger_type:
             merged = object()
             merger_type.return_value.merge.return_value = merged
 
-            result = manager._merge_available_results(available_results)
+            result = manager._merge_available_results(
+                available_results,
+                service_priority,
+            )
 
         self.assertIs(result, merged)
-        merger_type.return_value.merge.assert_called_once_with(
-            esm_data=esm_records,
-            rrsm_data=rrsm_records,
+        merger_type.assert_called_once_with(
+            service_priority=service_priority,
+            logger=manager.logger,
         )
-        arguments = merger_type.return_value.merge.call_args.kwargs
-        self.assertNotIn(felt_records, arguments.values())
+        merger_type.return_value.merge.assert_called_once_with(available_results)
+        self.assertIs(
+            merger_type.return_value.merge.call_args.args[0],
+            available_results,
+        )
 
     def test_alert_and_on_demand_entries_use_the_same_mapping_handoff(self):
         for source_kind, entry_kind in (
@@ -544,7 +571,11 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
                     event_context=persisted_context,
                 )
 
-                mapping = observed["handoff"].call_args.args[0]
+                mapping, _priority = self._assert_mapping_merger(observed)
+                self.assertEqual(
+                    observed["priority_resolver"].call_count,
+                    1,
+                )
                 self.assertIs(mapping, observed["manager"].available_results)
                 self.assertIs(mapping[ESM_SHAKEMAP_SERVICE], esm_records)
                 self.assertIs(mapping[RRSM_PEAK_MOTION_SERVICE], rrsm_records)

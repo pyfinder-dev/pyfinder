@@ -19,6 +19,7 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
     from pyfinder.eventcontext import EventContext
+    from pyfinder.pyfinderconfig import RRSM_PEAK_MOTION_SERVICE
     from paramws.clients import (
         PeakMotionChannelData,
         PeakMotionData,
@@ -638,7 +639,9 @@ class RRSMObservationNormalizationTests(unittest.TestCase):
             )
         ])
 
-        merged = StationMerger().merge(esm_data=[], rrsm_data=list(records))
+        merged = StationMerger(
+            service_priority=[RRSM_PEAK_MOTION_SERVICE]
+        ).merge({RRSM_PEAK_MOTION_SERVICE: list(records)})
 
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["source"], "RRSM")

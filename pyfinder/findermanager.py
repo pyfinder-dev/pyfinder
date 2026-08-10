@@ -558,15 +558,9 @@ class FinDerManager:
             )
         return acquired
 
-    def _select_on_demand_context(self, acquired):
+    def _select_on_demand_context(self, acquired, service_priority):
         """Select the first queried usable candidate in scientific priority."""
-        configured_priority = self.configuration.get("general", {}).get(
-            "services-priority"
-        )
-        for service_name in resolve_service_priority(
-            configured_priority,
-            logger=self.logger,
-        ):
+        for service_name in service_priority:
             provider_result = acquired.get(service_name)
             if (
                 provider_result is not None
@@ -664,12 +658,13 @@ class FinDerManager:
                 else "Failed with HTTP " + str(status_code)
             )
 
-    def _merge_available_results(self, available_results):
-        """Hand normalized instrumental lists to the current merger."""
-        return StationMerger().merge(
-            esm_data=available_results.get(ESM_SHAKEMAP_SERVICE, []),
-            rrsm_data=available_results.get(RRSM_PEAK_MOTION_SERVICE, []),
+    def _merge_available_results(self, available_results, service_priority):
+        """Hand the exact normalized service mapping to the merger."""
+        merger = StationMerger(
+            service_priority=service_priority,
+            logger=self.logger,
         )
+        return merger.merge(available_results)
 
     def process_event(self, event_id) -> FinderSolution:
         """ Process data associated with an event_id """
@@ -702,6 +697,14 @@ class FinDerManager:
             authoritative_event = self.event_context
         else:
             authoritative_event = None
+
+        configured_priority = self.configuration.get("general", {}).get(
+            "services-priority"
+        )
+        service_priority = resolve_service_priority(
+            configured_priority,
+            logger=self.logger,
+        )
         
         self.logger.info(
             "Querying configured observation services for event %s",
@@ -714,7 +717,10 @@ class FinDerManager:
         }
 
         if authoritative_event is None:
-            authoritative_event = self._select_on_demand_context(acquired)
+            authoritative_event = self._select_on_demand_context(
+                acquired,
+                service_priority,
+            )
             if authoritative_event is None:
                 diagnostic = (
                     "normalization was not attempted because no enabled "
@@ -763,32 +769,13 @@ class FinDerManager:
             )
             return None
 
-        # The current merger accepts only instrumental ESM and RRSM records.
-        # Felt observations remain available for diagnostics and for the
-        # future cross-source merger, but must not enter the current merger's
-        # coordinate-based behavior.
-        instrumental_results = any(
-            self.available_results.get(service_name, [])
-            for service_name in (
-                ESM_SHAKEMAP_SERVICE,
-                RRSM_PEAK_MOTION_SERVICE,
-            )
-        )
-        if not instrumental_results:
-            self.logger.error(
-                "FinDer cannot currently process event %s because only felt "
-                "observations were usable; the current instrumental merger "
-                "does not accept felt observations.",
-                event_id,
-            )
-            return None
-
         # The downstream handoff is always the merged normalized list. An
         # empty normalized source must never cause its raw provider model to
         # bypass this boundary and reach a direct provider formatter.
-        self.logger.info("Merging the ESM and RRSM data")
+        self.logger.info("Merging normalized observation data")
         _amplitude_data = self._merge_available_results(
-            self.available_results
+            self.available_results,
+            service_priority,
         )
         self.logger.info("Merge completed")
 
@@ -798,20 +785,18 @@ class FinDerManager:
             self.logger.warning("FinDer cannot be run.")
             if not _event_data:
                 self.logger.warning(
-                    "|- Reason: Neither ESM nor RRSM produced usable event "
-                    "metadata.")
+                    "|- Reason: No usable common event metadata was available.")
             if not _amplitude_data:
                 self.logger.error(
                     "|- Reason: The merged normalized observation list is "
                     "empty.")
             self.logger.warning(f"|- event_id: {event_id}")
             self.logger.warning(
-                "|- ESM normalized observations: %s",
-                len(self.available_results.get(ESM_SHAKEMAP_SERVICE, [])),
-            )
-            self.logger.warning(
-                "|- RRSM normalized observations: %s",
-                len(self.available_results.get(RRSM_PEAK_MOTION_SERVICE, [])),
+                "|- Normalized observations by service: %s",
+                {
+                    service_name: len(records)
+                    for service_name, records in self.available_results.items()
+                },
             )
             self.logger.warning(
                 "|- Provider outcomes: %s",

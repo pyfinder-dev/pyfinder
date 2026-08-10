@@ -19,7 +19,7 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
     from pyfinder.eventcontext import EventContext
-    from pyfinder.pyfinderconfig import pyfinderconfig
+    from pyfinder.pyfinderconfig import ESM_SHAKEMAP_SERVICE, pyfinderconfig
     from pyfinder.utils.calculator import Calculator
     from pyfinder.utils import dataformatter
     from pyfinder.utils.dataformatter import ESMShakeMapDataFormatter
@@ -437,7 +437,9 @@ class ESMObservationNormalizationTests(unittest.TestCase):
         records, _logger = self._extract([
             _Station([_Component("00.HNE", 3.0)])
         ])
-        merged = StationMerger().merge(esm_data=list(records), rrsm_data=[])
+        merged = StationMerger(
+            service_priority=[ESM_SHAKEMAP_SERVICE]
+        ).merge({ESM_SHAKEMAP_SERVICE: list(records)})
 
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["source"], "ESM")

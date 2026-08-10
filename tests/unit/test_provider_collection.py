@@ -158,7 +158,10 @@ class ProviderCollectionTests(unittest.TestCase):
             ESM_SHAKEMAP_SERVICE: {"event_context": esm_context},
         }
 
-        selected = manager._select_on_demand_context(acquired)
+        selected = manager._select_on_demand_context(
+            acquired,
+            manager.configuration["general"]["services-priority"],
+        )
 
         self.assertIs(selected, esm_context)
         self.assertEqual(
@@ -235,7 +238,7 @@ class ProviderCollectionTests(unittest.TestCase):
         )
         self.assertEqual(outcome["normalized_count"], 1)
 
-    def test_felt_only_records_remain_visible_and_stop_before_merger(self):
+    def test_felt_only_records_reach_merger_and_downstream_boundary(self):
         manager = self.manager(enabled=[EMSC_FELT_REPORT_SERVICE])
         felt_provider = object()
         felt_records = [{"source": "EMSC"}]
@@ -246,7 +249,9 @@ class ProviderCollectionTests(unittest.TestCase):
             "_normalize_provider",
             return_value=felt_records,
         ), mock.patch.object(
-            manager, "_merge_available_results"
+            manager,
+            "_merge_available_results",
+            wraps=manager._merge_available_results,
         ) as handoff, mock.patch.object(
             findermanager, "StationMerger"
         ) as merger_type, mock.patch.object(
@@ -260,10 +265,16 @@ class ProviderCollectionTests(unittest.TestCase):
                 {"felt_intensities": object()},
             )
             felt_type.return_value.get_feltreports.return_value = felt_provider
+            merger_type.return_value.merge.return_value = felt_records
+            executable_type.return_value.execute.side_effect = RuntimeError(
+                "downstream boundary reached"
+            )
 
-            result = manager.process_event(EVENT_ID)
+            with self.assertRaisesRegex(
+                RuntimeError, "downstream boundary reached"
+            ):
+                manager.process_event(EVENT_ID)
 
-        self.assertIsNone(result)
         self.assertEqual(
             manager.available_results,
             {EMSC_FELT_REPORT_SERVICE: felt_records},
@@ -277,10 +288,18 @@ class ProviderCollectionTests(unittest.TestCase):
         ]
         self.assertEqual(outcome["normalized_count"], 1)
         self.assertIsNone(outcome["failure_kind"])
-        handoff.assert_not_called()
-        merger_type.assert_not_called()
+        mapping, priority = handoff.call_args.args
+        self.assertIs(mapping, manager.available_results)
+        merger_type.assert_called_once_with(
+            service_priority=priority,
+            logger=manager.logger,
+        )
+        merger_type.return_value.merge.assert_called_once_with(mapping)
         artificial_point_format.assert_not_called()
-        executable_type.assert_not_called()
+        executable_type.return_value.execute.assert_called_once_with(
+            event_data=manager.event_context,
+            amplitudes=felt_records,
+        )
 
     def test_instrumental_and_felt_mapping_reaches_handoff_unchanged(self):
         manager = self.manager(enabled=[
@@ -291,6 +310,7 @@ class ProviderCollectionTests(unittest.TestCase):
         felt_provider = object()
         esm_records = [{"source": "ESM"}]
         felt_records = [{"source": "EMSC"}]
+        merged_records = esm_records + felt_records
 
         def normalize(service_name, event_context, value):
             if service_name == ESM_SHAKEMAP_SERVICE:
@@ -327,7 +347,7 @@ class ProviderCollectionTests(unittest.TestCase):
                 {"felt_intensities": object()},
             )
             felt_type.return_value.get_feltreports.return_value = felt_provider
-            merger_type.return_value.merge.return_value = esm_records
+            merger_type.return_value.merge.return_value = merged_records
             executable_type.return_value.execute.side_effect = RuntimeError(
                 "downstream boundary reached"
             )
@@ -337,7 +357,7 @@ class ProviderCollectionTests(unittest.TestCase):
             ):
                 manager.process_event(EVENT_ID)
 
-        mapping = handoff.call_args.args[0]
+        mapping, priority = handoff.call_args.args
         self.assertIs(mapping, manager.available_results)
         self.assertEqual(
             list(mapping),
@@ -345,13 +365,14 @@ class ProviderCollectionTests(unittest.TestCase):
         )
         self.assertIs(mapping[ESM_SHAKEMAP_SERVICE], esm_records)
         self.assertIs(mapping[EMSC_FELT_REPORT_SERVICE], felt_records)
-        merger_type.return_value.merge.assert_called_once_with(
-            esm_data=esm_records,
-            rrsm_data=[],
+        merger_type.assert_called_once_with(
+            service_priority=priority,
+            logger=manager.logger,
         )
+        merger_type.return_value.merge.assert_called_once_with(mapping)
         executable_type.return_value.execute.assert_called_once_with(
             event_data=manager.event_context,
-            amplitudes=esm_records,
+            amplitudes=merged_records,
         )
         self.assertEqual(
             set(manager.metadata["provider_outcomes"]),
