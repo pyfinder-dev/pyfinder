@@ -912,74 +912,20 @@ class FinDerManager:
             return executable.get_finder_solution_object()
             
     
-def build_args():
-    """ Build the command line arguments """
-    import argparse
-
-    def verbosity_level(value):
-        levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-        if value.upper() in levels:
-            return value.upper()
-        else:
-            raise argparse.ArgumentTypeError(
-                f"{value} is not a valid verbosity level. Choose from {', '.join(levels)}.")
-            
-    parser = argparse.ArgumentParser(description="Run the FinDer wrapper")
-
-    # Add the arguments
-    parser.add_argument("--use-lib", help="Flag to use either the FinDer library or executable. "\
-                        "If not provided, FinDer executable will be used", default=False,
-                        action='store_true')
-    
-    # Event id is optional. Defaults to the Kahramanmaras, Turkey event in 2023 for testing
-    parser.add_argument("--event-id", help="[Optional] Event ID for processing.", type=str, default=None)
-    
-    # Test mode; optional. If provided, the test mode will be used with the test event
-    parser.add_argument("--test", help="[Optional] Runs in testing mode with the test event as defined in configuration.", 
-                        default=False, action='store_true')
-    
-    # SeisComp support; optional. If provided, the results will be dumped in the SeisComp database.
-    parser.add_argument("--with-seiscomp", help="[Optional] Dump the results in the SeisComp database.",
-                        default=False, action='store_true')
-                         
-    # Logging options
-    parser.add_argument("--verbosity", help="Logging level for the application. Default is INFO", 
-                        type=verbosity_level, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    
-    parser.add_argument("--log-file", help="Log file path", type=str, default=None)
-
-    # Parse the arguments
-    _args = parser.parse_args()
-
-    return _args
-
-if __name__ == '__main__':    
-    # Get the command line arguments
-    args = build_args()
-
-    # If no arguments are provided, print the help message
-    if len(sys.argv) == 1:
-        print("No arguments provided. Use the -h option for help.")
-        sys.exit(1)
-
-    # Set the options from the command line arguments
+def run_cli(arguments):
+    """Run the existing on-demand manager from parsed CLI arguments."""
     options = {
-        "verbosity": args.verbosity,
-        "log_file": args.log_file,
-        "with_seiscomp": args.with_seiscomp,
-        "event_id": args.event_id,
-        "test": args.test,
-        "use_library": args.use_lib
+        "verbosity": arguments.verbosity,
+        "with_seiscomp": False,
+        "event_id": arguments.event_id,
+        "test": arguments.test,
+        "use_library": False,
     }
 
-    # Override with the command line log file, if provided
-    log_file = pyfinderconfig["finder-executable"]["log-file-name"]
-    if options["log_file"] is not None:
-        pyfinderconfig["finder-executable"]["log-file-name"] = options["log_file"]
-
-    # Store the whole command line in the options as one string
-    options["command_line_args"] = f"{sys.argv[0]} " + \
-        " ".join([f"--{key} {value}" for key, value in options.items()])
+    options["command_line_args"] = "pyfinder on-demand " + " ".join(
+        f"--{key.replace('_', '-')} {value}"
+        for key, value in options.items()
+    )
     
     # If the test mode is enabled, set the event_id to the test event
     if options["test"]:
@@ -996,3 +942,10 @@ if __name__ == '__main__':
         print(f"FinDer solution: {solution}")
     else:
         print("No FinDer solution returned.")
+    return 0
+
+
+if __name__ == "__main__":
+    from pyfinder.cli import main
+
+    sys.exit(main(["on-demand", *sys.argv[1:]]))

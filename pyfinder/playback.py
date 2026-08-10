@@ -2,7 +2,6 @@ from collections.abc import Mapping
 from copy import deepcopy
 import os
 import sys
-import argparse
 import json
 from datetime import datetime, timezone
 import logging
@@ -297,35 +296,38 @@ class EventAlertWSPlaybackManager:
             self.index = 0
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="EMSC Event Alert Playback Tool")
-    parser.add_argument("--event-id", type=str, nargs='+', help="Inject one or more specific events by ID.")
-    parser.add_argument("--list", action='store_true', help="List all available events for the playback.")
-    args = parser.parse_args()
+def run_cli(arguments):
+    """Run the existing playback workflow from parsed CLI arguments."""
+    playback = None
+    scheduler = None
 
     def handle_shutdown(signum, frame):
         print("\n[Main] Interrupt received. Shutting down...")
-        playback.pause()
-        scheduler.shutdown()
-        sys.exit(0)
-    
+        if playback is not None:
+            playback.pause()
+        if scheduler is not None:
+            scheduler.shutdown()
 
     # The predefined list of events to be played back
     event_list = generate_event_list()
 
     # If --list is specified, print available event IDs, the regions and exit
-    if args.list:
+    if arguments.list_events:
         print("Available events for playback:")
         for event in event_list:
             print(f"Event ID: {event['unid']}, M{event['mag']}, Region: {event['flynn_region']}")
-        sys.exit(0)
+        return 0
 
-    if args.event_id:
-        event_list = [e for e in event_list if e['unid'] in args.event_id]
+    if arguments.event_id:
+        event_list = [
+            event
+            for event in event_list
+            if event["unid"] in arguments.event_id
+        ]
     # Make sure we have events to play back
     if not event_list:
         print("No events found for the specified IDs. Exiting.")
-        sys.exit(1)
+        return 1
 
     # Start with a clean database
     for file in ["test_playback.db", "test_playback.db-shm", "test_playback.db-wal"]:
@@ -352,3 +354,10 @@ if __name__ == "__main__":
             time.sleep(1)
     except (KeyboardInterrupt, SystemExit):
         handle_shutdown(None, None)
+    return 0
+
+
+if __name__ == "__main__":
+    from pyfinder.cli import main
+
+    sys.exit(main(["playback", *sys.argv[1:]]))

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyfinder"
+dynamic = ["version"]
+description = "Python workflow wrapper for the FinDer earthquake detector."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Savas Ceylan", email = "savasceylan@gmail.com" },
+]
+dependencies = [
+  "geopandas",
+  "numpy",
+  "paramws-clients==0.1.0",
+  "shapely",
+  "tornado",
+]
+classifiers = [
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+pyfinder = "pyfinder.cli:main"
+
+[project.urls]
+Repository = "https://github.com/pyfinder-dev/pyfinder"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { attr = "pyfinder.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyfinder", "pyfinder.*"]
+exclude = ["tests", "tests.*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+pyfinder = [
+  "extern/finder_regional_wkt/*",
+  "extern/finder_regional_wkt/**/*",
+  "extern/ne_110m_admin_0_countries/*",
+  "extern/ne_110m_admin_0_countries/**/*",
+]
+
+[tool.setuptools.exclude-package-data]
+"*" = [".DS_Store", "**/.DS_Store"]
