@@ -15,6 +15,7 @@ from pyfinder.finderconfigs import (
     GlobalFinderConfigError,
     build_default_selector,
 )
+from pyfinder.finderutils import FinderSolution
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.services.querypolicy import build_service_policies
 
@@ -81,7 +82,10 @@ class FollowUpScheduler:
             configuration = pyfinderconfig
         self.configuration = configuration
 
-        # Initialize the EventTracker for managing event updates
+        # A tracker supplied by playback remains caller-owned until this
+        # constructor succeeds. A tracker created here has no other owner and
+        # must be closed if later scheduler construction fails.
+        owns_tracker_during_construction = tracker is None
         if tracker is None:
             if db_path is None:
                 raise ValueError(
@@ -90,44 +94,73 @@ class FollowUpScheduler:
                 )
             tracker = EventTracker(str(db_path))
         self.tracker = tracker
-        self.tracker.set_logger(self.logger)
-        self.logger.info("EventTracker initialized for the scheduler.")
-
-        # Recovery must happen before the executor exists. Otherwise new due
-        # work could start while rows abandoned by the previous process still
-        # look like active local executions.
-        recovered_rows = self.tracker.recover_abandoned_processing()
-        self.logger.info(
-            "Recovered %s abandoned processing rows during scheduler startup.",
-            recovered_rows,
-        )
-
-        # Python signal handlers run on the main thread and can re-enter
-        # shutdown() while run_once() already owns this coordination lock.
-        # Reentrancy prevents that self-deadlock while still excluding a
-        # different thread until active discovery and dispatch have finished.
-        self._state_lock = threading.RLock()
-        self._shutdown_lock = threading.Lock()
-        self._future_condition = threading.Condition()
-        self._submitted_futures = {}
-        self._futures_being_observed = set()
-        self._accepting_work = True
-        self._shutdown_complete = False
-
-        # Thread pool with up to 10 workers
-        self.executor = ThreadPoolExecutor(max_workers=10)
-        self.logger.info("ThreadPoolExecutor initialized for the scheduler.")
-        self.logger.info("FollowUpScheduler initialization completed.")
-
-        # Ensure the shakemap configuration is available
+        executor = None
         try:
-            from pyfinder.utils.config_fetcher import ensure_shakemap_config
+            self.tracker.set_logger(self.logger)
+            self.logger.info("EventTracker initialized for the scheduler.")
 
-            self.logger.info("Ensuring ShakeMap configuration is available...")
-            ensure_shakemap_config()
-            self.logger.info("ShakeMap configuration cloned successfully.")
-        except Exception as e:
-            self.logger.error(f"Failed to ensure ShakeMap configuration: {e}")
+            # Recovery must happen before the executor exists. Otherwise new
+            # due work could start while rows abandoned by the previous process
+            # still look like active local executions.
+            recovered_rows = self.tracker.recover_abandoned_processing()
+            self.logger.info(
+                "Recovered %s abandoned processing rows during scheduler "
+                "startup.",
+                recovered_rows,
+            )
+
+            # Python signal handlers run on the main thread and can re-enter
+            # shutdown() while run_once() already owns this coordination lock.
+            # Reentrancy prevents that self-deadlock while still excluding a
+            # different thread until active discovery and dispatch finish.
+            self._state_lock = threading.RLock()
+            self._shutdown_lock = threading.Lock()
+            self._future_condition = threading.Condition()
+            self._submitted_futures = {}
+            self._futures_being_observed = set()
+            self._accepting_work = True
+            self._drain_complete = False
+            self._shutdown_complete = False
+
+            # Thread pool with up to 10 workers
+            executor = ThreadPoolExecutor(max_workers=10)
+            self.executor = executor
+            self.logger.info(
+                "ThreadPoolExecutor initialized for the scheduler."
+            )
+            self.logger.info("FollowUpScheduler initialization completed.")
+        except BaseException as construction_error:
+            cleanup_errors = []
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=True)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if owns_tracker_during_construction:
+                try:
+                    self.tracker.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                construction_error.add_note(
+                    "Scheduler construction cleanup also failed: "
+                    "{0}: {1}".format(
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
+                )
+            raise
+
+        # Local ShakeMap configuration is inactive until the external service
+        # boundary is implemented.
+        # try:
+        #     from pyfinder.utils.config_fetcher import ensure_shakemap_config
+        #
+        #     self.logger.info("Ensuring ShakeMap configuration is available...")
+        #     ensure_shakemap_config()
+        #     self.logger.info("ShakeMap configuration cloned successfully.")
+        # except Exception as e:
+        #     self.logger.error(f"Failed to ensure ShakeMap configuration: {e}")
             
     @staticmethod
     def _welcome_message(logger):
@@ -357,8 +390,11 @@ class FollowUpScheduler:
             )
             return None
 
-        if finder_solution is None:
-            diagnostic = "FinDerManager returned no scheduler-visible result"
+        if not isinstance(finder_solution, FinderSolution):
+            diagnostic = (
+                "FinDerManager did not return a usable FinderSolution; "
+                "received {0}".format(type(finder_solution).__name__)
+            )
             self._record_failed_attempt(
                 event_id=event_id,
                 service=service,
@@ -471,27 +507,42 @@ class FollowUpScheduler:
             for future in unobserved:
                 self._observe_future(future)
 
-    def shutdown(self):
-        """ Shutdown the FollowUpScheduler and clean up resources. """
+    def _stop_and_drain_locked(self):
+        """Stop assignment and finish worker persistence while locked."""
+        if self._drain_complete:
+            return
+
+        self.logger.info("Shutting down FollowUpScheduler.")
+        with self._state_lock:
+            self._accepting_work = False
+
+        # ThreadPoolExecutor.shutdown(wait=True) stops new submissions and
+        # does not return until running work and its done callbacks finish.
+        # Persistence must remain open for both worker transitions and the
+        # callback's bounded terminal-failure attempt.
+        self.logger.info("Waiting for scheduler worker finalization.")
+        self.executor.shutdown(wait=True)
+        self._drain_future_observations()
+        self._drain_complete = True
+
+    def stop_and_drain(self):
+        """Stop accepting work and finish every retained worker outcome."""
+        with self._shutdown_lock:
+            self._stop_and_drain_locked()
+
+    def close(self):
+        """Close scheduler persistence after all worker outcomes finish."""
         with self._shutdown_lock:
             if self._shutdown_complete:
                 return
-
-            self.logger.info("Shutting down FollowUpScheduler.")
-            with self._state_lock:
-                self._accepting_work = False
-
-            # ThreadPoolExecutor.shutdown(wait=True) stops new submissions and
-            # does not return until running work and its done callbacks finish.
-            # Persistence must remain open for both worker transitions and the
-            # callback's bounded terminal-failure attempt.
-            self.logger.info("Waiting for scheduler worker finalization.")
-            self.executor.shutdown(wait=True)
-            self._drain_future_observations()
-
+            self._stop_and_drain_locked()
             self.tracker.close()
             self._shutdown_complete = True
             self.logger.info("FollowUpScheduler shutdown complete.")
+
+    def shutdown(self):
+        """Drain scheduler work and close its persistence."""
+        self.close()
 
     def run_once(self):
         """ Run the scheduler once to check for due events and process them. """
@@ -655,23 +706,21 @@ class FollowUpScheduler:
                     continue
                 self._retain_future(future=future, identity=identity)
 
-    def run_forever(self, interval_seconds=10):
+    def run_forever(self, interval_seconds=10, shutdown_event=None):
         """ 
-        Run the scheduler in an infinite loop, checking for due events 
-        at regular intervals. 
+        Run the scheduler until it is stopped or shutdown is requested.
         """
         import time
         self.logger.info(f"Scheduler running every {interval_seconds} seconds.")
 
-        try:
-            while True:
-                with self._state_lock:
-                    if not self._accepting_work:
-                        break
-                self.run_once()
+        while True:
+            with self._state_lock:
+                if not self._accepting_work:
+                    break
+            if shutdown_event is not None and shutdown_event.is_set():
+                break
+            self.run_once()
+            if shutdown_event is None:
                 time.sleep(interval_seconds)
-        except KeyboardInterrupt:
-            self.shutdown()
-        except Exception as e:
-            self.logger.error(f"Scheduler encountered an error: {e}")
-            self.shutdown()
+            elif shutdown_event.wait(interval_seconds):
+                break

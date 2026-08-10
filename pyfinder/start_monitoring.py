@@ -1,64 +1,102 @@
 # !/usr/bin/env python
 # -*- coding: utf-8 -*-
-""" 
-Start services for the pyfinder module. 
+"""Start continuous PyFinder listener and scheduler services."""
 
-This module is the main entry point for the pyfinder module. It starts the 
-listeners to manage the whole workflow from a new event detection to running 
-the FinDer with the parametric datasets.
-"""
+import logging
+import signal
 import sys
 import threading
-import logging
 
 from pyfinder.finderconfigs import (
     GlobalFinderConfigError,
     build_default_selector,
 )
+from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.services import seismiclistener
 from pyfinder.services.querypolicy import build_service_policies
 from pyfinder.services.scheduler import FollowUpScheduler
-from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.utils.customlogger import file_logger
-import signal
-import atexit
-import time
+
+
 _scheduler = None
+_listener = None
 _listener_thread = None
+_shutdown_event = None
 _launcher_logger = None
 
 
-def _graceful_shutdown(signum=None, frame=None):
-    global _scheduler, _listener_thread, _launcher_logger
+def _request_shutdown(signum=None, frame=None):
+    """Request an orderly stop without exiting the reusable command helper."""
+    del frame
     logger = _launcher_logger or logging.getLogger(__name__)
-    logger.info(f"Received signal {signum}; shutting down...")
-    # Stop scheduler if present
+    logger.info("Received signal %s; stopping continuous services.", signum)
+    if _shutdown_event is not None:
+        _shutdown_event.set()
+    if _listener is not None:
+        _listener.stop()
+
+
+def _install_signal_handlers():
+    """Install process signal handlers and return the previous handlers."""
+    previous_handlers = {}
     try:
-        if _scheduler is not None:
-            _scheduler.shutdown()
-    except Exception:
-        pass
-    # Give threads a moment to finish
-    try:
-        if _listener_thread is not None and _listener_thread.is_alive():
-            _listener_thread.join(timeout=5.0)
-    except Exception:
-        pass
-    # Small delay to allow any subprocess cleanup by children
-    try:
-        time.sleep(0.1)
-    except Exception:
-        pass
-    # Exit cleanly
-    try:
-        sys.exit(0)
-    except SystemExit:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _request_shutdown)
+    except BaseException:
+        for installed_signum, previous_handler in previous_handlers.items():
+            signal.signal(installed_signum, previous_handler)
         raise
+    return previous_handlers
+
+
+def _cleanup_continuous_services(
+    *,
+    listener,
+    scheduler,
+    listener_thread,
+    listener_started,
+    previous_signal_handlers,
+    logger,
+):
+    """Stop owned resources in order and return every cleanup failure."""
+    failures = []
+
+    def attempt(description, operation):
+        try:
+            operation()
+        except BaseException as error:
+            logger.error(
+                "%s failed: %s",
+                description,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            failures.append(error)
+
+    if listener is not None:
+        attempt("Stopping the seismic listener", listener.stop)
+    if scheduler is not None:
+        attempt("Shutting down the scheduler", scheduler.shutdown)
+    if listener_thread is not None and listener_started:
+        attempt("Joining the seismic listener thread", listener_thread.join)
+    if listener is not None:
+        attempt("Closing seismic listener persistence", listener.close)
+    for signum, previous_handler in previous_signal_handlers.items():
+        attempt(
+            "Restoring signal handler {0}".format(signum),
+            lambda signum=signum, previous_handler=previous_handler: (
+                signal.signal(signum, previous_handler)
+            ),
+        )
+    return failures
 
 
 def start_services(*, runtime_context):
     """Start continuous services from one validated runtime context."""
-    global _launcher_logger
+    global _launcher_logger, _listener, _listener_thread, _scheduler
+    global _shutdown_event
+
     logger = file_logger(
         runtime_context.process_log_path,
         module_name="ServiceLauncher",
@@ -102,37 +140,97 @@ def start_services(*, runtime_context):
         )
         raise
 
-    def start_listener():
-        logger.info("Starting seismic listener...")
-        seismiclistener.start_emsc_listener(
+    shutdown_event = threading.Event()
+    listener = None
+    scheduler = None
+    listener_thread = None
+    listener_started = False
+    previous_signal_handlers = {}
+    listener_failures = []
+    primary_error = None
+    primary_traceback = None
+
+    try:
+        listener = seismiclistener.build_emsc_listener(
             policy=rrsm_policy,
             db_path=runtime_context.operational_database_path,
             logger=listener_logger,
             configuration=application_configuration,
         )
+        scheduler = FollowUpScheduler(
+            service_policies=service_policies,
+            finder_config_selector=finder_config_selector,
+            db_path=runtime_context.operational_database_path,
+            logger=scheduler_logger,
+            configuration=application_configuration,
+        )
 
-    global _listener_thread, _scheduler
-    _listener_thread = threading.Thread(target=start_listener, daemon=False)
-    _listener_thread.start()
+        _listener = listener
+        _scheduler = scheduler
+        _shutdown_event = shutdown_event
+        previous_signal_handlers = _install_signal_handlers()
 
-    logger.info("Starting FollowUpScheduler...")
-    _scheduler = FollowUpScheduler(
-        service_policies=service_policies,
-        finder_config_selector=finder_config_selector,
-        db_path=runtime_context.operational_database_path,
-        logger=scheduler_logger,
-        configuration=application_configuration,
-    )
-    try:
-        _scheduler.run_forever()
-    except KeyboardInterrupt:
-        _graceful_shutdown()
+        def run_listener():
+            try:
+                listener.run()
+            except BaseException as error:
+                listener_failures.append(error)
+            finally:
+                shutdown_event.set()
 
-""" The main execution module for the pyfinder module. """
+        listener_thread = threading.Thread(
+            target=run_listener,
+            daemon=False,
+        )
+        _listener_thread = listener_thread
+        listener_thread.start()
+        listener_started = True
+        logger.info("Continuous listener and scheduler started.")
+
+        scheduler.run_forever(shutdown_event=shutdown_event)
+        if listener_failures:
+            raise listener_failures[0]
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+    finally:
+        shutdown_event.set()
+        cleanup_failures = _cleanup_continuous_services(
+            listener=listener,
+            scheduler=scheduler,
+            listener_thread=listener_thread,
+            listener_started=listener_started,
+            previous_signal_handlers=previous_signal_handlers,
+            logger=logger,
+        )
+        _shutdown_event = None
+        _listener_thread = None
+        _scheduler = None
+        _listener = None
+
+    if primary_error is not None:
+        for cleanup_error in cleanup_failures:
+            primary_error.add_note(
+                "Cleanup also failed: {0}: {1}".format(
+                    type(cleanup_error).__name__,
+                    cleanup_error,
+                )
+            )
+        raise primary_error.with_traceback(primary_traceback)
+    if cleanup_failures:
+        first_cleanup_error = cleanup_failures[0]
+        for additional_error in cleanup_failures[1:]:
+            first_cleanup_error.add_note(
+                "Additional cleanup failure: {0}: {1}".format(
+                    type(additional_error).__name__,
+                    additional_error,
+                )
+            )
+        raise first_cleanup_error
+    return 0
+
+
 if __name__ == "__main__":
     from pyfinder.cli import main
 
-    signal.signal(signal.SIGTERM, _graceful_shutdown)
-    signal.signal(signal.SIGINT, _graceful_shutdown)
-    atexit.register(_graceful_shutdown)
     sys.exit(main(["continuous", *sys.argv[1:]]))

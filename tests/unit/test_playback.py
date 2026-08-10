@@ -1,10 +1,13 @@
 """Offline tests for deterministic EMSC alert playback."""
 
 from copy import deepcopy
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+import io
 import inspect
 import json
 import tempfile
+import threading
 import unittest
 import urllib.request
 from unittest import mock
@@ -225,6 +228,35 @@ class PlaybackMetadataTests(unittest.TestCase):
         urlopen.assert_not_called()
         self.assertNotIn("EMSCFeltReportClient", source)
         self.assertNotIn("query(", source)
+
+    def test_pause_interrupts_a_long_historical_gap_and_joins_thread(self):
+        first_injected = threading.Event()
+        tracker = mock.Mock()
+        tracker.batch_register_from_policy.side_effect = (
+            lambda **kwargs: first_injected.set()
+        )
+        first = playback_event(
+            "first",
+            time="2020-01-02T03:04:05.250000Z",
+        )
+        second = playback_event(
+            "second",
+            time="2030-01-02T03:04:05.250000Z",
+        )
+        manager = EventAlertWSPlaybackManager(
+            [first, second],
+            tracker,
+            logger=mock.Mock(),
+        )
+
+        with redirect_stdout(io.StringIO()):
+            manager.start_auto()
+            self.assertTrue(first_injected.wait(1))
+            manager.pause()
+
+        self.assertFalse(manager.running)
+        self.assertIsNone(manager._thread)
+        tracker.batch_register_from_policy.assert_called_once()
 
 
 if __name__ == "__main__":

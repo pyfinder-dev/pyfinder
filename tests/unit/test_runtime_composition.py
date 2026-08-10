@@ -36,6 +36,9 @@ class ImmediateThread:
     def start(self):
         self.target()
 
+    def join(self):
+        pass
+
 
 class RuntimeCompositionTests(unittest.TestCase):
     def setUp(self):
@@ -74,6 +77,7 @@ class RuntimeCompositionTests(unittest.TestCase):
         policies = {"RRSM": object(), "ESM": object()}
         selector = object()
         scheduler = mock.Mock()
+        listener = mock.Mock()
 
         def configure_logger(path, **kwargs):
             path = Path(path)
@@ -98,8 +102,9 @@ class RuntimeCompositionTests(unittest.TestCase):
             side_effect=ImmediateThread,
         ), mock.patch.object(
             start_monitoring.seismiclistener,
-            "start_emsc_listener",
-        ) as listener_start, mock.patch.object(
+            "build_emsc_listener",
+            return_value=listener,
+        ) as listener_constructor, mock.patch.object(
             start_monitoring,
             "FollowUpScheduler",
             return_value=scheduler,
@@ -116,7 +121,7 @@ class RuntimeCompositionTests(unittest.TestCase):
                 self.runtime_context.scheduler_log_path,
             ],
         )
-        listener_arguments = listener_start.call_args.kwargs
+        listener_arguments = listener_constructor.call_args.kwargs
         self.assertIs(listener_arguments["policy"], policies["RRSM"])
         self.assertEqual(
             listener_arguments["db_path"],
@@ -144,7 +149,13 @@ class RuntimeCompositionTests(unittest.TestCase):
             ],
             str(self.runtime_context.runs_directory),
         )
-        scheduler.run_forever.assert_called_once_with()
+        listener.run.assert_called_once_with()
+        listener.stop.assert_called_once_with()
+        listener.close.assert_called_once_with()
+        scheduler.run_forever.assert_called_once_with(
+            shutdown_event=mock.ANY
+        )
+        scheduler.shutdown.assert_called_once_with()
 
     def test_direct_manager_opens_no_shared_file_logger(self):
         configuration = deepcopy(pyfinderconfig)

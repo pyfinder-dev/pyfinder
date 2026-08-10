@@ -26,6 +26,9 @@ class ImmediateThread:
     def start(self):
         self.target()
 
+    def join(self):
+        pass
+
 
 class PolicyStartupTests(unittest.TestCase):
     @staticmethod
@@ -84,8 +87,8 @@ class PolicyStartupTests(unittest.TestCase):
         ) as thread_constructor, mock.patch.object(
             start_monitoring, "FollowUpScheduler", autospec=True
         ) as scheduler_constructor, mock.patch.object(
-            seismiclistener, "start_emsc_listener", autospec=True
-        ) as listener_start, mock.patch.object(
+            seismiclistener, "build_emsc_listener", autospec=True
+        ) as listener_constructor, mock.patch.object(
             scheduler, "EventTracker", autospec=True
         ) as tracker_constructor, mock.patch.object(
             scheduler, "ThreadPoolExecutor", autospec=True
@@ -104,7 +107,7 @@ class PolicyStartupTests(unittest.TestCase):
         selector_builder.assert_not_called()
         thread_constructor.assert_not_called()
         scheduler_constructor.assert_not_called()
-        listener_start.assert_not_called()
+        listener_constructor.assert_not_called()
         tracker_constructor.assert_not_called()
         executor_constructor.assert_not_called()
         database_connect.assert_not_called()
@@ -126,6 +129,7 @@ class PolicyStartupTests(unittest.TestCase):
             "EMSC": object(),
         }
         scheduler_instance = mock.Mock()
+        listener_instance = mock.Mock()
         finder_config_selector = object()
 
         def configure_logger(*args, **kwargs):
@@ -145,8 +149,12 @@ class PolicyStartupTests(unittest.TestCase):
             events.append("listener-thread")
             return ImmediateThread(target=target, daemon=daemon)
 
-        def start_listener(**kwargs):
-            events.append("listener")
+        def construct_listener(**kwargs):
+            events.append("listener-construction")
+            listener_instance.run.side_effect = lambda: events.append(
+                "listener"
+            )
+            return listener_instance
 
         def construct_scheduler(**kwargs):
             events.append("scheduler")
@@ -170,9 +178,9 @@ class PolicyStartupTests(unittest.TestCase):
             side_effect=construct_thread,
         ), mock.patch.object(
             start_monitoring.seismiclistener,
-            "start_emsc_listener",
-            side_effect=start_listener,
-        ) as listener_start, mock.patch.object(
+            "build_emsc_listener",
+            side_effect=construct_listener,
+        ) as listener_constructor, mock.patch.object(
             start_monitoring,
             "FollowUpScheduler",
             side_effect=construct_scheduler,
@@ -189,13 +197,16 @@ class PolicyStartupTests(unittest.TestCase):
                 "logger",
                 "policy",
                 "selector",
+                "listener-construction",
+                "scheduler",
                 "listener-thread",
                 "listener",
-                "scheduler",
             ],
         )
         selector_builder.assert_called_once_with(logger=logger)
-        self.assertIs(listener_start.call_args.kwargs["policy"], rrsm_policy)
+        self.assertIs(
+            listener_constructor.call_args.kwargs["policy"], rrsm_policy
+        )
         self.assertIs(
             scheduler_constructor.call_args.kwargs["service_policies"],
             service_policies,
@@ -206,7 +217,12 @@ class PolicyStartupTests(unittest.TestCase):
             ],
             finder_config_selector,
         )
-        scheduler_instance.run_forever.assert_called_once_with()
+        scheduler_instance.run_forever.assert_called_once_with(
+            shutdown_event=mock.ANY
+        )
+        listener_instance.stop.assert_called_once_with()
+        scheduler_instance.shutdown.assert_called_once_with()
+        listener_instance.close.assert_called_once_with()
 
     def test_full_startup_global_error_aborts_before_operational_resources(self):
         events = []
@@ -252,9 +268,9 @@ class PolicyStartupTests(unittest.TestCase):
             autospec=True,
         ) as scheduler_constructor, mock.patch.object(
             seismiclistener,
-            "start_emsc_listener",
+            "build_emsc_listener",
             autospec=True,
-        ) as listener_start, mock.patch.object(
+        ) as listener_constructor, mock.patch.object(
             scheduler,
             "EventTracker",
             autospec=True,
@@ -286,7 +302,7 @@ class PolicyStartupTests(unittest.TestCase):
         self.assertIs(logger.critical.call_args.kwargs["exc_info"], True)
         thread_constructor.assert_not_called()
         scheduler_constructor.assert_not_called()
-        listener_start.assert_not_called()
+        listener_constructor.assert_not_called()
         tracker_constructor.assert_not_called()
         executor_constructor.assert_not_called()
         database_connect.assert_not_called()

@@ -8,6 +8,7 @@ from collections.abc import Collection, Mapping
 import json
 import logging
 import math
+import threading
 
 from pyfinder.utils.timeutils import parse_normalized_iso8601
 
@@ -237,12 +238,14 @@ def _make_eventtracker_handoff(tracker, policy, logger):
     return handoff
 
 
-def listen(ws, processor, logger):
+def listen(ws, processor, logger, stop_event=None):
     """Read messages from one open WebSocket until it closes."""
-    while True:
+    while stop_event is None or not stop_event.is_set():
         message = yield ws.read_message()
         if message is None:
             logger.info("WebSocket closed")
+            break
+        if stop_event is not None and stop_event.is_set():
             break
         processor(message)
 
@@ -255,32 +258,146 @@ def launch_client(
     websocket_connect,
     listen_coroutine,
     sleep,
+    stop_event=None,
 ):
     """Maintain the existing reconnect loop around the EMSC WebSocket."""
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             logger.info("Opening WebSocket connection to %s", echo_uri)
             ws = yield websocket_connect(echo_uri, ping_interval=ping_interval)
+            if stop_event is not None and stop_event.is_set():
+                ws.close()
+                break
             logger.info(
                 "WebSocket connection established. Waiting for messages..."
             )
-            yield listen_coroutine(ws, processor=processor, logger=logger)
+            yield listen_coroutine(
+                ws,
+                processor=processor,
+                logger=logger,
+                stop_event=stop_event,
+            )
         except Exception:
+            if stop_event is not None and stop_event.is_set():
+                break
             logger.exception("Connection error")
             logger.info("Retrying connection in 5 seconds...")
             yield sleep(5)
 
 
-def start_emsc_listener(
+class EMSCListener:
+    """Own one listener's persistence and controllable read loop."""
+
+    def __init__(
+        self,
+        policy,
+        *,
+        db_path,
+        logger,
+        configuration,
+    ):
+        from functools import partial
+
+        from tornado import gen
+        from tornado.ioloop import IOLoop
+        from tornado.websocket import websocket_connect
+
+        from pyfinder.services.eventtracker import EventTracker
+
+        listener_config = configuration.get("seismic-portal-listener", {})
+        self.target_regions = normalize_target_regions(
+            listener_config.get("target-regions")
+        )
+        self.min_magnitude = normalize_min_magnitude(
+            listener_config.get("min-magnitude")
+        )
+        self.echo_uri = listener_config["echo-uri"]
+        self.ping_interval = listener_config["ping-interval"]
+        self.logger = logger
+        self._tracker = EventTracker(str(db_path), logger=logger)
+        handoff = _make_eventtracker_handoff(self._tracker, policy, logger)
+        self._processor = partial(
+            process_emsc_message,
+            target_regions=self.target_regions,
+            min_magnitude=self.min_magnitude,
+            handoff=handoff,
+            logger=logger,
+        )
+        self._gen = gen
+        self._ioloop_type = IOLoop
+        self._websocket_connect = websocket_connect
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._ioloop = None
+        self._closed = False
+
+    def run(self):
+        """Run the WebSocket loop until it stops or shutdown is requested."""
+        listen_coroutine = self._gen.coroutine(listen)
+        launch_coroutine = self._gen.coroutine(launch_client)
+
+        self.logger.info(
+            " ===== Starting Seismic Portal WebSocket listener ====="
+        )
+        self.logger.info("Configuration:")
+        self.logger.info(
+            "|- Target regions: %s", self.target_regions or ("world",)
+        )
+        self.logger.info("|- Minimum magnitude: %s", self.min_magnitude)
+        self.logger.info("|- WebSocket URI: %s", self.echo_uri)
+
+        with self._lifecycle_lock:
+            if self._stop_event.is_set():
+                return
+            self._ioloop = self._ioloop_type()
+            ioloop = self._ioloop
+
+        self.logger.info("Launching WebSocket client")
+        ioloop.add_callback(
+            launch_coroutine,
+            echo_uri=self.echo_uri,
+            ping_interval=self.ping_interval,
+            processor=self._processor,
+            logger=self.logger,
+            websocket_connect=self._websocket_connect,
+            listen_coroutine=listen_coroutine,
+            sleep=self._gen.sleep,
+            stop_event=self._stop_event,
+        )
+
+        try:
+            self.logger.info("Starting the IOLoop ...")
+            ioloop.start()
+        finally:
+            with self._lifecycle_lock:
+                self._ioloop = None
+            ioloop.close(all_fds=True)
+
+    def stop(self):
+        """Stop accepting alerts and interrupt the owned read loop."""
+        self._stop_event.set()
+        with self._lifecycle_lock:
+            ioloop = self._ioloop
+        if ioloop is not None:
+            ioloop.add_callback(ioloop.stop)
+
+    def close(self):
+        """Close listener persistence once its read loop has ended."""
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._tracker.close()
+
+
+def build_emsc_listener(
     policy=None,
     *,
     db_path=None,
     logger=None,
     configuration=None,
 ):
-    """Start the listener with explicitly composed persistence and logging."""
-    from functools import partial
-
+    """Construct a listener after its policy and paths are validated."""
     logger = logger or logging.getLogger(__name__)
 
     if policy is None:
@@ -299,66 +416,37 @@ def start_emsc_listener(
             "the EMSC listener requires an explicit operational database path"
         )
 
-    # Operational runtime imports and construction occur only after policy
-    # validation has succeeded at this startup boundary.
-    from tornado import gen
-    from tornado.ioloop import IOLoop
-    from tornado.websocket import websocket_connect
-
-    from pyfinder.services.eventtracker import EventTracker
-
     if configuration is None:
         from pyfinder.pyfinderconfig import pyfinderconfig
 
         configuration = pyfinderconfig
-    listener_config = configuration.get("seismic-portal-listener", {})
-    target_regions = normalize_target_regions(
-        listener_config.get("target-regions")
-    )
-    min_magnitude = normalize_min_magnitude(
-        listener_config.get("min-magnitude")
-    )
-    echo_uri = listener_config["echo-uri"]
-    ping_interval = listener_config["ping-interval"]
-
-    tracker = EventTracker(str(db_path), logger=logger)
-    handoff = _make_eventtracker_handoff(tracker, policy, logger)
-    processor = partial(
-        process_emsc_message,
-        target_regions=target_regions,
-        min_magnitude=min_magnitude,
-        handoff=handoff,
+    return EMSCListener(
+        policy,
+        db_path=db_path,
         logger=logger,
+        configuration=configuration,
     )
-    listen_coroutine = gen.coroutine(listen)
-    launch_coroutine = gen.coroutine(launch_client)
 
-    logger.info(" ===== Starting Seismic Portal WebSocket listener =====")
-    logger.info("Configuration:")
-    logger.info("|- Target regions: %s", target_regions or ("world",))
-    logger.info("|- Minimum magnitude: %s", min_magnitude)
-    logger.info("|- WebSocket URI: %s", echo_uri)
 
-    logger.info("Starting Tornado IOLoop")
-    ioloop = IOLoop.instance()
-    logger.info("Launching WebSocket client")
-    ioloop.add_callback(
-        launch_coroutine,
-        echo_uri=echo_uri,
-        ping_interval=ping_interval,
-        processor=processor,
+def start_emsc_listener(
+    policy=None,
+    *,
+    db_path=None,
+    logger=None,
+    configuration=None,
+):
+    """Construct and run one listener for direct library callers."""
+    listener = build_emsc_listener(
+        policy=policy,
+        db_path=db_path,
         logger=logger,
-        websocket_connect=websocket_connect,
-        listen_coroutine=listen_coroutine,
-        sleep=gen.sleep,
+        configuration=configuration,
     )
-
     try:
-        logger.info("Starting the IOLoop ...")
-        ioloop.start()
-    except KeyboardInterrupt:
-        logger.info("Closing WebSocket")
-        ioloop.stop()
+        listener.run()
+    finally:
+        listener.stop()
+        listener.close()
 
 
 if __name__ == "__main__":

@@ -136,7 +136,6 @@ class BuiltArtifactTests(unittest.TestCase):
                     install_result.stderr,
                 )
             )
-
         (cls.guard_directory / "sitecustomize.py").write_text(
             """
 import builtins
@@ -577,6 +576,54 @@ class CommandDispatchTests(unittest.TestCase):
                         arguments,
                         runtime_context=runtime_context,
                     )
+
+
+class RetiredStartupScriptTests(unittest.TestCase):
+    def test_startup_script_only_directs_callers_to_installed_command(self):
+        script_path = PROJECT_ROOT / "pyfinder" / "startMonitoring.sh"
+        source = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("pyfinder continuous", source)
+        self.assertNotIn("nohup", source)
+        self.assertNotIn("python3.9", source)
+        self.assertNotIn("start_monitoring.py", source)
+
+        result = subprocess.run(
+            ["/bin/sh", os.fspath(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("pyfinder continuous", result.stderr)
+
+    def test_readme_records_current_execution_boundaries(self):
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = readme.casefold()
+        compact = " ".join(normalized.split())
+
+        self.assertIn("pyfinder continuous", readme)
+        self.assertIn("pyfinder playback --list", readme)
+        self.assertIn("pyfinder on-demand --event-id EVENT_ID", readme)
+        self.assertIn("forthcoming pyfinder container", compact)
+        self.assertIn(
+            "shakemap and email execution are currently inactive",
+            compact,
+        )
+        self.assertIn("host controller", compact)
+        self.assertNotIn("./startMonitoring.sh", readme)
+        self.assertNotIn("start_monitoring.py", readme)
+        self.assertNotIn("python3.9", readme)
+        self.assertNotIn("nohup", readme)
+        self.assertNotIn("standalone (no docker", normalized)
+        self.assertNotIn("pyfinder-docker", normalized)
+        self.assertNotIn("alerts are optional", normalized)
+        self.assertNotIn(".pyfinder_alert_config", normalized)
+        self.assertNotIn("docker run", normalized)
+        self.assertNotIn("$host_out", normalized)
+        self.assertNotIn("pyfinder/pyfinder/output", normalized)
+        self.assertNotIn("fully reproducible setup", normalized)
 
 
 if __name__ == "__main__":

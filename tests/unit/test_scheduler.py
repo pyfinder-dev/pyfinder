@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from pyfinder.eventcontext import EventContext
+from pyfinder.finderutils import FinderSolution
 from pyfinder.services import eventtracker as eventtracker_module
 from pyfinder.services import database as database_module
 from pyfinder.services import scheduler as scheduler_module
@@ -29,6 +30,11 @@ from pyfinder.services.scheduler import (
 EVENT_ID = "event-1"
 SERVICE = "RRSM"
 DELAY = 5
+
+
+def usable_solution(event_id=EVENT_ID):
+    """Return the scheduler's accepted domain result type."""
+    return FinderSolution(event_id=event_id)
 
 
 class ControlledFuture:
@@ -264,7 +270,7 @@ def make_scheduler(
         else service_policies
     )
     instance._finder_manager_class = manager_factory or ManagerFactory(
-        result=object()
+        result=usable_solution()
     )
     instance.finder_config_selector = (
         SelectorDouble()
@@ -277,6 +283,7 @@ def make_scheduler(
     instance._submitted_futures = {}
     instance._futures_being_observed = set()
     instance._accepting_work = True
+    instance._drain_complete = False
     instance._shutdown_complete = False
     instance.executor = executor
     return instance
@@ -434,7 +441,7 @@ class SchedulerExecutionTests(unittest.TestCase):
             temporary_directory.cleanup()
 
         tracker = make_tracker(metadata=metadata)
-        manager = ManagerFactory(result={"solution": "usable"})
+        manager = ManagerFactory(result=usable_solution())
         selector = SelectorDouble()
         scheduler = make_scheduler(
             tracker,
@@ -473,7 +480,7 @@ class SchedulerExecutionTests(unittest.TestCase):
             configuration_name="switzerland-alpine",
             configuration=selected_configuration,
         )
-        manager = ManagerFactory(result={"solution": "usable"})
+        manager = ManagerFactory(result=usable_solution())
         scheduler = make_scheduler(
             tracker,
             ImmediateExecutor(),
@@ -541,7 +548,7 @@ class SchedulerExecutionTests(unittest.TestCase):
             configuration_name="global",
             configuration=global_configuration,
         )
-        manager = ManagerFactory(result={"solution": "global"})
+        manager = ManagerFactory(result=usable_solution())
         scheduler = make_scheduler(
             tracker,
             ImmediateExecutor(),
@@ -568,7 +575,7 @@ class SchedulerExecutionTests(unittest.TestCase):
     def test_unexpected_selector_error_uses_existing_retry_lifecycle(self):
         tracker = make_tracker()
         selector = SelectorDouble(error=RuntimeError("selector failed"))
-        manager = ManagerFactory(result=object())
+        manager = ManagerFactory(result=usable_solution())
         scheduler = make_scheduler(
             tracker,
             ImmediateExecutor(),
@@ -596,7 +603,7 @@ class SchedulerExecutionTests(unittest.TestCase):
     def test_one_injected_selector_is_reused_for_multiple_attempts(self):
         tracker = make_tracker()
         selector = SelectorDouble()
-        manager = ManagerFactory(result=object())
+        manager = ManagerFactory(result=usable_solution())
         scheduler = make_scheduler(
             tracker,
             ImmediateExecutor(),
@@ -638,7 +645,7 @@ class SchedulerExecutionTests(unittest.TestCase):
             tracker.mark_completed.assert_not_called()
 
         manager = ManagerFactory(
-            result={"solution": "usable"},
+            result=usable_solution(),
             before_run=verify_not_precompleted,
         )
         executor = ImmediateExecutor()
@@ -659,7 +666,7 @@ class SchedulerExecutionTests(unittest.TestCase):
                 tracker = make_tracker(
                     metadata=event_metadata(next_delay=next_delay)
                 )
-                manager = ManagerFactory(result=object())
+                manager = ManagerFactory(result=usable_solution())
                 scheduler = make_scheduler(
                     tracker,
                     ImmediateExecutor(),
@@ -689,6 +696,39 @@ class SchedulerExecutionTests(unittest.TestCase):
         )
         tracker.mark_for_retry.assert_called_once()
         tracker.mark_completed.assert_not_called()
+
+    def test_non_solution_results_use_the_failed_attempt_lifecycle(self):
+        results = (
+            Path("materialized-input"),
+            {"solution": "not-a-domain-result"},
+            True,
+            False,
+            "materialized-input",
+            1,
+            object(),
+        )
+        for result in results:
+            with self.subTest(result_type=type(result).__name__):
+                tracker = make_tracker()
+                scheduler = make_scheduler(
+                    tracker,
+                    ImmediateExecutor(),
+                    ManagerFactory(result=result),
+                )
+
+                scheduler.run_once()
+
+                tracker.increment_retry_count.assert_called_once_with(
+                    event_id=EVENT_ID,
+                    service=SERVICE,
+                    current_delay_time=DELAY,
+                )
+                tracker.mark_for_retry.assert_called_once()
+                tracker.mark_completed.assert_not_called()
+                self.assertIn(
+                    "usable FinderSolution",
+                    tracker.mark_for_retry.call_args.kwargs["error_message"],
+                )
 
     def test_ordinary_manager_exception_increments_once(self):
         tracker = make_tracker()
@@ -793,7 +833,7 @@ class SchedulerExecutionTests(unittest.TestCase):
         scheduler = make_scheduler(
             tracker,
             executor,
-            ManagerFactory(result=object()),
+            ManagerFactory(result=usable_solution()),
         )
 
         scheduler.run_once()
@@ -949,7 +989,7 @@ class SchedulerFutureAndShutdownTests(unittest.TestCase):
         scheduler = make_scheduler(
             tracker,
             executor,
-            ManagerFactory(result=object()),
+            ManagerFactory(result=usable_solution()),
         )
         scheduler.run_once()
 
@@ -965,6 +1005,21 @@ class SchedulerFutureAndShutdownTests(unittest.TestCase):
                 "tracker_closed",
             ],
         )
+        tracker.close.assert_called_once_with()
+
+    def test_drain_can_finish_before_the_owner_closes_persistence(self):
+        tracker = make_tracker()
+        executor = DeferredExecutor()
+        scheduler = make_scheduler(tracker, executor)
+
+        scheduler.stop_and_drain()
+
+        self.assertEqual(executor.shutdown_calls, [True])
+        tracker.close.assert_not_called()
+
+        scheduler.close()
+        scheduler.shutdown()
+
         tracker.close.assert_called_once_with()
 
     def test_same_thread_state_lock_reentry_preserves_shutdown_order(self):
@@ -1014,7 +1069,9 @@ class SchedulerFutureAndShutdownTests(unittest.TestCase):
                 finder_config_selector=SelectorDouble(),
             )
 
-        instance._finder_manager_class = ManagerFactory(result=object())
+        instance._finder_manager_class = ManagerFactory(
+            result=usable_solution()
+        )
         instance.run_once()
         future = executor.submissions[0][2]
 
@@ -1085,6 +1142,39 @@ class SchedulerStartupTests(unittest.TestCase):
 
         selector_builder.assert_not_called()
         self.assertIs(instance.finder_config_selector, selector)
+        instance.shutdown()
+
+    def test_constructor_does_not_download_local_shakemap_configuration(self):
+        tracker = mock.Mock()
+        tracker.recover_abandoned_processing.return_value = 0
+        executor = DeferredExecutor()
+        config_fetcher = types.ModuleType("pyfinder.utils.config_fetcher")
+        config_fetcher.ensure_shakemap_config = mock.Mock()
+        finder_manager = types.ModuleType("pyfinder.findermanager")
+        finder_manager.FinDerManager = ManagerFactory
+
+        with mock.patch.object(
+            FollowUpScheduler,
+            "_setup_file_logger",
+            return_value=mock.Mock(),
+        ), mock.patch.object(
+            scheduler_module,
+            "ThreadPoolExecutor",
+            return_value=executor,
+        ), mock.patch.dict(
+            sys.modules,
+            {
+                "pyfinder.findermanager": finder_manager,
+                "pyfinder.utils.config_fetcher": config_fetcher,
+            },
+        ):
+            instance = FollowUpScheduler(
+                tracker=tracker,
+                service_policies={SERVICE: RRSMQueryPolicy()},
+                finder_config_selector=SelectorDouble(),
+            )
+
+        config_fetcher.ensure_shakemap_config.assert_not_called()
         instance.shutdown()
 
     def test_standalone_builds_selector_before_all_operational_resources(self):
@@ -1288,6 +1378,65 @@ class SchedulerStartupTests(unittest.TestCase):
                 )
 
         executor_constructor.assert_not_called()
+        tracker.close.assert_not_called()
+
+    def test_executor_failure_closes_scheduler_created_tracker(self):
+        tracker = mock.Mock()
+        tracker.recover_abandoned_processing.return_value = 0
+        original_error = RuntimeError("executor construction failed")
+        finder_manager = types.ModuleType("pyfinder.findermanager")
+        finder_manager.FinDerManager = ManagerFactory
+
+        with mock.patch.object(
+            FollowUpScheduler,
+            "_setup_file_logger",
+            return_value=mock.Mock(),
+        ), mock.patch.object(
+            scheduler_module,
+            "EventTracker",
+            return_value=tracker,
+        ), mock.patch.object(
+            scheduler_module,
+            "ThreadPoolExecutor",
+            side_effect=original_error,
+        ), mock.patch.dict(
+            sys.modules,
+            {"pyfinder.findermanager": finder_manager},
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                FollowUpScheduler(
+                    db_path="/runtime/state/scheduled_queries.sqlite3",
+                    service_policies={SERVICE: RRSMQueryPolicy()},
+                    finder_config_selector=SelectorDouble(),
+                )
+
+        self.assertIs(raised.exception, original_error)
+        tracker.close.assert_called_once_with()
+
+
+class SchedulerLoopTests(unittest.TestCase):
+    def test_loop_propagates_the_original_iteration_failure(self):
+        scheduler = make_scheduler(make_tracker(), DeferredExecutor())
+        original_error = RuntimeError("scheduler iteration failed")
+        scheduler.run_once = mock.Mock(side_effect=original_error)
+
+        with self.assertRaises(RuntimeError) as raised:
+            scheduler.run_forever(interval_seconds=0)
+
+        self.assertIs(raised.exception, original_error)
+
+    def test_requested_shutdown_stops_before_another_iteration(self):
+        scheduler = make_scheduler(make_tracker(), DeferredExecutor())
+        scheduler.run_once = mock.Mock()
+        shutdown_event = threading.Event()
+        shutdown_event.set()
+
+        scheduler.run_forever(
+            interval_seconds=0,
+            shutdown_event=shutdown_event,
+        )
+
+        scheduler.run_once.assert_not_called()
 
 
 class SchedulerBoundaryTests(unittest.TestCase):

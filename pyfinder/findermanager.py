@@ -314,25 +314,28 @@ class FinDerManager:
         self.logger.info(f"Channel codes have been renamed in the FinDer output. New file: {renamed_data_0}")
 
     def _send_failure_email(self, event_id, attachment=None):
-        try:
-            from services.alert import send_email_with_attachment
-            subject = f"pyFinder Alert - event {event_id}"
-            body = f"pyFinder attempted a shakemap calculation for {event_id},\n"
-            body += f"but FinDer executable failed to produce a solution for the event.\n"
-            body += f"Check the FinDer logs for more details.\n"
-            
-            send_email_with_attachment(
-                subject=subject,
-                body=body,
-                attachments=[attachment],
-                event_id=event_id,
-                finder_solution=None,
-                metadata=self.metadata
-            )
-            self.logger.info(f"Failure notification sent.")
-
-        except Exception as e:
-            self.logger.error(f"Failed to send failure notification: {e}")
+        # Alert email remains inactive until terminal notification behavior is
+        # owned by the external workflow boundary.
+        # try:
+        #     from services.alert import send_email_with_attachment
+        #     subject = f"pyFinder Alert - event {event_id}"
+        #     body = f"pyFinder attempted a shakemap calculation for {event_id},\n"
+        #     body += f"but FinDer executable failed to produce a solution for the event.\n"
+        #     body += f"Check the FinDer logs for more details.\n"
+        #
+        #     send_email_with_attachment(
+        #         subject=subject,
+        #         body=body,
+        #         attachments=[attachment],
+        #         event_id=event_id,
+        #         finder_solution=None,
+        #         metadata=self.metadata
+        #     )
+        #     self.logger.info(f"Failure notification sent.")
+        #
+        # except Exception as e:
+        #     self.logger.error(f"Failed to send failure notification: {e}")
+        return None
 
 
     def _build_augmented_event_id(self, event_id, delay_minutes):
@@ -834,11 +837,12 @@ class FinDerManager:
                 self.logger.error("Check the FinDer ouput in the pyfinder logs for more details.")
                 self.logger.warning("Returning to caller with no solution.")
 
-                self._send_failure_email(
-                    event_id=event_id, 
-                    attachment=os.path.join(
-                        executable.get_working_directory(), "pyfinder.log")
-                )
+                # Failure notification remains inactive with downstream email.
+                # self._send_failure_email(
+                #     event_id=event_id,
+                #     attachment=os.path.join(
+                #         executable.get_working_directory(), "pyfinder.log")
+                # )
                     
                 # Return None for no solution
                 return None
@@ -851,53 +855,55 @@ class FinDerManager:
                 working_dir=executable.get_working_directory(), 
                 finder_event_id=executable.get_finder_event_id())
             
-            # Build a new eventid with the scheduled delay time and export the data for shakemap 
-            from utils.shakemap import ShakeMapExporter
-            augmented_event_id = self._build_augmented_event_id(
-                event_id=event_id, delay_minutes=self.metadata['current_delay'])
-            self.logger.info(f"Augmented event id for shakemap is {augmented_event_id}")
-            
+            # Local ShakeMap execution and success email remain inactive until
+            # the external service workflow is implemented.
+            # Build a new eventid with the scheduled delay time and export the data for shakemap
+            # from utils.shakemap import ShakeMapExporter
+            # augmented_event_id = self._build_augmented_event_id(
+            #     event_id=event_id, delay_minutes=self.metadata['current_delay'])
+            # self.logger.info(f"Augmented event id for shakemap is {augmented_event_id}")
+            #
             # Check if we are passing the amplitudes from FinDer output
-            use_finder_amplitudes = self.configuration.get("shakemap", {}).get("use-amplitude-from-finder-output", False)
-            self.logger.info(f"To ShakeMap :: Are you passing the amplitudes from FinDer output? {use_finder_amplitudes}")
-
-            smap_exporter = ShakeMapExporter(
-                solution=executable.get_finder_solution_object(),
-                augmented_id=augmented_event_id,
-                logger=self.logger)
-            shakemapexp = smap_exporter.export_all()
-            self.logger.info(f"ShakeMap files exported to: {shakemapexp['output_dir']}")
-
+            # use_finder_amplitudes = self.configuration.get("shakemap", {}).get("use-amplitude-from-finder-output", False)
+            # self.logger.info(f"To ShakeMap :: Are you passing the amplitudes from FinDer output? {use_finder_amplitudes}")
+            #
+            # smap_exporter = ShakeMapExporter(
+            #     solution=executable.get_finder_solution_object(),
+            #     augmented_id=augmented_event_id,
+            #     logger=self.logger)
+            # shakemapexp = smap_exporter.export_all()
+            # self.logger.info(f"ShakeMap files exported to: {shakemapexp['output_dir']}")
+            #
             # Trigger ShakeMap using exported files
-            from utils.shakemap import ShakeMapTrigger
+            # from utils.shakemap import ShakeMapTrigger
             # Create the products directory
-            products_dir = os.path.join(shakemapexp["output_dir"], "products")
-            os.makedirs(products_dir, exist_ok=True)
+            # products_dir = os.path.join(shakemapexp["output_dir"], "products")
+            # os.makedirs(products_dir, exist_ok=True)
             # Copy the ShakeMap files to the products directory
-            trigger = ShakeMapTrigger(
-                event_id=augmented_event_id,#event_id,
-                event_xml=shakemapexp["event.xml"],
-                stationlist_path=shakemapexp["stationlist.json"],
-                rupture_path=shakemapexp["rupture.json"]  
-            )
-            trigger.run()
-
+            # trigger = ShakeMapTrigger(
+            #     event_id=augmented_event_id,#event_id,
+            #     event_xml=shakemapexp["event.xml"],
+            #     stationlist_path=shakemapexp["stationlist.json"],
+            #     rupture_path=shakemapexp["rupture.json"]
+            # )
+            # trigger.run()
+            #
             # Archive the products via ShakeMap exporter under the temp_data directory
-            smap_exporter.archive_products(target_base_dir=self.finder_temp_data_dir)
-
-            from services.alert import send_email_with_attachment
-            products_dir = os.path.join(shakemapexp["output_dir"], "products")
-            attachment = f"{products_dir}/intensity.jpg"
-            subject = f"pyFinder Alert - event {event_id}"
-            body = f"A new ShakeMap has been produced for event {event_id}.\n"
-            send_email_with_attachment(
-                subject=subject,
-                body=body,
-                attachments=[attachment],
-                event_id=event_id,
-                finder_solution=executable.get_finder_solution_object(),
-                metadata=self.metadata
-            )
+            # smap_exporter.archive_products(target_base_dir=self.finder_temp_data_dir)
+            #
+            # from services.alert import send_email_with_attachment
+            # products_dir = os.path.join(shakemapexp["output_dir"], "products")
+            # attachment = f"{products_dir}/intensity.jpg"
+            # subject = f"pyFinder Alert - event {event_id}"
+            # body = f"A new ShakeMap has been produced for event {event_id}.\n"
+            # send_email_with_attachment(
+            #     subject=subject,
+            #     body=body,
+            #     attachments=[attachment],
+            #     event_id=event_id,
+            #     finder_solution=executable.get_finder_solution_object(),
+            #     metadata=self.metadata
+            # )
      
             # Rename the channel codes if live mode is False. When live mode is False,
             # we pass FinDer only the coordinates and it assigns the channel codes itself.

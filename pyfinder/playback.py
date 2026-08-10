@@ -5,7 +5,6 @@ import json
 from datetime import datetime, timezone
 import logging
 import threading
-import time
 
 from pyfinder.eventcontext import EventContext, EventContextError
 from pyfinder.services.scheduler import FollowUpScheduler
@@ -155,6 +154,7 @@ class EventAlertWSPlaybackManager:
         speedup_factor=1.0,
         default_services=None,
         logger=None,
+        failure_callback=None,
     ):
         """
         event_list: List of events to be played back, in the same JSON structure as the alerts from EMSC
@@ -162,11 +162,13 @@ class EventAlertWSPlaybackManager:
         scheduler: Instance of FollowUpScheduler
         speedup_factor: Speed multiplier for playback
         default_services: Default services if event doesn't specify
+        failure_callback: Optional command-owner callback for worker failures
         """
         self.event_tracker = event_tracker
         self.speedup_factor = speedup_factor
         self.default_services = default_services or ["RRSM", "ESM"]
         self.logger = logger or logging.getLogger(__name__)
+        self._failure_callback = failure_callback
         valid_events = []
         for event in event_list:
             validated_event = self._validated_event(event)
@@ -180,6 +182,8 @@ class EventAlertWSPlaybackManager:
         self.running = False
         self._thread = None
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._worker_error = None
 
     def _validated_event(self, event):
         """Return an isolated usable alert mapping or warn and ignore it."""
@@ -218,6 +222,8 @@ class EventAlertWSPlaybackManager:
             print("[EMSC Event Alert Playback] Already running.")
             return
 
+        self._stop_event.clear()
+        self._worker_error = None
         self.running = True
         self._thread = threading.Thread(target=self._run)
         self._thread.start()
@@ -225,14 +231,28 @@ class EventAlertWSPlaybackManager:
 
     def pause(self):
         """Pause automatic playback."""
-        if not self.running:
+        if not self.running and self._thread is None:
             print("[EMSC Event Alert Playback] Already paused.")
             return
 
-        self.running = False
-        if self._thread:
-            self._thread.join()
+        self.stop()
+        self.join()
         print("[EMSC Event Alert Playback] Paused.")
+
+    def stop(self):
+        """Stop playback alert injection without waiting for its thread."""
+        self.running = False
+        self._stop_event.set()
+
+    def join(self):
+        """Join and release the owned playback thread after it stops."""
+        playback_thread = self._thread
+        if (
+            playback_thread is not None
+            and playback_thread is not threading.current_thread()
+        ):
+            playback_thread.join()
+        self._thread = None
 
     def inject_next_event(self):
         """Manually inject the next event."""
@@ -249,30 +269,52 @@ class EventAlertWSPlaybackManager:
 
     def _run(self):
         """Internal thread loop for automatic playback."""
-        while self.running and self.index < len(self.event_list):
-            with self._lock:
-                event = self.event_list[self.index]
-                self.index += 1
-
-            print(f"[EMSC Event Alert Playback] Auto-injecting event {event['unid']} at {datetime.now().isoformat()}")
-            self._inject_event(event)
-
-            if self.index < len(self.event_list):
-                next_event = self.event_list[self.index]
-                sleep_seconds = (
-                    get_epoch_time(next_event["time"])
-                    - get_epoch_time(event["time"])
-                )
-                sleep_seconds /= self.speedup_factor
-                if sleep_seconds > 0:
-                    time.sleep(min(sleep_seconds, 60))  # Sleep max 60 sec between events even if huge gaps
-        # Stay alive after injecting all events
-        print("[EMSC Event Alert Playback] All events injected. Waiting for external termination...")
         try:
-            while self.running:
-                time.sleep(0.5)
-        except (KeyboardInterrupt, SystemExit):
+            while (
+                self.running
+                and not self._stop_event.is_set()
+                and self.index < len(self.event_list)
+            ):
+                with self._lock:
+                    event = self.event_list[self.index]
+                    self.index += 1
+
+                print(f"[EMSC Event Alert Playback] Auto-injecting event {event['unid']} at {datetime.now().isoformat()}")
+                self._inject_event(event)
+
+                if self.index < len(self.event_list):
+                    next_event = self.event_list[self.index]
+                    sleep_seconds = (
+                        get_epoch_time(next_event["time"])
+                        - get_epoch_time(event["time"])
+                    )
+                    sleep_seconds /= self.speedup_factor
+                    if sleep_seconds > 0:
+                        # Long historical gaps remain bounded, and shutdown can
+                        # interrupt the wait immediately.
+                        self._stop_event.wait(min(sleep_seconds, 60))
+            # Stay alive after injecting all events
+            print("[EMSC Event Alert Playback] All events injected. Waiting for external termination...")
+            while self.running and not self._stop_event.wait(0.5):
+                pass
+        except BaseException as error:
+            self._worker_error = error
             self.running = False
+            self._stop_event.set()
+            if self._failure_callback is not None:
+                try:
+                    self._failure_callback(error)
+                except BaseException as callback_error:
+                    error.add_note(
+                        "Playback failure notification also failed: "
+                        "{0}: {1}".format(
+                            type(callback_error).__name__,
+                            callback_error,
+                        )
+                    )
+        finally:
+            self.running = False
+            self._stop_event.set()
 
     def _inject_event(self, event):
         """Internal helper to inject an event into system."""
@@ -302,7 +344,11 @@ def run_cli(arguments, *, runtime_context):
     playback = None
     scheduler = None
     tracker = None
-    scheduler_stopped = False
+    scheduler_thread = None
+    scheduler_thread_started = False
+    shutdown_event = threading.Event()
+    scheduler_failures = []
+    playback_failures = []
     process_logger = file_logger(
         runtime_context.process_log_path,
         module_name="Playback",
@@ -319,14 +365,40 @@ def run_cli(arguments, *, runtime_context):
         pyfinderconfig
     )
 
-    def handle_shutdown(signum, frame):
-        nonlocal scheduler_stopped
-        print("\n[Main] Interrupt received. Shutting down...")
+    def report_playback_failure(error):
+        playback_failures.append(error)
+        shutdown_event.set()
+
+    def shutdown_resources():
+        """Stop playback, drain scheduled work, and join owned threads."""
+        failures = []
+
+        def attempt(description, operation):
+            try:
+                operation()
+            except BaseException as error:
+                process_logger.error(
+                    "%s failed: %s",
+                    description,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                failures.append(error)
+
         if playback is not None:
-            playback.pause()
+            attempt("Stopping playback alert injection", playback.stop)
+        shutdown_event.set()
         if scheduler is not None:
-            scheduler.shutdown()
-            scheduler_stopped = True
+            attempt("Draining the playback scheduler", scheduler.stop_and_drain)
+        if playback is not None:
+            attempt("Joining the playback alert thread", playback.join)
+        if scheduler_thread is not None and scheduler_thread_started:
+            attempt("Joining the playback scheduler thread", scheduler_thread.join)
+        if scheduler is not None:
+            attempt("Closing playback scheduler persistence", scheduler.close)
+        elif tracker is not None:
+            attempt("Closing playback persistence", tracker.close)
+        return failures
 
     # The predefined list of events to be played back
     event_list = generate_event_list()
@@ -350,6 +422,8 @@ def run_cli(arguments, *, runtime_context):
         return 1
 
     with runtime_context.playback_database() as database_path:
+        primary_error = None
+        primary_traceback = None
         try:
             tracker = EventTracker(str(database_path), logger=process_logger)
 
@@ -360,6 +434,7 @@ def run_cli(arguments, *, runtime_context):
                 speedup_factor=1.0,
                 default_services=["RRSM"],
                 logger=process_logger,
+                failure_callback=report_playback_failure,
             )
 
             # Now start scheduler and playback
@@ -368,25 +443,54 @@ def run_cli(arguments, *, runtime_context):
                 logger=scheduler_logger,
                 configuration=application_configuration,
             )
+            def run_scheduler():
+                try:
+                    scheduler.run_forever(shutdown_event=shutdown_event)
+                except BaseException as error:
+                    scheduler_failures.append(error)
+                finally:
+                    shutdown_event.set()
+
             scheduler_thread = threading.Thread(
-                target=scheduler.run_forever,
-                daemon=True,
+                target=run_scheduler,
+                daemon=False,
             )
             scheduler_thread.start()
+            scheduler_thread_started = True
 
             playback.start_auto()
 
             print("[Main] Running playback. Press Ctrl+C to exit.")
             try:
-                while True:
-                    time.sleep(1)
+                while not shutdown_event.wait(1):
+                    pass
             except (KeyboardInterrupt, SystemExit):
-                handle_shutdown(None, None)
+                print("\n[Main] Interrupt received. Shutting down...")
+            if playback_failures:
+                raise playback_failures[0]
+            if scheduler_failures:
+                raise scheduler_failures[0]
+        except BaseException as error:
+            primary_error = error
+            primary_traceback = error.__traceback__
         finally:
-            if scheduler is not None and not scheduler_stopped:
-                scheduler.shutdown()
-            elif scheduler is None and tracker is not None:
-                tracker.close()
+            cleanup_failures = shutdown_resources()
+
+        if primary_error is not None:
+            for cleanup_error in cleanup_failures:
+                primary_error.add_note(
+                    "Cleanup also failed: {0}: {1}".format(
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
+                )
+            if isinstance(primary_error, (KeyboardInterrupt, SystemExit)):
+                if cleanup_failures:
+                    raise cleanup_failures[0]
+            else:
+                raise primary_error.with_traceback(primary_traceback)
+        elif cleanup_failures:
+            raise cleanup_failures[0]
     return 0
 
 
