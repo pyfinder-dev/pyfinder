@@ -1,0 +1,306 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# These values are deliberately fixed so arguments or environment settings
+# cannot redirect an operator command to another container or deployment tree.
+readonly CONTAINER_NAME="pyfinder-docker"
+readonly IMAGE_NAME="pyfinder:dev"
+readonly DEPLOYMENT_ROOT="/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy"
+readonly RUNTIME_ROOT="${DEPLOYMENT_ROOT}/runtime"
+readonly SERVICE_ROOT="${RUNTIME_ROOT}/pyfinder"
+readonly CONTAINER_RUNTIME="/home/sysop/runtime"
+readonly CONTAINER_USER="1000:1000"
+
+usage() {
+    printf '%s\n' \
+        "Usage: pyfinder COMMAND [ARGUMENTS]" \
+        "" \
+        "Manage the fixed local PyFinder development container." \
+        "" \
+        "Commands:" \
+        "  continuous            Start or preserve continuous operation" \
+        "  playback [ARGS...]    Run playback in the existing container" \
+        "  on-demand [ARGS...]   Run an on-demand calculation in the container" \
+        "  status                Report canonical container state" \
+        "  logs                  Show canonical container logs" \
+        "  stop                  Stop, but never remove, the canonical container" \
+        "  help, --help          Show this help"
+}
+
+fail() {
+    printf 'pyfinder: %s\n' "$1" >&2
+    exit 1
+}
+
+require_no_arguments() {
+    local command_name="$1"
+    local argument_count="$2"
+    if [[ "$argument_count" -ne 0 ]]; then
+        fail "${command_name} does not accept arguments"
+    fi
+}
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || fail "docker is not available"
+}
+
+query_container_presence() {
+    local names
+
+    # A failed Docker query means we do not know whether the container exists.
+    # Treating that uncertainty as absence could start a second service instance.
+    if ! names=$(
+        docker container ls \
+            --all \
+            --filter "name=^${CONTAINER_NAME}$" \
+            --format '{{.Names}}'
+    ); then
+        fail "could not query Docker containers; check Docker access, context, socket, and permissions"
+    fi
+
+    CONTAINER_PRESENT=false
+    while IFS= read -r name; do
+        if [[ "$name" == "$CONTAINER_NAME" ]]; then
+            CONTAINER_PRESENT=true
+            return
+        fi
+    done <<< "$names"
+}
+
+load_local_image_id() {
+    local images
+    local reference
+    local image_id
+
+    # Query failure is different from a successful query with no matching tag;
+    # only the latter proves that the required development image is absent.
+    if ! images=$(
+        docker image ls \
+            --no-trunc \
+            --filter "reference=${IMAGE_NAME}" \
+            --format '{{.Repository}}:{{.Tag}}|{{.ID}}'
+    ); then
+        fail "could not query Docker images; check Docker access, context, socket, and permissions"
+    fi
+
+    LOCAL_IMAGE_ID=""
+    while IFS='|' read -r reference image_id; do
+        if [[ "$reference" == "$IMAGE_NAME" ]]; then
+            LOCAL_IMAGE_ID="$image_id"
+            break
+        fi
+    done <<< "$images"
+    if [[ -z "$LOCAL_IMAGE_ID" ]]; then
+        fail "required local development image ${IMAGE_NAME} is absent; the launcher will not pull or build it"
+    fi
+}
+
+check_container_compatibility() {
+    local snapshot
+    local configured_image
+    local container_image_id
+    local configured_user
+    local configured_entrypoint
+    local configured_command
+    local running
+    local mounts
+    local expected_mount
+
+    load_local_image_id
+    if ! snapshot=$(
+        docker container inspect \
+            --format '{{.Config.Image}}|{{.Image}}|{{.Config.User}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}|{{.State.Running}}' \
+            "$CONTAINER_NAME" 2>/dev/null
+    ); then
+        fail "could not inspect ${CONTAINER_NAME} compatibility"
+    fi
+    IFS='|' read -r \
+        configured_image \
+        container_image_id \
+        configured_user \
+        configured_entrypoint \
+        configured_command \
+        running <<< "$snapshot"
+
+    if [[ "$configured_image" != "$IMAGE_NAME" ]]; then
+        fail "incompatible ${CONTAINER_NAME}: image reference is '${configured_image}', expected '${IMAGE_NAME}'"
+    fi
+    # Fresh development builds replace the image tag, but they do not update
+    # an already-created container. Reject that stale container explicitly.
+    if [[ "$container_image_id" != "$LOCAL_IMAGE_ID" ]]; then
+        fail "stale ${CONTAINER_NAME}: image ID '${container_image_id}' does not match local ${IMAGE_NAME} image ID '${LOCAL_IMAGE_ID}'"
+    fi
+    if [[ "$configured_user" != "$CONTAINER_USER" ]]; then
+        fail "incompatible ${CONTAINER_NAME}: user is '${configured_user}', expected '${CONTAINER_USER}'"
+    fi
+    if [[ "$configured_entrypoint" != '["pyfinder"]' ]]; then
+        fail "incompatible ${CONTAINER_NAME}: entrypoint is '${configured_entrypoint}', expected '[\"pyfinder\"]'"
+    fi
+    if [[ "$configured_command" != '["continuous"]' ]]; then
+        fail "incompatible ${CONTAINER_NAME}: command is '${configured_command}', expected '[\"continuous\"]'"
+    fi
+
+    if ! mounts=$(
+        docker container inspect \
+            --format '{{range .Mounts}}{{printf "%s|%s|%s|%t\n" .Type .Source .Destination .RW}}{{end}}' \
+            "$CONTAINER_NAME" 2>/dev/null
+    ); then
+        fail "could not inspect ${CONTAINER_NAME} runtime mount"
+    fi
+    expected_mount="bind|${RUNTIME_ROOT}|${CONTAINER_RUNTIME}|true"
+    if [[ "$mounts" != "$expected_mount" ]]; then
+        fail "incompatible ${CONTAINER_NAME}: mounts are '${mounts}', expected exactly '${expected_mount}'"
+    fi
+
+    CONTAINER_RUNNING="$running"
+}
+
+create_runtime_directories() {
+    # Only create directories owned by PyFinder; neighboring services may
+    # share the deployment root and remain outside this launcher's authority.
+    mkdir -p \
+        "${SERVICE_ROOT}/state" \
+        "${SERVICE_ROOT}/logs" \
+        "${SERVICE_ROOT}/runs" \
+        "${SERVICE_ROOT}/playbacks"
+}
+
+run_continuous() {
+    query_container_presence
+    if [[ "$CONTAINER_PRESENT" == "true" ]]; then
+        check_container_compatibility
+        if [[ "$CONTAINER_RUNNING" == "true" ]]; then
+            # Preserve the accepted service instance instead of silently
+            # replacing it and losing its process and filesystem continuity.
+            printf '%s is already running and compatible.\n' "$CONTAINER_NAME"
+            return
+        fi
+
+        create_runtime_directories
+        docker start "$CONTAINER_NAME" >/dev/null
+        printf 'Started existing compatible container %s.\n' "$CONTAINER_NAME"
+        return
+    fi
+
+    load_local_image_id
+    create_runtime_directories
+    docker run \
+        --detach \
+        --pull=never \
+        --name "$CONTAINER_NAME" \
+        --user "$CONTAINER_USER" \
+        --mount "type=bind,source=${RUNTIME_ROOT},target=${CONTAINER_RUNTIME}" \
+        "$IMAGE_NAME" \
+        continuous >/dev/null
+    printf 'Started new container %s from %s.\n' "$CONTAINER_NAME" "$IMAGE_NAME"
+}
+
+run_additional_process() {
+    local workflow="$1"
+    shift
+
+    # Playback and on-demand run inside the continuous container so they cannot
+    # accidentally create another service instance.
+    query_container_presence
+    if [[ "$CONTAINER_PRESENT" != "true" ]]; then
+        fail "${CONTAINER_NAME} does not exist; start continuous operation first"
+    fi
+    check_container_compatibility
+    if [[ "$CONTAINER_RUNNING" != "true" ]]; then
+        fail "${CONTAINER_NAME} is stopped; start continuous operation first"
+    fi
+    exec docker exec "$CONTAINER_NAME" pyfinder "$workflow" "$@"
+}
+
+report_status() {
+    local running
+    query_container_presence
+    if [[ "$CONTAINER_PRESENT" != "true" ]]; then
+        printf '%s is absent.\n' "$CONTAINER_NAME"
+        return
+    fi
+    running=$(
+        docker container inspect \
+            --format '{{.State.Running}}' \
+            "$CONTAINER_NAME"
+    )
+    if [[ "$running" == "true" ]]; then
+        printf '%s is running.\n' "$CONTAINER_NAME"
+    else
+        printf '%s exists but is stopped.\n' "$CONTAINER_NAME"
+    fi
+}
+
+show_logs() {
+    query_container_presence
+    if [[ "$CONTAINER_PRESENT" != "true" ]]; then
+        fail "${CONTAINER_NAME} does not exist; no logs are available"
+    fi
+    exec docker logs "$CONTAINER_NAME"
+}
+
+stop_container() {
+    local running
+    query_container_presence
+    if [[ "$CONTAINER_PRESENT" != "true" ]]; then
+        fail "${CONTAINER_NAME} does not exist; nothing was stopped"
+    fi
+    running=$(
+        docker container inspect \
+            --format '{{.State.Running}}' \
+            "$CONTAINER_NAME"
+    )
+    if [[ "$running" != "true" ]]; then
+        printf '%s is already stopped.\n' "$CONTAINER_NAME"
+        return
+    fi
+    # Stop is intentionally recoverable: keep the container so continuous can
+    # restart the same compatible instance later.
+    docker stop "$CONTAINER_NAME" >/dev/null
+    printf 'Stopped %s without removing it.\n' "$CONTAINER_NAME"
+}
+
+if [[ "$#" -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+command_name="$1"
+shift
+
+case "$command_name" in
+    help|--help)
+        require_no_arguments "$command_name" "$#"
+        usage
+        ;;
+    continuous)
+        require_no_arguments "$command_name" "$#"
+        require_docker
+        run_continuous
+        ;;
+    playback|on-demand)
+        require_docker
+        run_additional_process "$command_name" "$@"
+        ;;
+    status)
+        require_no_arguments "$command_name" "$#"
+        require_docker
+        report_status
+        ;;
+    logs)
+        require_no_arguments "$command_name" "$#"
+        require_docker
+        show_logs
+        ;;
+    stop)
+        require_no_arguments "$command_name" "$#"
+        require_docker
+        stop_container
+        ;;
+    *)
+        printf 'pyfinder: unsupported command: %s\n\n' "$command_name" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

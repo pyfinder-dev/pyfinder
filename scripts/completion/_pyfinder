@@ -1,0 +1,34 @@
+#compdef pyfinder
+
+# Completion only lists the public command vocabulary; it never runs the launcher.
+_pyfinder() {
+    local workflow previous_word
+    local -a candidates
+
+    if (( CURRENT == 2 )); then
+        candidates=(continuous playback on-demand status logs stop help --help)
+        compadd -- "${candidates[@]}"
+        return
+    fi
+
+    workflow="${words[2]}"
+    previous_word="${words[CURRENT-1]}"
+    case "$workflow" in
+        playback)
+            candidates=(--event-id --list)
+            ;;
+        on-demand)
+            if [[ "$previous_word" == "--verbosity" ]]; then
+                candidates=(DEBUG INFO WARNING ERROR CRITICAL)
+            else
+                candidates=(--event-id --test --verbosity)
+            fi
+            ;;
+        *)
+            candidates=()
+            ;;
+    esac
+    compadd -- "${candidates[@]}"
+}
+
+compdef _pyfinder pyfinder
