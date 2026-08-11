@@ -16,7 +16,7 @@ authors = [
 dependencies = [
   "geopandas",
   "numpy",
-  "paramws-clients==0.1.0",
+  "paramws-clients",
   "shapely",
   "tornado",
 ]

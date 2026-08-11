@@ -98,7 +98,10 @@ class DockerfileRequirementsTests(unittest.TestCase):
 
     def test_python_312_is_checksum_built_without_a_python_39_path(self):
         normalized = self.contents.lower()
-        self.assertIn("arg python_version=3.12.13", normalized)
+        self.assertRegex(
+            normalized,
+            r"(?m)^arg python_version=3\.12\.[0-9]+$",
+        )
         self.assertRegex(
             normalized,
             r"python_source_sha256=[0-9a-f]{64}",
@@ -118,6 +121,10 @@ class DockerfileRequirementsTests(unittest.TestCase):
         self.assertIn("git -c /build/paramws-clients rev-parse head", normalized)
         self.assertIn("python3.12 -m pip wheel", normalized)
         self.assertIn("python3.12 -m pip install", normalized)
+        self.assertRegex(normalized, r"(?m)^\s*pyfinder\s*\\?$")
+        self.assertRegex(normalized, r"(?m)^\s*paramws-clients\s*\\?$")
+        self.assertNotIn("pyfinder==", normalized)
+        self.assertNotIn("paramws-clients==", normalized)
         self.assertNotIn("--editable", normalized)
         self.assertNotRegex(
             normalized,
@@ -127,7 +134,7 @@ class DockerfileRequirementsTests(unittest.TestCase):
         self.assertIn("site-packages", normalized)
         self.assertIn("build-info.json", normalized)
 
-    def test_final_runtime_identity_and_command_boundary_are_fixed(self):
+    def test_final_image_uses_user_1000_entrypoint_and_continuous_command(self):
         self.assertIn("USER 1000:1000", self.lines)
         self.assertIn(
             'ENTRYPOINT ["/usr/local/bin/pyfinder-entrypoint"]',

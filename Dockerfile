@@ -107,8 +107,8 @@ python3.12 -m pip install \
     --no-cache-dir \
     --no-index \
     --find-links /tmp/wheelhouse \
-    pyfinder==1.0.0 \
-    paramws-clients==0.1.0
+    pyfinder \
+    paramws-clients
 mkdir -p /usr/local/share/pyfinder
 
 # ParamWS configures its file handler when imported. This temporary safe path

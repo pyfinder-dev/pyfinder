@@ -1,4 +1,4 @@
-"""Artifact and command-boundary tests for normal PyFinder installation."""
+"""Artifact and installed-command tests for normal PyFinder installation."""
 
 import configparser
 from contextlib import redirect_stderr, redirect_stdout
@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-from pyfinder import cli
+from pyfinder import __version__, cli
 from pyfinder.finderconfigs import profiles
 
 
@@ -202,14 +202,14 @@ threading.Thread.start = reject_operation
 
     def test_distribution_metadata_and_console_entry_point(self):
         self.assertEqual(self.metadata["Name"], "pyfinder")
-        self.assertEqual(self.metadata["Version"], "1.0.0")
+        self.assertEqual(self.metadata["Version"], __version__)
         self.assertEqual(self.metadata["Requires-Python"], ">=3.12")
         self.assertEqual(
             set(self.metadata.get_all("Requires-Dist", [])),
             {
                 "geopandas",
                 "numpy",
-                "paramws-clients==0.1.0",
+                "paramws-clients",
                 "shapely",
                 "tornado",
             },
@@ -231,7 +231,7 @@ threading.Thread.start = reject_operation
                 }
                 self.assertEqual(packaged, expected)
 
-    def test_wheel_excludes_downstream_secret_and_development_artifacts(self):
+    def test_wheel_excludes_secrets_and_development_artifacts(self):
         forbidden_fragments = (
             "/.agent/",
             "/.git/",
