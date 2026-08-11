@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 import fcntl
 import logging
+import math
+from numbers import Real
 import os
 import subprocess
 import sys
@@ -29,6 +31,62 @@ from pyfinder.workspace import select_workspace_path
 
 class FinDerExecutable(object):
     """ Class for executing the FinDer executable. """
+
+    @staticmethod
+    def _resolve_live_mode(value):
+        """Return the configured FinDer mode without accepting truthy values."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized_value = value.lower()
+            if normalized_value == "yes":
+                return True
+            if normalized_value == "no":
+                return False
+        raise ValueError(
+            "finder-executable.finder-live-mode must be a Boolean or the "
+            "case-insensitive string 'yes' or 'no'"
+        )
+
+    @staticmethod
+    def _resolve_felt_report_component_code(value):
+        """Return one ASCII uppercase alphanumeric SNCL component."""
+        if (
+            isinstance(value, str)
+            and value
+            and value.isascii()
+            and value.isalnum()
+            and value == value.upper()
+        ):
+            return value
+        raise ValueError(
+            "finder-executable.felt-report-component-code must be a nonempty "
+            "ASCII uppercase alphanumeric SNCL component without dots, "
+            "whitespace, path separators, or control characters"
+        )
+
+    @staticmethod
+    def _resolve_artificial_point_margin_percent(value):
+        """Return a finite nonnegative percentage as a float."""
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(
+                "finder-executable.artificial-point-margin-percent must be a "
+                "real number, not a Boolean"
+            )
+        try:
+            normalized_value = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "finder-executable.artificial-point-margin-percent must be a "
+                "finite real number"
+            ) from exc
+        if not math.isfinite(normalized_value) or normalized_value < 0:
+            raise ValueError(
+                "finder-executable.artificial-point-margin-percent must be "
+                "finite and greater than or equal to zero"
+            )
+        return normalized_value
+
     def __init__(
         self,
         options: dict,
@@ -64,8 +122,55 @@ class FinDerExecutable(object):
         self.finder_configuration_name = finder_configuration_name
         self.finder_configuration = execution_configuration
 
-        # User-defined configuration
-        self.configuration: dict = configuration
+        if not isinstance(configuration, Mapping):
+            raise ValueError("application configuration must be a mapping")
+        try:
+            execution_application_configuration = deepcopy(configuration)
+        except Exception as exc:
+            raise ValueError(
+                "application configuration cannot be isolated for execution"
+            ) from exc
+
+        finder_executable_configuration = (
+            execution_application_configuration.get("finder-executable")
+        )
+        if not isinstance(finder_executable_configuration, Mapping):
+            raise ValueError(
+                "application setting finder-executable must be a mapping"
+            )
+        required_settings = (
+            "finder-live-mode",
+            "felt-report-component-code",
+            "artificial-point-margin-percent",
+        )
+        for setting_name in required_settings:
+            if setting_name not in finder_executable_configuration:
+                raise ValueError(
+                    "application setting finder-executable.{} is required".format(
+                        setting_name
+                    )
+                )
+
+        # One private snapshot supplies every decision for this invocation,
+        # even if a caller later changes or reloads its own configuration.
+        self.configuration: dict = execution_application_configuration
+        self.is_live_mode = self._resolve_live_mode(
+            finder_executable_configuration["finder-live-mode"]
+        )
+        self.felt_report_component_code = (
+            self._resolve_felt_report_component_code(
+                finder_executable_configuration[
+                    "felt-report-component-code"
+                ]
+            )
+        )
+        self.artificial_point_margin_percent = (
+            self._resolve_artificial_point_margin_percent(
+                finder_executable_configuration[
+                    "artificial-point-margin-percent"
+                ]
+            )
+        )
 
         # Path to the FinDer executable
         self.executable_path: str = self.configuration["finder-executable"]["path"]
@@ -357,22 +462,13 @@ class FinDerExecutable(object):
 
 
     def _is_live_mode_on(self):
-        """ Checks if the live mode is enabled. """
-        is_live_mode = self.configuration["finder-executable"]["finder-live-mode"]
-        if isinstance(is_live_mode, str): 
-            if is_live_mode.lower() == "yes":
-                is_live_mode = True
-            elif is_live_mode.lower() == "no":
-                is_live_mode = False
-            else:
-                is_live_mode = bool(is_live_mode)
-            
-        if is_live_mode:
+        """Report the live-mode decision resolved for this invocation."""
+        if self.is_live_mode:
             self.logger.info("FinDer live mode is enabled.")
         else:
             self.logger.info("FinDer live mode is disabled.")
     
-        return is_live_mode
+        return self.is_live_mode
     
     def _process_finder_output(self, stdout, stderr):
         """ Process the FinDer output for the Event_ID and log everything. """

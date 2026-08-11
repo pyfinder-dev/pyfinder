@@ -133,6 +133,14 @@ pyfinderconfig = {
         # data_ file will contain the lat/lon, station code, a time stamp, 
         # and the PGA (not log10).
         "finder-live-mode": False,
+
+        # HNZ is the known FinDer-recognized component used when felt reports
+        # receive a synthetic SNCL for input materialization.
+        "felt-report-component-code": "HNZ",
+
+        # This percentage is applied while observed amplitudes remain in the
+        # linear cm/s² domain when the artificial point is calculated.
+        "artificial-point-margin-percent": 1.0,
     }
 }
 
