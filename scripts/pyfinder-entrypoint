@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly REQUIRED_UID="1000"
+readonly REQUIRED_GID="1000"
+readonly RUNTIME_ROOT="/home/sysop/runtime"
+readonly REQUIRED_DIRECTORIES=(
+    "/home/sysop/runtime/pyfinder"
+    "/home/sysop/runtime/pyfinder/state"
+    "/home/sysop/runtime/pyfinder/logs"
+    "/home/sysop/runtime/pyfinder/runs"
+    "/home/sysop/runtime/pyfinder/playbacks"
+)
+
+observed_ownership() {
+    local path="$1"
+
+    if [[ ! -e "$path" ]]; then
+        printf 'path does not exist'
+        return
+    fi
+    stat --format='%U:%G (%u:%g)' "$path" 2>/dev/null \
+        || printf 'unavailable'
+}
+
+fail_path() {
+    local path="$1"
+    local reason="$2"
+
+    printf '%s\n' \
+        "pyfinder-entrypoint: ${reason}: ${path}" \
+        "  observed ownership: $(observed_ownership "$path")" \
+        "  required runtime identity: ${REQUIRED_UID}:${REQUIRED_GID}" \
+        "  host correction: correct the host path so it exists and is writable by UID/GID ${REQUIRED_UID}:${REQUIRED_GID}, then start PyFinder again" \
+        >&2
+    exit 1
+}
+
+actual_uid="$(id -u)"
+actual_gid="$(id -g)"
+if [[ "$actual_uid" != "$REQUIRED_UID" || "$actual_gid" != "$REQUIRED_GID" ]]; then
+    printf 'pyfinder-entrypoint: runtime identity is %s:%s; required runtime identity: %s:%s\n' \
+        "$actual_uid" "$actual_gid" "$REQUIRED_UID" "$REQUIRED_GID" >&2
+    exit 1
+fi
+
+# The mount and directories are checked, not created or repaired. Their host
+# ownership is an operator concern, and a permission failure must stop startup
+# instead of redirecting persistent work into the image layer.
+probe_path=""
+cleanup_probe() {
+    if [[ -n "$probe_path" && -e "$probe_path" ]]; then
+        rm -f -- "$probe_path"
+    fi
+}
+trap cleanup_probe EXIT
+# Docker may stop the container while these checks are running. Clean up and
+# honor that stop instead of continuing into PyFinder.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if ! mountpoint -q "$RUNTIME_ROOT"; then
+    fail_path "$RUNTIME_ROOT" "required runtime mount is absent"
+fi
+
+for directory in "${REQUIRED_DIRECTORIES[@]}"; do
+    if [[ ! -d "$directory" ]]; then
+        fail_path "$directory" "required runtime directory is absent"
+    fi
+    if ! probe_path="$(mktemp "${directory}/.pyfinder-write-probe.XXXXXX")"; then
+        probe_path=""
+        fail_path "$directory" "required runtime directory is not writable"
+    fi
+    if ! rm -f -- "$probe_path"; then
+        fail_path "$directory" "write probe could not be removed"
+    fi
+    probe_path=""
+done
+
+trap - EXIT HUP INT TERM
+
+# Replace the shell so signals and exit status belong directly to PyFinder.
+exec pyfinder "$@"

@@ -134,8 +134,8 @@ check_container_compatibility() {
     if [[ "$configured_user" != "$CONTAINER_USER" ]]; then
         fail "incompatible ${CONTAINER_NAME}: user is '${configured_user}', expected '${CONTAINER_USER}'"
     fi
-    if [[ "$configured_entrypoint" != '["pyfinder"]' ]]; then
-        fail "incompatible ${CONTAINER_NAME}: entrypoint is '${configured_entrypoint}', expected '[\"pyfinder\"]'"
+    if [[ "$configured_entrypoint" != '["/usr/local/bin/pyfinder-entrypoint"]' ]]; then
+        fail "incompatible ${CONTAINER_NAME}: entrypoint is '${configured_entrypoint}', expected '[\"/usr/local/bin/pyfinder-entrypoint\"]'"
     fi
     if [[ "$configured_command" != '["continuous"]' ]]; then
         fail "incompatible ${CONTAINER_NAME}: command is '${configured_command}', expected '[\"continuous\"]'"

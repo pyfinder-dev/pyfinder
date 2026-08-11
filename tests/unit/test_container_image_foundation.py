@@ -1,12 +1,16 @@
 """Host-side requirements for the buildable PyFinder image foundation."""
 
+import os
 from pathlib import Path, PurePosixPath
+import subprocess
+import tempfile
 import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = PROJECT_ROOT / "Dockerfile"
 DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
+ENTRYPOINT = PROJECT_ROOT / "scripts/pyfinder-entrypoint"
 BASE_IMAGE = "ghcr.io/sceylan/finder-base:gmt5"
 RESOURCE_DIRECTORIES = (
     Path("pyfinder/extern/finder_regional_wkt"),
@@ -51,7 +55,13 @@ def _repository_files():
 
 
 def _expected_context_files():
-    expected = {"Dockerfile", "pyproject.toml", "README.md", "LICENSE"}
+    expected = {
+        "Dockerfile",
+        "pyproject.toml",
+        "README.md",
+        "LICENSE",
+        "scripts/pyfinder-entrypoint",
+    }
     expected.update(
         path.relative_to(PROJECT_ROOT).as_posix()
         for path in (PROJECT_ROOT / "pyfinder").rglob("*.py")
@@ -76,7 +86,9 @@ class DockerfileRequirementsTests(unittest.TestCase):
 
     def test_every_stage_and_the_final_image_use_the_mandatory_base(self):
         from_lines = [
-            line for line in self.lines if line.upper().startswith("FROM ")
+            line.strip()
+            for line in self.contents.splitlines()
+            if line.startswith("FROM ")
         ]
         self.assertEqual(len(from_lines), 2)
         self.assertTrue(
@@ -117,8 +129,26 @@ class DockerfileRequirementsTests(unittest.TestCase):
 
     def test_final_runtime_identity_and_command_boundary_are_fixed(self):
         self.assertIn("USER 1000:1000", self.lines)
-        self.assertIn('ENTRYPOINT ["pyfinder"]', self.lines)
+        self.assertIn(
+            'ENTRYPOINT ["/usr/local/bin/pyfinder-entrypoint"]',
+            self.lines,
+        )
         self.assertIn('CMD ["continuous"]', self.lines)
+
+    def test_base_digest_is_required_and_used_for_label_and_build_information(self):
+        normalized = self.contents.lower()
+        self.assertIn("arg pyfinder_base_digest", normalized)
+        self.assertNotRegex(normalized, r"arg pyfinder_base_digest\s*=")
+        self.assertIn(
+            'io.pyfinder.base.digest="${pyfinder_base_digest}"',
+            normalized,
+        )
+        self.assertIn(
+            '"base_digest": os.environ["pyfinder_base_digest"]',
+            normalized,
+        )
+        self.assertIn('[ -z "${pyfinder_base_digest}" ]', normalized)
+        self.assertIn("platform.freedesktop_os_release()", normalized)
 
     def test_build_checks_cover_durable_installed_image_requirements(self):
         normalized = self.contents.lower()
@@ -135,10 +165,109 @@ class DockerfileRequirementsTests(unittest.TestCase):
             "paramws-commit",
             "distribution_origin",
             "module_origin",
+            "paramws_log_file=/tmp/pyfinder-build-paramws.log",
+            "from paramws.clients import",
+            "from paramws.utils import customlogger",
+            "from pyfinder import cli, finderexec, findermanager, runtime",
+            "import geopandas",
+            "import shapely",
+            "import tornado",
         )
         for fragment in required_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, normalized)
+
+
+class EntrypointRequirementsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.contents = ENTRYPOINT.read_text(encoding="utf-8")
+
+    def test_entrypoint_requires_identity_mount_and_exact_runtime_directories(self):
+        required_fragments = (
+            "id -u",
+            "id -g",
+            "mountpoint -q",
+            "/home/sysop/runtime",
+            "/home/sysop/runtime/pyfinder/state",
+            "/home/sysop/runtime/pyfinder/logs",
+            "/home/sysop/runtime/pyfinder/runs",
+            "/home/sysop/runtime/pyfinder/playbacks",
+            "mktemp",
+            'readonly REQUIRED_UID="1000"',
+            'readonly REQUIRED_GID="1000"',
+            "required runtime identity:",
+            "observed ownership:",
+            "correct the host path",
+            'exec pyfinder "$@"',
+        )
+        for fragment in required_fragments:
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, self.contents)
+
+    def test_entrypoint_does_not_repair_or_fallback(self):
+        normalized = self.contents.lower()
+        for forbidden in ("chown", "chmod", "mkdir", "/home/sysop/pyfinder"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, normalized)
+
+    def test_term_during_mount_check_stops_before_later_validation(self):
+        with tempfile.TemporaryDirectory(
+            prefix="pyfinder-entrypoint-signal-"
+        ) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            fake_bin = temporary_root / "bin"
+            record_file = temporary_root / "commands.log"
+            pyfinder_record = temporary_root / "pyfinder-reached"
+            fake_bin.mkdir()
+
+            fake_commands = {
+                "id": """#!/bin/bash
+case "${1:-}" in
+    -u|-g) printf '1000\\n' ;;
+    *) exit 2 ;;
+esac
+""",
+                "mountpoint": """#!/bin/bash
+printf 'mountpoint\\n' >> "${FAKE_RECORD_FILE:?}"
+kill -TERM "$PPID"
+exit 0
+""",
+                "pyfinder": """#!/bin/bash
+printf 'reached\\n' > "${FAKE_PYFINDER_RECORD:?}"
+""",
+            }
+            for name, contents in fake_commands.items():
+                path = fake_bin / name
+                path.write_text(contents, encoding="utf-8")
+                path.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": os.pathsep.join(
+                        (str(fake_bin), environment["PATH"])
+                    ),
+                    "FAKE_RECORD_FILE": str(record_file),
+                    "FAKE_PYFINDER_RECORD": str(pyfinder_record),
+                }
+            )
+            result = subprocess.run(
+                [str(ENTRYPOINT), "continuous"],
+                cwd=temporary_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 143, result.stderr)
+            self.assertEqual(
+                record_file.read_text(encoding="utf-8").splitlines(),
+                ["mountpoint"],
+            )
+            self.assertFalse(pyfinder_record.exists())
+            self.assertNotIn("required runtime directory", result.stderr)
 
 
 class EffectiveBuildContextTests(unittest.TestCase):
@@ -191,6 +320,9 @@ class EffectiveBuildContextTests(unittest.TestCase):
     def test_deny_all_rule_precedes_each_explicit_source_exception(self):
         self.assertEqual(self.rules[0], "**")
         self.assertTrue(any(rule == "!Dockerfile" for rule in self.rules))
+        self.assertTrue(
+            any(rule == "!scripts/pyfinder-entrypoint" for rule in self.rules)
+        )
         self.assertTrue(
             any(
                 rule == "!pyfinder/extern/finder_regional_wkt/**"

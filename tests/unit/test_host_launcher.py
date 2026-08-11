@@ -28,8 +28,6 @@ EXPECTED_MOUNT = "bind|{0}|{1}|true".format(
     RUNTIME_ROOT,
     CONTAINER_RUNTIME,
 )
-
-
 FAKE_DOCKER = r'''#!/bin/bash
 set -eu
 
@@ -70,7 +68,7 @@ if [[ "${1:-}" == "container" && "${2:-}" == "inspect" ]]; then
                 "${FAKE_CONFIG_IMAGE:-pyfinder:dev}" \
                 "${FAKE_CONTAINER_IMAGE_ID:-sha256:current}" \
                 "${FAKE_CONFIG_USER:-1000:1000}" \
-                "${FAKE_ENTRYPOINT:-[\"pyfinder\"]}" \
+                "${FAKE_ENTRYPOINT:-[\"/usr/local/bin/pyfinder-entrypoint\"]}" \
                 "${FAKE_COMMAND:-[\"continuous\"]}" \
                 "$running"
             ;;

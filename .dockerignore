@@ -8,6 +8,9 @@
 !README.md
 !LICENSE
 
+!scripts/
+!scripts/pyfinder-entrypoint
+
 !pyfinder/
 !pyfinder/*.py
 !pyfinder/finderconfigs/
