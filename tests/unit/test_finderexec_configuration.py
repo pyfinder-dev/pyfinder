@@ -176,7 +176,6 @@ class FinDerExecutableConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(executable.executable_path, "/not-executed/finder_run")
         self.assertIs(executable.is_live_mode, True)
-        self.assertEqual(executable.felt_report_component_code, "HG2")
         self.assertEqual(executable.artificial_point_margin_percent, 2.0)
 
     def test_supported_live_mode_values_are_resolved_once(self):
@@ -227,42 +226,28 @@ class FinDerExecutableConfigurationTests(unittest.TestCase):
                     "finder-executable.finder-live-mode",
                 )
 
-    def test_valid_felt_components_are_preserved_exactly(self):
-        for configured_value in ("HNZ", "HG2"):
-            with self.subTest(configured_value=configured_value):
-                executable = self.construct_executable(
-                    "global",
-                    {"DATA_FOLDER": "source-data"},
-                    self.application_configuration(
-                        felt_component=configured_value
-                    ),
-                )
+    def test_felt_component_is_not_required_by_the_executable(self):
+        application_configuration = self.application_configuration()
+        del application_configuration["finder-executable"][
+            "felt-report-component-code"
+        ]
 
-                self.assertEqual(
-                    executable.felt_report_component_code,
-                    configured_value,
-                )
-
-    def test_invalid_felt_component_categories_fail_visibly(self):
-        invalid_values = (
-            ("empty", ""),
-            ("dot", "HN.Z"),
-            ("whitespace", "HN Z"),
-            ("forward path separator", "HN/Z"),
-            ("backward path separator", "HN\\Z"),
-            ("control character", "HN\nZ"),
-            ("lowercase", "hnz"),
-            ("non-ASCII", "HÑZ"),
-            ("nonstr", 123),
+        executable = self.construct_executable(
+            "global",
+            {"DATA_FOLDER": "source-data"},
+            application_configuration,
         )
-        for label, configured_value in invalid_values:
-            with self.subTest(label=label):
-                self.assert_application_configuration_rejected(
-                    self.application_configuration(
-                        felt_component=configured_value
-                    ),
-                    "finder-executable.felt-report-component-code",
-                )
+
+        self.assertFalse(hasattr(executable, "felt_report_component_code"))
+
+    def test_felt_component_is_not_validated_or_stored_by_the_executable(self):
+        executable = self.construct_executable(
+            "global",
+            {"DATA_FOLDER": "source-data"},
+            self.application_configuration(felt_component="invalid.value"),
+        )
+
+        self.assertFalse(hasattr(executable, "felt_report_component_code"))
 
     def test_valid_artificial_margins_are_normalized_to_float(self):
         for configured_value, expected in ((0, 0.0), (3, 3.0), (2.75, 2.75)):
@@ -453,10 +438,6 @@ class FinDerExecutableConfigurationTests(unittest.TestCase):
         base = self.application_configuration()
         missing_live_mode = deepcopy(base)
         del missing_live_mode["finder-executable"]["finder-live-mode"]
-        missing_component = deepcopy(base)
-        del missing_component["finder-executable"][
-            "felt-report-component-code"
-        ]
         missing_margin = deepcopy(base)
         del missing_margin["finder-executable"][
             "artificial-point-margin-percent"
@@ -473,7 +454,6 @@ class FinDerExecutableConfigurationTests(unittest.TestCase):
                 "finder-executable must be a mapping",
             ),
             (missing_live_mode, "finder-live-mode is required"),
-            (missing_component, "felt-report-component-code is required"),
             (
                 missing_margin,
                 "artificial-point-margin-percent is required",

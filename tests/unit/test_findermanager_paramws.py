@@ -22,10 +22,7 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
     from paramws.clients import (
-        PeakMotionChannelData,
         PeakMotionData,
-        PeakMotionStationData,
-        ShakeMapEventData,
         ShakeMapStationAmplitudes,
     )
     from pyfinder import finderexec, findermanager
@@ -246,12 +243,29 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
             "exception",
         )
 
-    def test_normalizers_use_the_public_paramws_model_classes(self):
-        self.assertIs(dataformatter.PeakMotionData, PeakMotionData)
-        self.assertIs(dataformatter.ShakeMapEventData, ShakeMapEventData)
-        self.assertIs(
-            dataformatter.ShakeMapStationAmplitudes,
-            ShakeMapStationAmplitudes,
+    def test_service_normalizers_accept_public_paramws_models(self):
+        event_data = _EventModel("common")
+        peak_motion = PeakMotionData(data_dict={})
+        station_amplitudes = ShakeMapStationAmplitudes(
+            data_dict={"stations": []},
+        )
+
+        rrsm_formatter = dataformatter.RRSMPeakMotionDataFormatter(
+            logger=Mock(),
+            configuration=self._manager().configuration,
+        )
+        esm_formatter = dataformatter.ESMShakeMapDataFormatter(
+            logger=Mock(),
+            configuration=self._manager().configuration,
+        )
+
+        self.assertEqual(
+            rrsm_formatter.extract_raw_stations(event_data, peak_motion),
+            [],
+        )
+        self.assertEqual(
+            esm_formatter.extract_raw_stations(event_data, station_amplitudes),
+            [],
         )
 
     def test_finder_executable_does_not_import_provider_models(self):

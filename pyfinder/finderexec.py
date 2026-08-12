@@ -45,23 +45,6 @@ class FinDerExecutable(object):
         )
 
     @staticmethod
-    def _resolve_felt_report_component_code(value):
-        """Return one ASCII uppercase alphanumeric SNCL component."""
-        if (
-            isinstance(value, str)
-            and value
-            and value.isascii()
-            and value.isalnum()
-            and value == value.upper()
-        ):
-            return value
-        raise ValueError(
-            "finder-executable.felt-report-component-code must be a nonempty "
-            "ASCII uppercase alphanumeric SNCL component without dots, "
-            "whitespace, path separators, or control characters"
-        )
-
-    @staticmethod
     def _resolve_artificial_point_margin_percent(value):
         """Return a finite nonnegative percentage as a float."""
         if isinstance(value, bool) or not isinstance(value, Real):
@@ -136,7 +119,6 @@ class FinDerExecutable(object):
             )
         required_settings = (
             "finder-live-mode",
-            "felt-report-component-code",
             "artificial-point-margin-percent",
         )
         for setting_name in required_settings:
@@ -152,13 +134,6 @@ class FinDerExecutable(object):
         self.configuration: dict = execution_application_configuration
         self.is_live_mode = self._resolve_live_mode(
             finder_executable_configuration["finder-live-mode"]
-        )
-        self.felt_report_component_code = (
-            self._resolve_felt_report_component_code(
-                finder_executable_configuration[
-                    "felt-report-component-code"
-                ]
-            )
         )
         self.artificial_point_margin_percent = (
             self._resolve_artificial_point_margin_percent(

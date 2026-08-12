@@ -255,8 +255,6 @@ class ProviderCollectionTests(unittest.TestCase):
         ) as handoff, mock.patch.object(
             findermanager, "StationMerger"
         ) as merger_type, mock.patch.object(
-            findermanager.FinDerFormatterFromRawList, "format"
-        ) as artificial_point_format, mock.patch.object(
             finderexec, "FinDerExecutable"
         ) as executable_type:
             felt_type.return_value.query.return_value = (
@@ -295,7 +293,6 @@ class ProviderCollectionTests(unittest.TestCase):
             logger=manager.logger,
         )
         merger_type.return_value.merge.assert_called_once_with(mapping)
-        artificial_point_format.assert_not_called()
         executable_type.return_value.execute.assert_called_once_with(
             event_data=manager.event_context,
             amplitudes=felt_records,

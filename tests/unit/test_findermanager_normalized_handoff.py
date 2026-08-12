@@ -131,18 +131,6 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
                 "extract_raw_stations",
                 return_value=esm_records,
             ))
-            rrsm_direct_format = stack.enter_context(patch.object(
-                findermanager.RRSMPeakMotionDataFormatter,
-                "format_data",
-            ))
-            esm_direct_format = stack.enter_context(patch.object(
-                findermanager.ESMShakeMapDataFormatter,
-                "format_data",
-            ))
-            artificial_point_format = stack.enter_context(patch.object(
-                findermanager.FinDerFormatterFromRawList,
-                "format",
-            ))
             merger_type = stack.enter_context(patch.object(
                 findermanager, "StationMerger"))
             priority_resolver = stack.enter_context(patch.object(
@@ -190,9 +178,6 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             "result": result,
             "rrsm_extract": rrsm_extract,
             "esm_extract": esm_extract,
-            "rrsm_direct_format": rrsm_direct_format,
-            "esm_direct_format": esm_direct_format,
-            "artificial_point_format": artificial_point_format,
             "merger_type": merger_type,
             "priority_resolver": priority_resolver,
             "context_selector": context_selector,
@@ -389,9 +374,6 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
         observed["merger_type"].assert_not_called()
         observed["executable_type"].assert_not_called()
         observed["executable"].execute.assert_not_called()
-        observed["esm_direct_format"].assert_not_called()
-        observed["rrsm_direct_format"].assert_not_called()
-        observed["artificial_point_format"].assert_not_called()
         outcomes = observed["manager"].metadata["provider_outcomes"]
         self.assertEqual(
             set(outcomes),

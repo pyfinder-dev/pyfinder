@@ -40,9 +40,7 @@ from pyfinder.finderutils import (FinderChannelList, FinderSolution)
 from pyfinder.utils.dataformatter import (
     EMSCFeltReportDataFormatter,
     ESMShakeMapDataFormatter,
-    FinDerFormatterFromRawList,
     RRSMPeakMotionDataFormatter,
-    get_epoch_time,
 )
 from pyfinder.utils.station_merger import StationMerger
 from pyfinder.workspace import build_augmented_event_id
