@@ -840,19 +840,13 @@ class FinDerWorkspaceTests(unittest.TestCase):
             any("cannot open event log" in message for message in failure_messages)
         )
 
-    def test_execute_preserves_rrsm_nested_event_identity(self):
+    def test_execute_uses_the_supplied_common_event_identity(self):
         executable = self.executable(self.temporary_root / "runs")
-        peak_motion = finderexec.PeakMotionData(data_dict={})
-        nested_event = mock.Mock()
-        nested_event.get_event_id.return_value = "rrsm-event"
-        peak_motion.set_event_data(nested_event)
-        supplied_event = mock.Mock(name="supplied_event")
+        observations = []
+        supplied_event = mock.Mock(name="supplied_common_event")
+        supplied_event.get_event_id.return_value = "common-event"
 
         with mock.patch.object(
-            peak_motion,
-            "get_event_data",
-            wraps=peak_motion.get_event_data,
-        ) as get_event_data, mock.patch.object(
             executable,
             "_check_finder_executable",
         ), mock.patch.object(
@@ -870,57 +864,32 @@ class FinDerWorkspaceTests(unittest.TestCase):
             "_collect_finder_output",
         ) as collect_output:
             executable.execute(
-                amplitudes=peak_motion,
+                amplitudes=observations,
                 event_data=supplied_event,
-                augmented_event_id="rrsm-event_t00010",
+                augmented_event_id="common-event_t00010",
             )
 
-        get_event_data.assert_called_once_with()
         write_data.assert_called_once_with(
-            peak_motion,
-            nested_event,
+            observations,
+            supplied_event,
         )
-        collect_output.assert_called_once_with(event_id="rrsm-event")
-        supplied_event.get_event_id.assert_not_called()
+        collect_output.assert_called_once_with(event_id="common-event")
+        supplied_event.get_event_id.assert_called_once_with()
 
-    def test_input_materialization_preserves_rrsm_formatter_event_behavior(self):
+    def test_data_writer_rejects_non_list_observations(self):
         executable = self.executable(self.temporary_root / "runs")
-        peak_motion = finderexec.PeakMotionData(data_dict={})
-        supplied_event = mock.Mock(name="supplied_event")
-        channels = finderexec.FinderChannelList()
+        workspace = self.temporary_root / "runs" / "event-one_t00010"
+        workspace.mkdir(parents=True)
+        executable.working_directory = str(workspace)
 
-        with mock.patch.object(
-            finderexec,
-            "RRSMPeakMotionDataFormatter",
-        ) as formatter_type, mock.patch.object(
-            executable,
-            "_check_finder_executable",
-        ) as check_executable, mock.patch.object(
-            executable,
-            "_run_finder",
-        ) as run_finder:
-            formatter_type.return_value.format_data.return_value = (
-                b"existing-rrsm-data",
-                channels,
-            )
-            _config_path, data_path = executable.materialize_inputs(
-                peak_motion,
-                supplied_event,
-                augmented_event_id="rrsm-event_t00010",
+        with self.assertRaisesRegex(
+                TypeError, "requires merged normalized observations"):
+            executable._write_data_for_finder(
+                object(),
+                mock.Mock(name="supplied_common_event"),
             )
 
-        formatter_type.assert_called_once()
-        formatter_logger = formatter_type.call_args.kwargs["logger"]
-        self.assertIsNot(formatter_logger, executable.logger)
-        self.assertEqual(formatter_logger.handlers, [])
-        formatter_type.return_value.format_data.assert_called_once_with(
-            amplitudes=peak_motion,
-            event_data=peak_motion,
-        )
-        self.assertEqual(Path(data_path).read_bytes(), b"existing-rrsm-data")
-        self.assertIs(executable.get_finder_used_channels(), channels)
-        check_executable.assert_not_called()
-        run_finder.assert_not_called()
+        self.assertFalse((workspace / "data_0").exists())
 
     def test_output_lookup_uses_only_the_returned_finder_identifier(self):
         executable = self.executable(self.temporary_root / "runs")

@@ -246,18 +246,17 @@ class FinDerManagerParamWSBoundaryTests(unittest.TestCase):
             "exception",
         )
 
-    def test_paramws_models_are_the_public_exported_class_objects(self):
+    def test_normalizers_use_the_public_paramws_model_classes(self):
         self.assertIs(dataformatter.PeakMotionData, PeakMotionData)
         self.assertIs(dataformatter.ShakeMapEventData, ShakeMapEventData)
         self.assertIs(
             dataformatter.ShakeMapStationAmplitudes,
             ShakeMapStationAmplitudes,
         )
-        self.assertIs(finderexec.PeakMotionData, PeakMotionData)
-        self.assertIs(
-            finderexec.ShakeMapStationAmplitudes,
-            ShakeMapStationAmplitudes,
-        )
+
+    def test_finder_executable_does_not_import_provider_models(self):
+        self.assertFalse(hasattr(finderexec, "PeakMotionData"))
+        self.assertFalse(hasattr(finderexec, "ShakeMapStationAmplitudes"))
 
     def test_package_import_is_offline_and_has_no_operational_side_effects(self):
         repository_root = Path(__file__).resolve().parents[2]

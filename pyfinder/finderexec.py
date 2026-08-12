@@ -12,19 +12,15 @@ import os
 import subprocess
 import sys
 import json
-from typing import List
 from datetime import datetime
 from pyfinder.utils import customlogger
-from paramws.clients import PeakMotionData, ShakeMapStationAmplitudes
 from pyfinder.finderutils import (FinderChannelList, FinderChannel,
                                   FinderSolution, FinderRupture,
                                   FinderEvent)
 from pyfinder.finderutils import (read_event_solution_from_file,
                                   read_rupture_polygon_from_file,
                                   read_finder_channels_from_file)
-from pyfinder.utils.dataformatter import (RRSMPeakMotionDataFormatter,
-                                          ESMShakeMapDataFormatter,
-                                          FinDerFormatterFromRawList,
+from pyfinder.utils.dataformatter import (FinDerFormatterFromRawList,
                                           get_epoch_time)
 from pyfinder.utils.station_merger import RawStationMeasurement
 from pyfinder.workspace import select_workspace_path
@@ -416,42 +412,41 @@ class FinDerExecutable(object):
         if not os.access(self.executable_path, os.X_OK):
             raise PermissionError("The FinDer executable is not executable: {}".format(self.executable_path))
         
-    def _write_data_for_finder(self, amplitudes, event_data) -> tuple[str, FinderChannelList]:
-        """ Write the data to the working directory. """
+    def _write_data_for_finder(
+        self,
+        observations: list[RawStationMeasurement],
+        event_data,
+    ) -> tuple[str, FinderChannelList]:
+        """
+        Format merged normalized observations and write ``data_0``.
+        Per-service formatters have already normalized the observations into a common
+        RawStationMesurement list. This method formats that list into the FinDer input
+        format and writes it to the working directory. It returns the path to the
+        data file and the list of FinderChannel objects used by FinDer.
+        """
         data_file_path = os.path.join(self.working_directory, "data_0")
 
-        if isinstance(amplitudes, PeakMotionData):
-            # RRSM peak motion data contains the event data as well.
-            # Amplitudes and event data are the same for the RRSM peak motion service.
-            self.logger.info("FinDerExecutable received RRSM peak motion data. Formatting now...")
-
-            out_str, finder_stations = RRSMPeakMotionDataFormatter(
-                logger=self.logger).format_data(
-                    amplitudes=amplitudes, event_data=amplitudes)
-            
-            self.logger.info("FinDerExecutable formatted RRSM peak motion data.")
-            
-        elif isinstance(amplitudes, ShakeMapStationAmplitudes):
-            self.logger.info("FinDerExecutable received ESM ShakeMap data. Formatting now...")
-
-            out_str, finder_stations = ESMShakeMapDataFormatter(
-                logger=self.logger).format_data(
-                    amplitudes=amplitudes, event_data=event_data)
-            
-            self.logger.info("FinDerExecutable formatted ESM ShakeMap data.")
-            
-        elif isinstance(amplitudes, List) or isinstance(amplitudes, list):   
-            self.logger.info("Merged ESM+RRSM data has been passed to FinDerExecutable.")
-            # Format the merged data for FinDer   
-            out_str, finder_stations = FinDerFormatterFromRawList.format(
-                event_lat=event_data.get_latitude(),
-                event_lon=event_data.get_longitude(),
-                event_depth_km=event_data.get_depth(),
-                event_mag=event_data.get_magnitude(),
-                event_time_epoch=get_epoch_time(event_data.get_origin_time()),
-                station_list=amplitudes
+        if not isinstance(observations, list):
+            raise TypeError(
+                "FinDerExecutable requires merged normalized observations "
+                "as a list"
             )
-            self.logger.info("FinDerExecutable formatted merged ESM+RRSM data.")
+
+        self.logger.info(
+            "FinDerExecutable received merged normalized observations. "
+            "Formatting now..."
+        )
+        out_str, finder_stations = FinDerFormatterFromRawList.format(
+            event_lat=event_data.get_latitude(),
+            event_lon=event_data.get_longitude(),
+            event_depth_km=event_data.get_depth(),
+            event_mag=event_data.get_magnitude(),
+            event_time_epoch=get_epoch_time(event_data.get_origin_time()),
+            station_list=observations,
+        )
+        self.logger.info(
+            "FinDerExecutable formatted the merged normalized observations."
+        )
 
         # Write the data to the working directory
         with open(data_file_path, "wb") as data_file:
@@ -626,10 +621,6 @@ class FinDerExecutable(object):
         # Check if the executable exists
         self._check_finder_executable()
 
-        if isinstance(amplitudes, PeakMotionData):
-            # RRSM peak motion data contains the event information as well.
-            event_data = amplitudes.get_event_data()
-        
         # Get the event id to create the working directory
         event_id = event_data.get_event_id()
 
