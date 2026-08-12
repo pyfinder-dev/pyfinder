@@ -28,6 +28,76 @@ RRSM_PEAKMOTION_PGV_MAX = 1.0 # m/s
 RRSM_PEAKMOTION_PGV_BROADBAND_MIN = 0.000001
 RRSM_PEAKMOTION_PGV_BROADBAND_MAX = 0.013 # m/s
 
+
+_FELT_REPORT_STATION_CODE_PATTERNS = (
+    ("LDDD", 26 * 999),
+    ("DLDD", 10 * 26 * 99),
+    ("DDLD", 10 * 10 * 26 * 10),
+    ("DDDL", 10 * 10 * 10 * 26),
+    ("LLDD", 26 * 26 * 10 * 10),
+    ("LDLD", 26 * 10 * 26 * 10),
+    ("LDDL", 26 * 10 * 10 * 26),
+    ("DLLD", 10 * 26 * 26 * 10),
+    ("DLDL", 10 * 26 * 10 * 26),
+    ("DDLL", 10 * 10 * 26 * 26),
+    ("LLLD", 26 * 26 * 26 * 10),
+    ("LLDL", 26 * 26 * 10 * 26),
+    ("LDLL", 26 * 10 * 26 * 26),
+    ("DLLL", 10 * 26 * 26 * 26),
+)
+_FELT_REPORT_STATION_CODE_COUNT = sum(
+    pattern_size for _pattern, pattern_size
+    in _FELT_REPORT_STATION_CODE_PATTERNS
+)
+
+
+def _felt_report_station_code(index):
+    """Return the station code at one zero-based FeltReport sequence index."""
+    if isinstance(index, bool) or not isinstance(index, numbers.Integral):
+        raise TypeError("FeltReport station-code index must be an integer")
+    if index < 0 or index >= _FELT_REPORT_STATION_CODE_COUNT:
+        raise ValueError(
+            "FeltReport station-code namespace exhausted after "
+            f"{_FELT_REPORT_STATION_CODE_COUNT} retained reports"
+        )
+
+    remaining = int(index)
+    for pattern, pattern_size in _FELT_REPORT_STATION_CODE_PATTERNS:
+        if remaining >= pattern_size:
+            remaining -= pattern_size
+            continue
+
+        # The first two patterns omit an all-zero numerical suffix. Their
+        # unusual sequence gives identity to reports that have no provider
+        # station code while keeping every generated value four characters.
+        if pattern == "LDDD":
+            letter_index, numerical_suffix = divmod(remaining, 999)
+            return (
+                chr(ord("A") + letter_index)
+                + f"{numerical_suffix + 1:03d}"
+            )
+        if pattern == "DLDD":
+            prefix_index, numerical_suffix = divmod(remaining, 99)
+            digit_index, letter_index = divmod(prefix_index, 26)
+            return (
+                str(digit_index)
+                + chr(ord("A") + letter_index)
+                + f"{numerical_suffix + 1:02d}"
+            )
+
+        characters = [None] * len(pattern)
+        for position in range(len(pattern) - 1, -1, -1):
+            radix = 26 if pattern[position] == "L" else 10
+            remaining, value = divmod(remaining, radix)
+            characters[position] = (
+                chr(ord("A") + value)
+                if pattern[position] == "L"
+                else str(value)
+            )
+        return "".join(characters)
+
+    raise AssertionError("FeltReport station-code pattern table is incomplete")
+
 class FinDerFormatterFromRawList:
 
     @staticmethod
@@ -192,6 +262,36 @@ class BaseDataFormatter(object):
 class EMSCFeltReportDataFormatter(BaseDataFormatter):
     """Normalize one public EMSC felt-intensity event view."""
 
+    def __init__(self, logger=None, configuration=None):
+        super().__init__(logger=logger)
+        self.configuration = (
+            pyfinderconfig if configuration is None else configuration)
+
+    def _felt_report_component_code(self):
+        """Return the configured complete-SNCL component or fail visibly."""
+        try:
+            component_code = self.configuration["finder-executable"][
+                "felt-report-component-code"
+            ]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                "finder-executable.felt-report-component-code is required"
+            ) from error
+
+        if (
+            isinstance(component_code, str)
+            and component_code
+            and component_code.isascii()
+            and component_code.isalnum()
+            and component_code == component_code.upper()
+        ):
+            return component_code
+        raise ValueError(
+            "finder-executable.felt-report-component-code must be a nonempty "
+            "ASCII uppercase alphanumeric SNCL component without dots, "
+            "whitespace, path separators, or control characters"
+        )
+
     @staticmethod
     def _numeric_rejection_reason(value):
         """Describe why one provider value is not a finite real number."""
@@ -281,6 +381,7 @@ class EMSCFeltReportDataFormatter(BaseDataFormatter):
         Rows remain independent and in provider order. Dependency model access
         failures cross the explicit public-model boundary for orchestration.
         """
+        component_code = self._felt_report_component_code()
         event_identity = self._event_identity(event_data)
         event_latitude = event_data.get_latitude()
         event_longitude = event_data.get_longitude()
@@ -399,10 +500,10 @@ class EMSCFeltReportDataFormatter(BaseDataFormatter):
             raw_stations.append(RawStationMeasurement(
                 latitude=latitude,
                 longitude=longitude,
-                network="",
-                station="",
-                location="",
-                channel="",
+                network="FR",
+                station=_felt_report_station_code(len(raw_stations)),
+                location="00",
+                channel=component_code,
                 pga=pga_cm_s2,
                 timestamp=time_epoch,
                 source="EMSC",

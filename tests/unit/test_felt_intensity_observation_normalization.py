@@ -22,7 +22,9 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
     from paramws.clients import FeltReportEventData, FeltReportIntensityData
+    from pyfinder import findermanager
     from pyfinder.eventcontext import EventContext, ProviderModelAccessError
+    from pyfinder.pyfinderconfig import EMSC_FELT_REPORT_SERVICE
     from pyfinder.utils.calculator import Calculator
     from pyfinder.utils import dataformatter
     from pyfinder.utils.dataformatter import EMSCFeltReportDataFormatter
@@ -214,6 +216,70 @@ class AllenCalculatorTests(unittest.TestCase):
             float(log10_pga), (3.0 - 1.78) / 1.55, places=6)
 
 
+class FeltReportStationCodeTests(unittest.TestCase):
+    """Verify the accepted finite FeltReport identity namespace by index."""
+
+    def test_first_last_and_exact_namespace_exhaustion(self):
+        self.assertEqual(dataformatter._felt_report_station_code(0), "A001")
+        self.assertEqual(
+            dataformatter._felt_report_station_code(1_212_353),
+            "9ZZZ",
+        )
+        self.assertEqual(
+            dataformatter._FELT_REPORT_STATION_CODE_COUNT,
+            1_212_354,
+        )
+
+        with self.assertRaisesRegex(ValueError, "namespace exhausted"):
+            dataformatter._felt_report_station_code(1_212_354)
+
+    def test_every_pattern_transition_uses_the_accepted_sequence(self):
+        transitions = (
+            (25_973, "Z999", "0A01"),
+            (51_713, "9Z99", "00A0"),
+            (77_713, "99Z9", "000A"),
+            (103_713, "999Z", "AA00"),
+            (171_313, "ZZ99", "A0A0"),
+            (238_913, "Z9Z9", "A00A"),
+            (306_513, "Z99Z", "0AA0"),
+            (374_113, "9ZZ9", "0A0A"),
+            (441_713, "9Z9Z", "00AA"),
+            (509_313, "99ZZ", "AAA0"),
+            (685_073, "ZZZ9", "AA0A"),
+            (860_833, "ZZ9Z", "A0AA"),
+            (1_036_593, "Z9ZZ", "0AAA"),
+        )
+        for last_index, expected_last, expected_next in transitions:
+            with self.subTest(last_index=last_index):
+                self.assertEqual(
+                    dataformatter._felt_report_station_code(last_index),
+                    expected_last,
+                )
+                self.assertEqual(
+                    dataformatter._felt_report_station_code(last_index + 1),
+                    expected_next,
+                )
+
+    def test_representative_one_two_and_three_letter_codes(self):
+        expected_codes = (
+            (998, "A999"),
+            (999, "B001"),
+            (26_072, "0A99"),
+            (26_073, "0B01"),
+            (51_724, "00B0"),
+            (77_740, "001A"),
+            (103_837, "AB23"),
+            (172_118, "A3C4"),
+            (509_601, "ABC7"),
+        )
+        for index, expected_code in expected_codes:
+            with self.subTest(index=index):
+                self.assertEqual(
+                    dataformatter._felt_report_station_code(index),
+                    expected_code,
+                )
+
+
 _MISSING = object()
 
 
@@ -264,7 +330,7 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
     """Test the independent EMSC felt-intensity normalization adapter."""
 
     def _extract(self, rows=None, *, event_data=_MISSING,
-                 felt_reports=_MISSING, logger=None):
+                 felt_reports=_MISSING, logger=None, configuration=None):
         logger = logger or Mock()
         if event_data is _MISSING:
             event_data = _event()
@@ -273,7 +339,10 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
                 rows = [_row()]
             felt_reports = _felt_reports(rows)
 
-        formatter = EMSCFeltReportDataFormatter(logger=logger)
+        formatter = EMSCFeltReportDataFormatter(
+            logger=logger,
+            configuration=configuration,
+        )
         records = formatter.extract_raw_stations(
             event_data=event_data,
             felt_reports=felt_reports,
@@ -308,6 +377,10 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
         self.assertEqual(record["source"], "EMSC")
         self.assertEqual(record["provider_value"], 6.25)
         self.assertEqual(record["provider_unit"], "EMS-98")
+        self.assertEqual(record["network"], "FR")
+        self.assertEqual(record["station"], "A001")
+        self.assertEqual(record["location"], "00")
+        self.assertEqual(record["channel"], "HNZ")
         self.assertEqual(
             record["pga"],
             float(10 ** Calculator.I_to_PGA_Wordon2012(6.25)),
@@ -715,16 +788,170 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
             [record["provider_value"] for record in records],
             [4.0, 5.0, 6.0],
         )
+        self.assertEqual(
+            [record["station"] for record in records],
+            ["A001", "A002", "A003"],
+        )
+        self.assertEqual(
+            {
+                ".".join((
+                    record["network"],
+                    record["station"],
+                    record["location"],
+                    record["channel"],
+                ))
+                for record in records
+            },
+            {
+                "FR.A001.00.HNZ",
+                "FR.A002.00.HNZ",
+                "FR.A003.00.HNZ",
+            },
+        )
         for record in records:
             self.assertEqual(record["latitude"], 45.0)
             self.assertEqual(record["longitude"], 10.0)
-            self.assertEqual(record["network"], "")
-            self.assertEqual(record["station"], "")
-            self.assertEqual(record["location"], "")
-            self.assertEqual(record["channel"], "")
+            self.assertEqual(record["network"], "FR")
+            self.assertEqual(record["location"], "00")
+            self.assertEqual(record["channel"], "HNZ")
             self.assertEqual(record["source"], "EMSC")
             self.assertEqual(record["provider_unit"], "EMS-98")
         self.assertEqual(len({record["timestamp"] for record in records}), 1)
+
+    def test_rejected_rows_do_not_consume_codes_and_calls_restart(self):
+        rows = [
+            _row(corrected="rejected"),
+            _row(corrected=5.0),
+            _row(latitude=91.0, corrected=6.0),
+            _row(corrected=7.0),
+        ]
+        with patch.object(
+                Calculator, "I_Allen2012_Rhypo", return_value=6.0):
+            first_records, _logger = self._extract(rows)
+            second_records, _logger = self._extract([_row(corrected=6.0)])
+
+        self.assertEqual(
+            [record["station"] for record in first_records],
+            ["A001", "A002"],
+        )
+        self.assertEqual(second_records[0]["station"], "A001")
+
+    def test_namespace_exhaustion_aborts_the_normalization_call(self):
+        rows = [
+            _row(corrected=5.0),
+            _row(corrected=6.0),
+            _row(corrected=7.0),
+        ]
+        with patch.object(
+                Calculator, "I_Allen2012_Rhypo", return_value=6.0), \
+                patch.object(
+                    dataformatter,
+                    "_FELT_REPORT_STATION_CODE_COUNT",
+                    2,
+                ):
+            with self.assertRaisesRegex(ValueError, "namespace exhausted"):
+                self._extract(rows)
+
+    def test_alternate_valid_component_is_used_exactly(self):
+        configuration = {
+            "finder-executable": {"felt-report-component-code": "HG2"}
+        }
+
+        records, _logger = self._extract(configuration=configuration)
+
+        self.assertEqual(records[0]["channel"], "HG2")
+        self.assertEqual(records[0]["station"], "A001")
+
+    def test_invalid_component_configurations_fail_visibly(self):
+        cases = (
+            ("missing section", {}),
+            ("missing setting", {"finder-executable": {}}),
+            ("empty", ""),
+            ("lowercase", "hnz"),
+            ("dotted", "HN.Z"),
+            ("space", "HN Z"),
+            ("forward path separator", "HN/Z"),
+            ("backward path separator", "HN\\Z"),
+            ("control character", "HN\nZ"),
+            ("non-ASCII", "HNÉ"),
+        )
+        for label, configured_value in cases:
+            with self.subTest(label=label):
+                configuration = configured_value
+                if not isinstance(configured_value, dict):
+                    configuration = {
+                        "finder-executable": {
+                            "felt-report-component-code": configured_value,
+                        }
+                    }
+                felt_reports = Mock()
+
+                with self.assertRaises(ValueError) as raised:
+                    self._extract(
+                        felt_reports=felt_reports,
+                        configuration=configuration,
+                    )
+
+                self.assertIn(
+                    "felt-report-component-code", str(raised.exception))
+                felt_reports.get_intensities.assert_not_called()
+
+    def test_manager_passes_active_configuration_to_felt_formatter(self):
+        manager = object.__new__(findermanager.FinDerManager)
+        manager.logger = Mock()
+        manager.configuration = {
+            "finder-executable": {"felt-report-component-code": "HG2"}
+        }
+        event_context = object()
+        felt_reports = object()
+        normalized = [object()]
+
+        with patch.object(
+                findermanager,
+                "EMSCFeltReportDataFormatter",
+        ) as formatter_type:
+            formatter_type.return_value.extract_raw_stations.return_value = (
+                normalized)
+
+            result = manager._normalize_provider(
+                EMSC_FELT_REPORT_SERVICE,
+                event_context,
+                felt_reports,
+            )
+
+        self.assertIs(result, normalized)
+        formatter_type.assert_called_once_with(
+            logger=manager.logger,
+            configuration=manager.configuration,
+        )
+        formatter_type.return_value.extract_raw_stations.assert_called_once_with(
+            event_data=event_context,
+            felt_reports=felt_reports,
+        )
+
+    def test_invalid_component_is_not_classified_as_provider_outage(self):
+        manager = object.__new__(findermanager.FinDerManager)
+        manager.logger = Mock()
+        manager.configuration = {
+            "finder-executable": {"felt-report-component-code": "hnz"}
+        }
+        outcome = manager._new_provider_outcome()
+        acquired = {
+            EMSC_FELT_REPORT_SERVICE: {
+                "scientific_value": _felt_reports([_row()]),
+                "outcome": outcome,
+            }
+        }
+
+        with self.assertRaises(ValueError):
+            manager._normalize_acquired_providers(
+                acquired,
+                _event(),
+                "event-one",
+            )
+
+        self.assertIsNone(outcome["failure_kind"])
+        self.assertEqual(outcome["normalized_count"], 0)
 
     def test_event_timestamp_and_felt_rows_are_each_read_once(self):
         event_data = Mock(wraps=_event())
