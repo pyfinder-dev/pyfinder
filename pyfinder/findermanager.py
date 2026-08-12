@@ -560,8 +560,13 @@ class FinDerManager:
                 return provider_result["event_context"]
         return None
 
-    def _normalize_provider(self, service_name, event_context, value):
-        """Normalize one provider value with the common event context."""
+    def _normalize_provider(self, service_name, event_context, value) -> list:
+        """
+        Normalize one provider value with the common event context. In this context,
+        normalization means converting the data providers' values into a common format
+        that is a list of RawStationMeasurement objects. Normalization is performed by
+        data formatters that are specific to each provider.
+        """
         if service_name == ESM_SHAKEMAP_SERVICE:
             formatter = ESMShakeMapDataFormatter(
                 logger=self.logger,
@@ -581,11 +586,24 @@ class FinDerManager:
                 amplitudes=value,
             )
 
-        formatter = EMSCFeltReportDataFormatter(logger=self.logger)
-        return formatter.extract_raw_stations(
-            event_data=event_context,
-            felt_reports=value,
+        if service_name == EMSC_FELT_REPORT_SERVICE:
+            formatter = EMSCFeltReportDataFormatter(
+                logger=self.logger,
+                configuration=self.configuration,
+            )
+            return formatter.extract_raw_stations(
+                event_data=event_context,
+                felt_reports=value,
+            )
+
+        # Unknown service. Log an error and return an empty list
+        # to keep provider failures isolated so other usable services
+        # can continue.
+        self.logger.error(
+            f"No observation normalizer is available for service "
+            f"{service_name!r}; this service will contribute no observations."
         )
+        return []
 
     def _normalize_acquired_providers(self, acquired, event_context, event_id):
         """Build normalized available results and complete provider outcomes."""
