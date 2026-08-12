@@ -731,16 +731,21 @@ class SchedulerExecutionTests(unittest.TestCase):
                     tracker.mark_for_retry.call_args.kwargs["error_message"],
                 )
 
-    def test_ordinary_manager_exception_increments_once(self):
+    def test_ordinary_manager_exception_increments_once_and_is_retried(self):
         tracker = make_tracker()
-        manager = ManagerFactory(error=ValueError("ordinary failure"))
+        manager = ManagerFactory(error=ValueError("ordinary manager failure"))
         scheduler = make_scheduler(tracker, ImmediateExecutor(), manager)
 
         scheduler.run_once()
 
-        tracker.increment_retry_count.assert_called_once()
+        tracker.increment_retry_count.assert_called_once_with(
+            event_id=EVENT_ID,
+            service=SERVICE,
+            current_delay_time=DELAY,
+        )
         tracker.mark_for_retry.assert_called_once()
         tracker.mark_failed.assert_not_called()
+        tracker.mark_completed.assert_not_called()
 
     def test_policy_receives_newly_persisted_retry_count(self):
         tracker = make_tracker(metadata=event_metadata(retry_count=0))

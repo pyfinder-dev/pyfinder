@@ -4,9 +4,11 @@ import atexit
 import builtins
 from copy import deepcopy
 import fcntl
+import json
 import multiprocessing
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -44,6 +46,39 @@ def _hold_lock_until_released(lock_file_path, connection):
             connection.recv()
     finally:
         connection.close()
+
+
+def _write_controlled_executable(
+    path,
+    *,
+    stdout,
+    stderr,
+    returncode,
+):
+    """Create a real child that records the FinDer arguments it receives."""
+    source = """#!{python}
+import json
+from pathlib import Path
+import sys
+
+workspace = Path(sys.argv[2])
+(workspace / "controlled-child-arguments.json").write_text(
+    json.dumps(sys.argv[1:]),
+    encoding="utf-8",
+)
+sys.stdout.buffer.write({stdout!r})
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write({stderr!r})
+sys.stderr.buffer.flush()
+raise SystemExit({returncode})
+""".format(
+        python=sys.executable,
+        stdout=stdout,
+        stderr=stderr,
+        returncode=returncode,
+    )
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
 
 
 class FinDerWorkspaceTests(unittest.TestCase):
@@ -94,6 +129,19 @@ class FinDerWorkspaceTests(unittest.TestCase):
                 fcntl.LOCK_EX | fcntl.LOCK_NB,
             )
             fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+
+    def assert_execution_cleanup(
+        self,
+        executable,
+        workspace,
+        process_logger,
+        transient_handlers,
+    ):
+        """Verify the observable logger and lock cleanup for one invocation."""
+        self.assertIs(executable.logger, process_logger)
+        self.assert_workspace_available(workspace)
+        self.assertEqual(len(transient_handlers), 1)
+        self.assertIsNone(transient_handlers[0].stream)
 
     @staticmethod
     def logged_messages(logger, method_name):
@@ -559,10 +607,30 @@ class FinDerWorkspaceTests(unittest.TestCase):
         work_root = self.temporary_root / "runs"
         workspace = work_root / "event-one_t00010"
         executable = self.executable(work_root)
+        controlled_child = self.temporary_root / "controlled-success-finder"
+        stdout = (
+            b"CONTROLLED EXECUTE STDOUT\n"
+            b"Event_ID = controlled-finder-id\n"
+        )
+        stderr = b"CONTROLLED EXECUTE STDERR\n"
+        _write_controlled_executable(
+            controlled_child,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=0,
+        )
+        executable.executable_path = str(controlled_child)
         event_data = mock.Mock()
         event_data.get_event_id.return_value = "event-one"
         calls = []
         process_logger = executable.logger
+        transient_handlers = []
+        original_new_handler = finderexec.customlogger._new_handler
+
+        def record_handler(*args, **kwargs):
+            handler = original_new_handler(*args, **kwargs)
+            transient_handlers.append(handler)
+            return handler
 
         def record_locked_call(name):
             self.assert_workspace_locked(workspace)
@@ -573,11 +641,10 @@ class FinDerWorkspaceTests(unittest.TestCase):
             executable.logger.info("controlled input diagnostic")
             return str(workspace / "data_0"), finderexec.FinderChannelList()
 
-        def run_finder():
-            record_locked_call("run")
-            executable._process_finder_output(
-                b"Event_ID = controlled-finder-id\n",
-                b"controlled finder stderr\n",
+        def write_configuration():
+            record_locked_call("configuration")
+            executable.finder_file_config_path = str(
+                workspace / "finder_file.config"
             )
 
         def collect_output(**_kwargs):
@@ -585,29 +652,22 @@ class FinDerWorkspaceTests(unittest.TestCase):
             executable.logger.info("controlled output collection diagnostic")
 
         with mock.patch.object(
-            executable,
-            "_check_finder_executable",
-            side_effect=lambda: calls.append("check"),
+            finderexec.customlogger,
+            "_new_handler",
+            side_effect=record_handler,
         ), mock.patch.object(
             executable,
             "_write_finder_configuration",
-            side_effect=lambda: record_locked_call("configuration"),
+            side_effect=write_configuration,
         ), mock.patch.object(
             executable,
             "_write_data_for_finder",
             side_effect=write_data,
         ), mock.patch.object(
             executable,
-            "_run_finder",
-            side_effect=run_finder,
-        ), mock.patch.object(
-            executable,
             "_collect_finder_output",
             side_effect=collect_output,
-        ) as collect_output, mock.patch.object(
-            finderexec.subprocess,
-            "Popen",
-        ) as process_constructor:
+        ) as collect_output:
             result = executable.execute(
                 amplitudes=[{"normalized": "record"}],
                 event_data=event_data,
@@ -617,64 +677,289 @@ class FinDerWorkspaceTests(unittest.TestCase):
         self.assertIs(result, executable)
         self.assertEqual(
             calls,
-            ["check", "configuration", "data", "run", "collect"],
+            ["configuration", "data", "collect"],
         )
         collect_output.assert_called_once_with(event_id="event-one")
-        process_constructor.assert_not_called()
-        self.assert_workspace_available(workspace)
-        self.assertIs(executable.logger, process_logger)
+        self.assert_execution_cleanup(
+            executable,
+            workspace,
+            process_logger,
+            transient_handlers,
+        )
+        self.assertEqual(
+            json.loads(
+                (workspace / "controlled-child-arguments.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            [
+                str(workspace / "finder_file.config"),
+                str(workspace),
+                "0",
+                "0",
+                "yes" if executable.is_live_mode else "no",
+            ],
+        )
         event_log = (workspace / "pyfinder.log").read_text(encoding="utf-8")
         self.assertIn("controlled input diagnostic", event_log)
+        self.assertIn("CONTROLLED EXECUTE STDOUT", event_log)
         self.assertIn("controlled-finder-id", event_log)
-        self.assertIn("controlled finder stderr", event_log)
+        self.assertIn("CONTROLLED EXECUTE STDERR", event_log)
         self.assertIn("controlled output collection diagnostic", event_log)
 
-    def test_execute_failures_release_workspace_lock(self):
-        cases = (
-            ("output exception", None, RuntimeError("output read failed")),
-            ("finder SystemExit", SystemExit(2), None),
+    def test_nonzero_controlled_subprocess_retains_result_and_cleans_up(self):
+        identity = "event-nonzero_t00010"
+        work_root = self.temporary_root / "runs"
+        workspace = work_root / identity
+        controlled_child = self.temporary_root / "controlled-nonzero-finder"
+        stdout = b"CONTROLLED NONZERO STDOUT\n"
+        stderr = b"CONTROLLED NONZERO STDERR\n"
+        returncode = 37
+        _write_controlled_executable(
+            controlled_child,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=returncode,
         )
-        for index, (label, run_error, collect_error) in enumerate(cases):
-            with self.subTest(label=label):
-                identity = "event-{0}_t00010".format(index)
-                work_root = self.temporary_root / "runs"
-                workspace = work_root / identity
-                executable = self.executable(work_root)
-                process_logger = executable.logger
-                event_data = mock.Mock()
-                event_data.get_event_id.return_value = "event-{0}".format(index)
+        executable = self.executable(work_root)
+        executable.executable_path = str(controlled_child)
+        process_logger = executable.logger
+        event_data = mock.Mock()
+        event_data.get_event_id.return_value = "event-nonzero"
+        transient_handlers = []
+        original_new_handler = finderexec.customlogger._new_handler
 
-                with mock.patch.object(
-                    executable,
-                    "_check_finder_executable",
-                ), mock.patch.object(
-                    executable,
-                    "_write_finder_configuration",
-                ), mock.patch.object(
-                    executable,
-                    "_write_data_for_finder",
-                    return_value=(
-                        str(workspace / "data_0"),
-                        finderexec.FinderChannelList(),
-                    ),
-                ), mock.patch.object(
-                    executable,
-                    "_run_finder",
-                    side_effect=run_error,
-                ), mock.patch.object(
-                    executable,
-                    "_collect_finder_output",
-                    side_effect=collect_error,
-                ):
-                    with self.assertRaises(SystemExit):
-                        executable.execute(
-                            amplitudes=[],
-                            event_data=event_data,
-                            augmented_event_id=identity,
-                        )
+        def record_handler(*args, **kwargs):
+            handler = original_new_handler(*args, **kwargs)
+            transient_handlers.append(handler)
+            return handler
 
-                self.assert_workspace_available(workspace)
-                self.assertIs(executable.logger, process_logger)
+        def write_configuration():
+            self.assert_workspace_locked(workspace)
+            executable.finder_file_config_path = str(
+                workspace / "finder_file.config"
+            )
+
+        with mock.patch.object(
+            finderexec.customlogger,
+            "_new_handler",
+            side_effect=record_handler,
+        ), mock.patch.object(
+            executable,
+            "_write_finder_configuration",
+            side_effect=write_configuration,
+        ), mock.patch.object(
+            executable,
+            "_write_data_for_finder",
+            return_value=(
+                str(workspace / "data_0"),
+                finderexec.FinderChannelList(),
+            ),
+        ), mock.patch.object(
+            executable,
+            "_collect_finder_output",
+        ) as collect_output:
+            with self.assertRaises(finderexec.FinDerExecutionError) as raised:
+                executable.execute(
+                    amplitudes=[],
+                    event_data=event_data,
+                    augmented_event_id=identity,
+                )
+
+        error = raised.exception
+        self.assertIsInstance(error, Exception)
+        self.assertNotIsInstance(error, SystemExit)
+        self.assertEqual(error.returncode, returncode)
+        self.assertEqual(error.stdout, stdout)
+        self.assertEqual(error.stderr, stderr)
+        self.assertEqual(error.executable_path, str(controlled_child))
+        self.assertEqual(error.working_directory, str(workspace))
+        self.assertEqual(
+            error.command,
+            (
+                str(controlled_child),
+                str(workspace / "finder_file.config"),
+                str(workspace),
+                "0",
+                "0",
+                "yes" if executable.is_live_mode else "no",
+            ),
+        )
+        collect_output.assert_not_called()
+        self.assert_execution_cleanup(
+            executable,
+            workspace,
+            process_logger,
+            transient_handlers,
+        )
+        self.assertEqual(
+            json.loads(
+                (workspace / "controlled-child-arguments.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            list(error.command[1:]),
+        )
+        event_log = (workspace / "pyfinder.log").read_text(encoding="utf-8")
+        self.assertIn("CONTROLLED NONZERO STDOUT", event_log)
+        self.assertIn("CONTROLLED NONZERO STDERR", event_log)
+
+    def test_launch_failure_propagates_original_exception_and_cleans_up(self):
+        identity = "event-launch_t00010"
+        work_root = self.temporary_root / "runs"
+        workspace = work_root / identity
+        controlled_child = self.temporary_root / "controlled-launch-finder"
+        _write_controlled_executable(
+            controlled_child,
+            stdout=b"",
+            stderr=b"",
+            returncode=0,
+        )
+        executable = self.executable(work_root)
+        executable.executable_path = str(controlled_child)
+        process_logger = executable.logger
+        event_data = mock.Mock()
+        event_data.get_event_id.return_value = "event-launch"
+        launch_error = OSError("controlled launch failure")
+        transient_handlers = []
+        original_new_handler = finderexec.customlogger._new_handler
+
+        def record_handler(*args, **kwargs):
+            handler = original_new_handler(*args, **kwargs)
+            transient_handlers.append(handler)
+            return handler
+
+        def write_configuration():
+            executable.finder_file_config_path = str(
+                workspace / "finder_file.config"
+            )
+
+        with mock.patch.object(
+            finderexec.customlogger,
+            "_new_handler",
+            side_effect=record_handler,
+        ), mock.patch.object(
+            executable,
+            "_write_finder_configuration",
+            side_effect=write_configuration,
+        ), mock.patch.object(
+            executable,
+            "_write_data_for_finder",
+            return_value=(
+                str(workspace / "data_0"),
+                finderexec.FinderChannelList(),
+            ),
+        ), mock.patch.object(
+            finderexec.subprocess,
+            "Popen",
+            side_effect=launch_error,
+        ), mock.patch.object(
+            executable,
+            "_collect_finder_output",
+        ) as collect_output:
+            with self.assertRaises(OSError) as raised:
+                executable.execute(
+                    amplitudes=[],
+                    event_data=event_data,
+                    augmented_event_id=identity,
+                )
+
+        self.assertIs(raised.exception, launch_error)
+        self.assertIsInstance(raised.exception, Exception)
+        self.assertNotIsInstance(raised.exception, SystemExit)
+        collect_output.assert_not_called()
+        self.assert_execution_cleanup(
+            executable,
+            workspace,
+            process_logger,
+            transient_handlers,
+        )
+
+    def test_output_reader_failure_propagates_original_exception_and_cleans_up(self):
+        identity = "event-output_t00010"
+        work_root = self.temporary_root / "runs"
+        workspace = work_root / identity
+        controlled_child = self.temporary_root / "controlled-output-finder"
+        _write_controlled_executable(
+            controlled_child,
+            stdout=(
+                b"CONTROLLED OUTPUT-HANDOFF STDOUT\n"
+                b"Event_ID = controlled-output-id\n"
+            ),
+            stderr=b"CONTROLLED OUTPUT-HANDOFF STDERR\n",
+            returncode=0,
+        )
+        executable = self.executable(work_root)
+        executable.executable_path = str(controlled_child)
+        process_logger = executable.logger
+        event_data = mock.Mock()
+        event_data.get_event_id.return_value = "event-output"
+        reader_error = OSError("controlled output reader failure")
+        transient_handlers = []
+        original_new_handler = finderexec.customlogger._new_handler
+
+        def record_handler(*args, **kwargs):
+            handler = original_new_handler(*args, **kwargs)
+            transient_handlers.append(handler)
+            return handler
+
+        def write_configuration():
+            executable.finder_file_config_path = str(
+                workspace / "finder_file.config"
+            )
+
+        with mock.patch.object(
+            finderexec.customlogger,
+            "_new_handler",
+            side_effect=record_handler,
+        ), mock.patch.object(
+            executable,
+            "_write_finder_configuration",
+            side_effect=write_configuration,
+        ), mock.patch.object(
+            executable,
+            "_write_data_for_finder",
+            return_value=(
+                str(workspace / "data_0"),
+                finderexec.FinderChannelList(),
+            ),
+        ), mock.patch.object(
+            finderexec,
+            "read_event_solution_from_file",
+            side_effect=reader_error,
+        ) as read_event, mock.patch.object(
+            finderexec,
+            "read_rupture_polygon_from_file",
+        ) as read_rupture, mock.patch.object(
+            finderexec,
+            "read_finder_channels_from_file",
+        ) as read_channels:
+            with self.assertRaises(OSError) as raised:
+                executable.execute(
+                    amplitudes=[],
+                    event_data=event_data,
+                    augmented_event_id=identity,
+                )
+
+        self.assertIs(raised.exception, reader_error)
+        self.assertIsInstance(raised.exception, Exception)
+        self.assertNotIsInstance(raised.exception, SystemExit)
+        read_event.assert_called_once_with(
+            str(
+                workspace
+                / "temp_data"
+                / "controlled-output-id"
+                / "core_info_0"
+            )
+        )
+        read_rupture.assert_not_called()
+        read_channels.assert_not_called()
+        self.assert_execution_cleanup(
+            executable,
+            workspace,
+            process_logger,
+            transient_handlers,
+        )
 
     def test_workspace_logger_initialization_failure_stops_execution(self):
         identity = "event-one_t00010"

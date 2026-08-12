@@ -103,6 +103,10 @@ if [[ "${1:-}" == "image" && "${2:-}" == "ls" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "exec" ]]; then
+    exit "${FAKE_DOCKER_EXEC_STATUS:-0}"
+fi
+
 exit 0
 '''
 
@@ -515,6 +519,33 @@ class HostLauncherTests(unittest.TestCase):
                 self.assertFalse(
                     any(record[0] == "mkdir" for record in self.records())
                 )
+
+    def test_on_demand_preserves_exact_docker_exec_failure_status(self):
+        result = self.run_launcher(
+            "on-demand",
+            "--event-id",
+            "event-failure",
+            "--verbosity",
+            "DEBUG",
+            FAKE_CONTAINER_STATE="running",
+            FAKE_DOCKER_EXEC_STATUS="37",
+        )
+
+        self.assertEqual(result.returncode, 37)
+        self.assertEqual(
+            self.lifecycle_records(self.records()),
+            [[
+                "docker",
+                "exec",
+                CONTAINER_NAME,
+                "pyfinder",
+                "on-demand",
+                "--event-id",
+                "event-failure",
+                "--verbosity",
+                "DEBUG",
+            ]],
+        )
 
     def test_additional_processes_reject_all_unusable_container_states(self):
         cases = (

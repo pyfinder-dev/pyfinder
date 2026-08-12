@@ -8,7 +8,6 @@ import fcntl
 import logging
 import os
 import subprocess
-import sys
 import json
 from datetime import datetime
 from pyfinder.utils import customlogger
@@ -24,6 +23,36 @@ from pyfinder.utils.dataformatter import FinDerInputFormatter
 from pyfinder.utils.timeutils import get_epoch_time
 from pyfinder.utils.station_merger import RawStationMeasurement
 from pyfinder.workspace import select_workspace_path
+
+
+class FinDerExecutionError(RuntimeError):
+    """Report one nonzero FinDer subprocess result to the workflow caller."""
+
+    def __init__(
+        self,
+        *,
+        returncode,
+        stdout,
+        stderr,
+        command,
+        executable_path,
+        working_directory,
+    ):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.command = tuple(command)
+        self.executable_path = executable_path
+        self.working_directory = working_directory
+        super().__init__(
+            "FinDer execution failed with return code {0}; "
+            "executable={1}; workspace={2}".format(
+                returncode,
+                executable_path,
+                working_directory,
+            )
+        )
+
 
 class FinDerExecutable(object):
     """ Class for executing the FinDer executable. """
@@ -556,8 +585,9 @@ class FinDerExecutable(object):
                         self.working_directory, '0', '0', 
                         'yes' if is_live_mode else 'no']
             
+        command = [self.executable_path] + cmd_line_opt
         process = subprocess.Popen(
-            [self.executable_path] + cmd_line_opt, 
+            command,
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE)
             
@@ -571,8 +601,14 @@ class FinDerExecutable(object):
         # Check if the process is successful
         if process.returncode != 0:
             self.logger.error(f"FinDer execution failed with return code: {process.returncode}")
-            # self.logger.error(f"Check the log file for more details: {self.logger.log_file}")
-            sys.exit(1)
+            raise FinDerExecutionError(
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                command=command,
+                executable_path=self.executable_path,
+                working_directory=self.working_directory,
+            )
 
         # Return the stdout, stderr, and the return code, although we don't need them
         return stdout, stderr, process.returncode
@@ -686,12 +722,6 @@ class FinDerExecutable(object):
 
                 # Collect the output of the executable
                 self._collect_finder_output(event_id=event_id)
-
-            except Exception as e:
-                # Log the error and exit
-                self.logger.error(f"Error executing FinDer:")
-                self.logger.error(f"{e}")
-                sys.exit(1)
 
             finally:
                 # The end of the execution

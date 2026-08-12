@@ -2,8 +2,10 @@
 
 import atexit
 from copy import deepcopy
+import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -68,6 +70,39 @@ class FinDerExecutableConfigurationTests(unittest.TestCase):
             finder_configuration_name=name,
             finder_configuration=configuration,
         )
+
+    @staticmethod
+    def write_controlled_executable(
+        path,
+        *,
+        stdout,
+        stderr,
+        returncode,
+    ):
+        """Create a real child that records FinDer's received arguments."""
+        source = """#!{python}
+import json
+from pathlib import Path
+import sys
+
+workspace = Path(sys.argv[2])
+(workspace / "controlled-child-arguments.json").write_text(
+    json.dumps(sys.argv[1:]),
+    encoding="utf-8",
+)
+sys.stdout.buffer.write({stdout!r})
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write({stderr!r})
+sys.stderr.buffer.flush()
+raise SystemExit({returncode})
+""".format(
+            python=sys.executable,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=returncode,
+        )
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
 
     def assert_application_configuration_rejected(
         self,
@@ -290,52 +325,147 @@ class FinDerExecutableConfigurationTests(unittest.TestCase):
                     "finder-executable.artificial-point-margin-percent",
                 )
 
-    def test_run_finder_uses_the_stored_live_mode_decision(self):
-        application_configuration = self.application_configuration(
-            live_mode="YeS"
+    def test_run_finder_crosses_real_subprocess_with_stored_live_mode(self):
+        stdout = (
+            b"CONTROLLED SUCCESS STDOUT\n"
+            b"Event_ID = controlled-success-id\n"
         )
-        executable = self.construct_executable(
-            "global",
-            {"DATA_FOLDER": "source-data"},
-            application_configuration,
-        )
-        application_configuration["finder-executable"][
-            "finder-live-mode"
-        ] = "no"
-        executable.configuration["finder-executable"][
-            "finder-live-mode"
-        ] = "no"
-        executable.finder_file_config_path = "/not-created/finder_file.config"
-        executable.working_directory = "/not-created/workspace"
-        executable.logger = mock.Mock()
-        process = mock.Mock()
-        process.communicate.return_value = (b"", b"")
-        process.returncode = 0
+        stderr = b"CONTROLLED SUCCESS STDERR\n"
+        cases = (("YeS", "no", "yes"), (False, "yes", "no"))
 
-        with mock.patch.object(
-            finderexec.subprocess,
-            "Popen",
-            return_value=process,
-        ) as process_constructor, mock.patch.object(
-            executable,
-            "_process_finder_output",
-        ) as process_output:
-            result = executable._run_finder()
+        for index, (configured, mutated, expected_mode) in enumerate(cases):
+            with self.subTest(configured=configured):
+                application_configuration = self.application_configuration(
+                    live_mode=configured
+                )
+                executable = self.construct_executable(
+                    "global",
+                    {"DATA_FOLDER": "source-data"},
+                    application_configuration,
+                )
+                application_configuration["finder-executable"][
+                    "finder-live-mode"
+                ] = mutated
+                executable.configuration["finder-executable"][
+                    "finder-live-mode"
+                ] = mutated
 
-        process_constructor.assert_called_once_with(
-            [
-                "/not-executed/finder_run",
-                "/not-created/finder_file.config",
-                "/not-created/workspace",
-                "0",
-                "0",
-                "yes",
-            ],
-            stdout=finderexec.subprocess.PIPE,
-            stderr=finderexec.subprocess.PIPE,
-        )
-        process_output.assert_called_once_with(b"", b"")
-        self.assertEqual(result, (b"", b"", 0))
+                with tempfile.TemporaryDirectory(
+                    prefix="pyfinder-controlled-child-"
+                ) as temporary_directory:
+                    workspace = Path(temporary_directory)
+                    controlled_child = workspace / "controlled-finder"
+                    config_path = workspace / "finder_file.config"
+                    event_log_path = workspace / "pyfinder.log"
+                    config_path.write_text("CONTROLLED CONFIG\n", encoding="utf-8")
+                    self.write_controlled_executable(
+                        controlled_child,
+                        stdout=stdout,
+                        stderr=stderr,
+                        returncode=0,
+                    )
+                    executable.executable_path = str(controlled_child)
+                    executable.finder_file_config_path = str(config_path)
+                    executable.working_directory = str(workspace)
+                    process_logger = executable.logger
+
+                    with finderexec.customlogger.transient_file_logger(
+                        event_log_path
+                    ) as event_logger:
+                        executable.logger = event_logger
+                        result = executable._run_finder()
+                    executable.logger = process_logger
+
+                    received_arguments = json.loads(
+                        (workspace / "controlled-child-arguments.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertEqual(
+                        received_arguments,
+                        [
+                            str(config_path),
+                            str(workspace),
+                            "0",
+                            "0",
+                            expected_mode,
+                        ],
+                    )
+                    self.assertEqual(result, (stdout, stderr, 0))
+                    self.assertEqual(
+                        executable.finder_event_id,
+                        "controlled-success-id",
+                    )
+                    event_log = event_log_path.read_text(encoding="utf-8")
+                    self.assertIn("CONTROLLED SUCCESS STDOUT", event_log)
+                    self.assertIn("CONTROLLED SUCCESS STDERR", event_log)
+
+    def test_invalid_executable_paths_stop_before_workspace_or_child_activity(self):
+        with tempfile.TemporaryDirectory(
+            prefix="pyfinder-executable-validation-"
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            missing_path = root / "missing-finder"
+            directory_path = root / "directory-finder"
+            directory_path.mkdir()
+            non_executable_path = root / "non-executable-finder"
+            non_executable_path.write_text("not executable\n", encoding="utf-8")
+            non_executable_path.chmod(0o644)
+            cases = (
+                ("missing", missing_path, FileNotFoundError),
+                ("directory", directory_path, FileNotFoundError),
+                ("non-executable", non_executable_path, PermissionError),
+            )
+
+            for index, (label, executable_path, error_type) in enumerate(cases):
+                with self.subTest(label=label):
+                    application_configuration = self.application_configuration()
+                    application_configuration["finder-executable"]["path"] = str(
+                        executable_path
+                    )
+                    work_root = root / "work-{0}".format(index)
+                    application_configuration["finder-executable"][
+                        "output-root-folder"
+                    ] = str(work_root)
+                    executable = self.construct_executable(
+                        "global",
+                        {"DATA_FOLDER": "source-data"},
+                        application_configuration,
+                    )
+                    event_data = mock.Mock()
+
+                    with mock.patch.object(
+                        executable,
+                        "_prepare_workspace",
+                    ) as prepare_workspace, mock.patch.object(
+                        executable,
+                        "_materialize_inputs",
+                    ) as materialize_inputs, mock.patch.object(
+                        finderexec.subprocess,
+                        "Popen",
+                    ) as process_constructor, mock.patch.object(
+                        executable,
+                        "_process_finder_output",
+                    ) as process_output, mock.patch.object(
+                        executable,
+                        "_collect_finder_output",
+                    ) as collect_output:
+                        with self.assertRaises(error_type):
+                            executable.execute(
+                                amplitudes=[],
+                                event_data=event_data,
+                                augmented_event_id="event-{0}_t00010".format(
+                                    index
+                                ),
+                            )
+
+                    self.assertFalse(work_root.exists())
+                    event_data.get_event_id.assert_not_called()
+                    prepare_workspace.assert_not_called()
+                    materialize_inputs.assert_not_called()
+                    process_constructor.assert_not_called()
+                    process_output.assert_not_called()
+                    collect_output.assert_not_called()
 
     def test_materialization_replaces_only_data_folder_in_mapping_order(self):
         source = {
@@ -374,10 +504,6 @@ class FinDerExecutableConfigurationTests(unittest.TestCase):
         self.assertEqual(
             executable.finder_configuration,
             executable_owned_before,
-        )
-        executable.logger.info.assert_any_call(
-            "Selected FinDer configuration: %s",
-            "regional",
         )
         process_constructor.assert_not_called()
 

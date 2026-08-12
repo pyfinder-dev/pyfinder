@@ -216,6 +216,38 @@ class OnDemandAdapterTests(unittest.TestCase):
         )
         self.assertEqual(self.runtime_context.database_allocations, 0)
 
+    def test_execution_exception_escapes_on_demand_adapter_unchanged(self):
+        arguments = cli.build_parser().parse_args(
+            ["on-demand", "--event-id", "event-failure"]
+        )
+        execution_error = RuntimeError(
+            "controlled manager execution failure"
+        )
+        manager = mock.Mock()
+        manager.run.side_effect = execution_error
+        process_logger = mock.Mock()
+
+        with mock.patch.object(
+            findermanager.customlogger,
+            "file_logger",
+            return_value=process_logger,
+        ), mock.patch.object(
+            findermanager.FinDerManager,
+            "for_on_demand",
+            return_value=manager,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                findermanager.run_cli(
+                    arguments,
+                    runtime_context=self.runtime_context,
+                )
+
+        self.assertIs(raised.exception, execution_error)
+        self.assertIsInstance(raised.exception, Exception)
+        self.assertNotIsInstance(raised.exception, SystemExit)
+        manager.run.assert_called_once_with(event_id="event-failure")
+        self.assertEqual(self.runtime_context.database_allocations, 0)
+
 
 class PlaybackAdapterTests(unittest.TestCase):
     def setUp(self):
