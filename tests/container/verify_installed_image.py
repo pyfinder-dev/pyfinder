@@ -10,6 +10,7 @@ import importlib.metadata as metadata
 import json
 import logging
 import lzma
+import math
 import os
 from pathlib import Path
 import platform
@@ -90,6 +91,82 @@ def forbidden_call(operation):
         raise AssertionError("controlled materialization attempted {0}".format(operation))
 
     return reject
+
+
+def require_numeric_close(
+    actual_text,
+    expected,
+    *,
+    relative_tolerance=1e-12,
+    absolute_tolerance=1e-20,
+):
+    """Compare serialized scientific data by parsed numerical meaning."""
+    actual = float(actual_text)
+    require(math.isfinite(actual), "serialized numeric field is not finite")
+    require(
+        math.isclose(
+            actual,
+            expected,
+            rel_tol=relative_tolerance,
+            abs_tol=absolute_tolerance,
+        ),
+        "serialized numeric field differs: {0!r} != {1!r}".format(
+            actual,
+            expected,
+        ),
+    )
+
+
+def verify_non_live_data_0(path, *, event_time, expected_rows):
+    """Verify installed non-live output without freezing float spellings."""
+    lines = path.read_bytes().decode("ascii").splitlines()
+    require(
+        lines[0].split() == ["#", str(event_time), "0"],
+        "installed formatter header differs",
+    )
+    require(
+        len(lines) == len(expected_rows) + 1,
+        "installed formatter row count differs",
+    )
+    for line, expected in zip(lines[1:], expected_rows):
+        fields = line.split()
+        require(len(fields) == 3, "installed non-live row field count differs")
+        latitude, longitude, log10_pga = fields
+        require_numeric_close(latitude, expected["latitude"])
+        require_numeric_close(longitude, expected["longitude"])
+        require_numeric_close(log10_pga, math.log10(expected["pga"]))
+
+
+def verify_companion(path, expected_rows):
+    """Verify installed companion structure and scientific values."""
+    lines = path.read_bytes().decode("ascii").splitlines()
+    require(
+        lines[0].split()
+        == ["#", "SNCL", "PGA_CM_S2", "EPI_DISTANCE_KM"],
+        "installed amplitude companion header differs",
+    )
+    require(
+        len(lines) == len(expected_rows) + 1,
+        "installed amplitude companion row count differs",
+    )
+    for line, expected in zip(lines[1:], expected_rows):
+        fields = line.split()
+        require(len(fields) == 3, "installed companion row field count differs")
+        sncl, pga, distance = fields
+        require(sncl == expected["sncl"], "installed companion SNCL differs")
+        require_numeric_close(pga, expected["pga"])
+        require(
+            re.fullmatch(r"-?\d+\.\d", distance) is not None,
+            "installed companion distance does not have one decimal place",
+        )
+        require_numeric_close(
+            distance,
+            expected["distance_km"],
+            relative_tolerance=0.0,
+            # One-decimal serialization may differ from the independent
+            # full-precision expectation by at most half a display unit.
+            absolute_tolerance=0.05,
+        )
 
 
 def main():
@@ -307,16 +384,6 @@ def main():
             "provider_unit": "cm/s^2",
         }
     ]
-    expected_data = (
-        b"# 1786349730 0\n"
-        b"0.0 0.0 1.101231386790699\n"
-        b"0.0 1.0 1.0969100130080565"
-    )
-    expected_companion = (
-        b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
-        b"XX.NONE.00.HNZ 12.625 0.0\n"
-        b"CH.IMAGECHECK.00.HNZ 12.5 111.2"
-    )
     process_logger = customlogger.file_logger(
         runtime_context.process_log_path,
         module_name="image-verification.materialization",
@@ -372,10 +439,22 @@ def main():
     require(data_path == workspace / "data_0", "data path differs")
     require(companion_path.is_file(), "amplitude companion is absent")
     require(workspace_log_path.is_file(), "workspace log is absent")
-    require(data_path.read_bytes() == expected_data, "installed formatter output differs")
-    require(
-        companion_path.read_bytes() == expected_companion,
-        "installed amplitude companion output differs",
+    verify_non_live_data_0(
+        data_path,
+        event_time=1786349730,
+        expected_rows=[
+            {"latitude": 0.0, "longitude": 0.0, "pga": 12.625},
+            {"latitude": 0.0, "longitude": 1.0, "pga": 12.5},
+        ],
+    )
+    verify_companion(
+        companion_path,
+        [
+            {"sncl": "XX.NONE.00.HNZ", "pga": 12.625,
+             "distance_km": 0.0},
+            {"sncl": "CH.IMAGECHECK.00.HNZ", "pga": 12.5,
+             "distance_km": 6371.0 * math.radians(1.0)},
+        ],
     )
     configuration_lines = config_path.read_text(encoding="utf-8").splitlines()
     require("DATA_FOLDER {0}".format(workspace) in configuration_lines, "DATA_FOLDER does not select the workspace")

@@ -5,6 +5,7 @@ import atexit
 import builtins
 from copy import deepcopy
 import fcntl
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -48,6 +49,10 @@ def _hold_lock_until_released(lock_file_path, connection):
 
 
 class FinDerWorkspaceTests(unittest.TestCase):
+    SERIALIZED_NUMBER_REL_TOLERANCE = 1e-12
+    SERIALIZED_NUMBER_ABS_TOLERANCE = 1e-20
+    COMPANION_DISTANCE_ABS_TOLERANCE_KM = 0.05
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory(
             prefix="pyfinder-workspace-"
@@ -111,6 +116,61 @@ class FinDerWorkspaceTests(unittest.TestCase):
                 message = message % call.args[1:]
             messages.append(message)
         return messages
+
+    def assert_serialized_number_close(self, actual_text, expected):
+        """Compare one artifact field numerically instead of by text form."""
+        actual = float(actual_text)
+        self.assertTrue(math.isfinite(actual), actual_text)
+        self.assertTrue(
+            math.isclose(
+                actual,
+                expected,
+                rel_tol=self.SERIALIZED_NUMBER_REL_TOLERANCE,
+                abs_tol=self.SERIALIZED_NUMBER_ABS_TOLERANCE,
+            ),
+            (actual, expected),
+        )
+
+    def assert_non_live_data_0(self, path, *, event_time, expected_rows):
+        """Verify materialized non-live data structurally and numerically."""
+        lines = path.read_bytes().decode("ascii").splitlines()
+        self.assertEqual(lines[0].split(), ["#", str(event_time), "0"])
+        self.assertEqual(len(lines), len(expected_rows) + 1)
+        for line, expected in zip(lines[1:], expected_rows):
+            fields = line.split()
+            self.assertEqual(len(fields), 3)
+            latitude, longitude, log10_pga = fields
+            self.assert_serialized_number_close(latitude, expected["latitude"])
+            self.assert_serialized_number_close(longitude, expected["longitude"])
+            self.assert_serialized_number_close(
+                log10_pga,
+                math.log10(expected["pga"]),
+            )
+
+    def assert_companion(self, path, expected_rows):
+        """Verify materialized companion membership and numeric semantics."""
+        lines = path.read_bytes().decode("ascii").splitlines()
+        self.assertEqual(
+            lines[0].split(),
+            ["#", "SNCL", "PGA_CM_S2", "EPI_DISTANCE_KM"],
+        )
+        self.assertEqual(len(lines), len(expected_rows) + 1)
+        for line, expected in zip(lines[1:], expected_rows):
+            fields = line.split()
+            self.assertEqual(len(fields), 3)
+            sncl, pga, distance = fields
+            self.assertEqual(sncl, expected["sncl"])
+            self.assert_serialized_number_close(pga, expected["pga"])
+            self.assertRegex(distance, r"^-?\d+\.\d$")
+            self.assertTrue(
+                math.isclose(
+                    float(distance),
+                    expected["distance_km"],
+                    rel_tol=0.0,
+                    abs_tol=self.COMPANION_DISTANCE_ABS_TOLERANCE_KM,
+                ),
+                (distance, expected["distance_km"]),
+            )
 
     def test_augmented_identity_uses_only_event_and_five_digit_delay(self):
         cases = (
@@ -413,16 +473,6 @@ class FinDerWorkspaceTests(unittest.TestCase):
                 "provider_unit": "cm/s^2",
             }
         ]
-        expected_data = (
-            b"# 1786349730 0\n"
-            b"0.0 0.0 1.101231386790699\n"
-            b"0.0 1.0 1.0969100130080565"
-        )
-        expected_companion = (
-            b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
-            b"XX.NONE.00.HNZ 12.625 0.0\n"
-            b"CH.TEST.00.HNZ 12.5 111.2"
-        )
         identity = "event-one_t00010"
         workspace = work_root / identity
         original_import = builtins.__import__
@@ -503,9 +553,24 @@ class FinDerWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(Path(config_path), workspace / "finder_file.config")
         self.assertEqual(Path(data_path), workspace / "data_0")
-        self.assertEqual(Path(data_path).read_bytes(), expected_data)
+        self.assert_non_live_data_0(
+            Path(data_path),
+            event_time=1786349730,
+            expected_rows=[
+                {"latitude": 0.0, "longitude": 0.0, "pga": 12.625},
+                {"latitude": 0.0, "longitude": 1.0, "pga": 12.5},
+            ],
+        )
         companion_path = workspace / "pyfinder_amplitudes_to_Finder.txt"
-        self.assertEqual(companion_path.read_bytes(), expected_companion)
+        self.assert_companion(
+            companion_path,
+            [
+                {"sncl": "XX.NONE.00.HNZ", "pga": 12.625,
+                 "distance_km": 0.0},
+                {"sncl": "CH.TEST.00.HNZ", "pga": 12.5,
+                 "distance_km": 6371.0 * math.radians(1.0)},
+            ],
+        )
         self.assertEqual(
             opened_invocation_inputs,
             [

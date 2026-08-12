@@ -65,6 +65,18 @@ class ControlledEvent:
 
 
 class FinDerInputGenerationTests(unittest.TestCase):
+    # ``data_0`` preserves supplied finite floats with enough significant
+    # digits for a normal double-precision round trip. A very small absolute
+    # tolerance protects low positive amplitudes without making a material
+    # scientific difference invisible.
+    SERIALIZED_NUMBER_REL_TOLERANCE = 1e-12
+    SERIALIZED_NUMBER_ABS_TOLERANCE = 1e-20
+
+    # Companion distances are intentionally serialized to one decimal place.
+    # Half of that display unit is therefore the largest legitimate difference
+    # between the independent full-precision expectation and the parsed text.
+    COMPANION_DISTANCE_ABS_TOLERANCE_KM = 0.05
+
     def executable(self, *, live_mode=False, margin_percent=1.0):
         return finderexec.FinDerExecutable(
             options={"command_line_args": "input-generation-test"},
@@ -143,6 +155,79 @@ class FinDerInputGenerationTests(unittest.TestCase):
         return "\n".join(
             call.args[0] for call in executable.logger.info.call_args_list
         )
+
+    def assert_serialized_number_close(self, actual_text, expected):
+        """Compare one serialized finite number by value, not text spelling."""
+        actual = float(actual_text)
+        self.assertTrue(math.isfinite(actual), actual_text)
+        self.assertTrue(
+            math.isclose(
+                actual,
+                expected,
+                rel_tol=self.SERIALIZED_NUMBER_REL_TOLERANCE,
+                abs_tol=self.SERIALIZED_NUMBER_ABS_TOLERANCE,
+            ),
+            (actual, expected),
+        )
+
+    def assert_live_data_0(self, rendered, *, event_time, expected_rows):
+        """Verify live ``data_0`` structure and parsed scientific values."""
+        lines = rendered.decode("ascii").splitlines()
+        self.assertEqual(lines[0].split(), ["#", str(event_time), "0"])
+        self.assertEqual(len(lines), len(expected_rows) + 1)
+
+        for line, expected in zip(lines[1:], expected_rows):
+            fields = line.split()
+            self.assertEqual(len(fields), 5)
+            latitude, longitude, sncl, timestamp, pga = fields
+            self.assert_serialized_number_close(latitude, expected["latitude"])
+            self.assert_serialized_number_close(longitude, expected["longitude"])
+            self.assertEqual(sncl, expected["sncl"])
+            self.assertEqual(timestamp, str(event_time))
+            self.assert_serialized_number_close(pga, expected["pga"])
+
+    def assert_non_live_data_0(self, rendered, *, event_time, expected_rows):
+        """Verify non-live structure and independently calculated logarithms."""
+        lines = rendered.decode("ascii").splitlines()
+        self.assertEqual(lines[0].split(), ["#", str(event_time), "0"])
+        self.assertEqual(len(lines), len(expected_rows) + 1)
+
+        for line, expected in zip(lines[1:], expected_rows):
+            fields = line.split()
+            self.assertEqual(len(fields), 3)
+            latitude, longitude, log10_pga = fields
+            self.assert_serialized_number_close(latitude, expected["latitude"])
+            self.assert_serialized_number_close(longitude, expected["longitude"])
+            self.assert_serialized_number_close(
+                log10_pga,
+                math.log10(expected["pga"]),
+            )
+
+    def assert_companion(self, rendered, expected_rows):
+        """Verify companion structure, ordering, and parsed numeric meaning."""
+        lines = rendered.decode("ascii").splitlines()
+        self.assertEqual(
+            lines[0].split(),
+            ["#", "SNCL", "PGA_CM_S2", "EPI_DISTANCE_KM"],
+        )
+        self.assertEqual(len(lines), len(expected_rows) + 1)
+
+        for line, expected in zip(lines[1:], expected_rows):
+            fields = line.split()
+            self.assertEqual(len(fields), 3)
+            sncl, pga, distance = fields
+            self.assertEqual(sncl, expected["sncl"])
+            self.assert_serialized_number_close(pga, expected["pga"])
+            self.assertRegex(distance, r"^-?\d+\.\d$")
+            self.assertTrue(
+                math.isclose(
+                    float(distance),
+                    expected["distance_km"],
+                    rel_tol=0.0,
+                    abs_tol=self.COMPANION_DISTANCE_ABS_TOLERANCE_KM,
+                ),
+                (distance, expected["distance_km"]),
+            )
 
     def test_real_channel_assembly_preserves_membership_order_values_and_input(self):
         observations = self.observations()
@@ -494,7 +579,7 @@ class FinDerInputGenerationTests(unittest.TestCase):
             self.info_messages(executable),
         )
 
-    def test_companion_exact_bytes_sort_stably_without_mutating_channels_or_data(self):
+    def test_companion_values_sort_stably_without_mutating_channels_or_data(self):
         channels = FinderChannelList([
             FinderChannel(
                 latitude=0.0,
@@ -535,22 +620,43 @@ class FinDerInputGenerationTests(unittest.TestCase):
             event_longitude=0.0,
         )
 
-        self.assertEqual(
+        self.assert_companion(
             rendered,
-            b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
-            b"XX.NONE.00.HNZ 12.5 0.0\n"
-            b"CH.FAR.00.HNZ 12.5 111.2\n"
-            b"FR.MID.00.HNZ 2.0 55.6\n"
-            b"IV.LOW.00.HNZ 1e-12 0.0",
+            [
+                {"sncl": "XX.NONE.00.HNZ", "pga": 12.5,
+                 "distance_km": 0.0},
+                {"sncl": "CH.FAR.00.HNZ", "pga": 12.5,
+                 "distance_km": 6371.0 * math.radians(1.0)},
+                {"sncl": "FR.MID.00.HNZ", "pga": 2.0,
+                 "distance_km": 6371.0 * math.radians(0.5)},
+                {"sncl": "IV.LOW.00.HNZ", "pga": 1e-12,
+                 "distance_km": 0.0},
+            ],
         )
         self.assertEqual(list(channels), original_channels)
         self.assertEqual(
             [vars(channel).copy() for channel in channels],
             original_state,
         )
-        self.assertEqual(
-            FinDerInputFormatter.format(channels, 1000.0, True),
+        expected_data_rows = [
+            {"latitude": 0.0, "longitude": 0.0,
+             "sncl": "XX.NONE.00.HNZ", "pga": 12.5},
+            {"latitude": 0.0, "longitude": 0.0,
+             "sncl": "IV.LOW.00.HNZ", "pga": 1e-12},
+            {"latitude": 0.0, "longitude": 1.0,
+             "sncl": "CH.FAR.00.HNZ", "pga": 12.5},
+            {"latitude": 0.0, "longitude": 0.5,
+             "sncl": "FR.MID.00.HNZ", "pga": 2.0},
+        ]
+        self.assert_live_data_0(
             original_data,
+            event_time=1000,
+            expected_rows=expected_data_rows,
+        )
+        self.assert_live_data_0(
+            FinDerInputFormatter.format(channels, 1000.0, True),
+            event_time=1000,
+            expected_rows=expected_data_rows,
         )
         self.assertEqual(
             [channel.get_sncl() for channel in channels],
@@ -593,13 +699,14 @@ class FinDerInputGenerationTests(unittest.TestCase):
             0.0,
         )
 
-        expected = (
-            b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
-            b"IV.SECOND.00.HNZ 4.0 0.0\n"
-            b"CH.FIRST.00.HNZ 2.0 111.2"
-        )
-        self.assertEqual(non_live_rendered, expected)
-        self.assertEqual(live_rendered, expected)
+        expected_rows = [
+            {"sncl": "IV.SECOND.00.HNZ", "pga": 4.0,
+             "distance_km": 0.0},
+            {"sncl": "CH.FIRST.00.HNZ", "pga": 2.0,
+             "distance_km": 6371.0 * math.radians(1.0)},
+        ]
+        self.assert_companion(non_live_rendered, expected_rows)
+        self.assert_companion(live_rendered, expected_rows)
         self.assertNotIn(b"XX.NONE.00.HNZ", non_live_rendered)
 
     def test_invalid_companion_distance_fails_visibly(self):
@@ -680,11 +787,15 @@ class FinDerInputGenerationTests(unittest.TestCase):
             is_live_mode=True,
         )
 
-        self.assertEqual(
+        self.assert_live_data_0(
             rendered,
-            b"# 1000 0\n"
-            b"46.10000000000001 7.2 CH.FIRST..HHE 1000 12.5\n"
-            b"45.9 8.4 IV.SECOND.01.HNZ 1000 1e-08",
+            event_time=1000,
+            expected_rows=[
+                {"latitude": 46.10000000000001, "longitude": 7.2,
+                 "sncl": "CH.FIRST..HHE", "pga": 12.5},
+                {"latitude": 45.9, "longitude": 8.4,
+                 "sncl": "IV.SECOND.01.HNZ", "pga": 1e-8},
+            ],
         )
         self.assertEqual(len(rendered.splitlines()), 3)
         self.assertNotIn(b"XX.NONE.00.HNZ", rendered)
@@ -700,11 +811,15 @@ class FinDerInputGenerationTests(unittest.TestCase):
             is_live_mode=True,
         )
 
-        self.assertEqual(
+        self.assert_live_data_0(
             rendered,
-            b"# 2000 0\n"
-            b"46.10000000000001 7.2 CH.FIRST..HHE 2000 12.5\n"
-            b"45.9 8.4 IV.SECOND.01.HNZ 2000 1e-08",
+            event_time=2000,
+            expected_rows=[
+                {"latitude": 46.10000000000001, "longitude": 7.2,
+                 "sncl": "CH.FIRST..HHE", "pga": 12.5},
+                {"latitude": 45.9, "longitude": 8.4,
+                 "sncl": "IV.SECOND.01.HNZ", "pga": 1e-8},
+            ],
         )
         self.assertEqual([channel.get_sncl() for channel in channels],
                          ["CH.FIRST..HHE", "IV.SECOND.01.HNZ"])
@@ -719,11 +834,14 @@ class FinDerInputGenerationTests(unittest.TestCase):
             is_live_mode=False,
         )
 
-        self.assertEqual(
+        self.assert_non_live_data_0(
             rendered,
-            b"# 3000 0\n"
-            b"46.10000000000001 7.2 2.0\n"
-            b"45.9 8.4 -2.0",
+            event_time=3000,
+            expected_rows=[
+                {"latitude": 46.10000000000001, "longitude": 7.2,
+                 "pga": 100.0},
+                {"latitude": 45.9, "longitude": 8.4, "pga": 0.01},
+            ],
         )
         self.assertEqual([channel.pga for channel in channels], [100.0, 0.01])
 
