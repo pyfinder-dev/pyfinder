@@ -69,10 +69,10 @@ class ControlledEvent:
     """Supply deterministic event values through the existing formatter seam."""
 
     def get_latitude(self):
-        return 46.2
+        return 0.0
 
     def get_longitude(self):
-        return 7.3
+        return 0.0
 
     def get_depth(self):
         return 10.0
@@ -294,8 +294,8 @@ def main():
     event_data = ControlledEvent()
     observations = [
         {
-            "latitude": 46.1,
-            "longitude": 7.2,
+            "latitude": 0.0,
+            "longitude": 1.0,
             "network": "CH",
             "station": "IMAGECHECK",
             "location": "00",
@@ -309,8 +309,13 @@ def main():
     ]
     expected_data = (
         b"# 1786349730 0\n"
-        b"46.2 7.3 1.101231386790699\n"
-        b"46.1 7.2 1.0969100130080565"
+        b"0.0 0.0 1.101231386790699\n"
+        b"0.0 1.0 1.0969100130080565"
+    )
+    expected_companion = (
+        b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
+        b"XX.NONE.00.HNZ 12.625 0.0\n"
+        b"CH.IMAGECHECK.00.HNZ 12.5 111.2"
     )
     process_logger = customlogger.file_logger(
         runtime_context.process_log_path,
@@ -360,19 +365,29 @@ def main():
 
     config_path = Path(config_path)
     data_path = Path(data_path)
+    companion_path = workspace / "pyfinder_amplitudes_to_Finder.txt"
     workspace_log_path = workspace / "pyfinder.log"
     require(workspace == Path(executable.get_working_directory()), "augmented workspace differs")
     require(config_path == workspace / "finder_file.config", "configuration path differs")
     require(data_path == workspace / "data_0", "data path differs")
+    require(companion_path.is_file(), "amplitude companion is absent")
     require(workspace_log_path.is_file(), "workspace log is absent")
     require(data_path.read_bytes() == expected_data, "installed formatter output differs")
+    require(
+        companion_path.read_bytes() == expected_companion,
+        "installed amplitude companion output differs",
+    )
     configuration_lines = config_path.read_text(encoding="utf-8").splitlines()
     require("DATA_FOLDER {0}".format(workspace) in configuration_lines, "DATA_FOLDER does not select the workspace")
 
     workspace_log = workspace_log_path.read_text(encoding="utf-8")
     require(IDENTITY in workspace_log, "workspace log lacks augmented identity")
     require("FinDer configuration file" in workspace_log, "workspace log lacks configuration diagnostics")
-    require("Data file written" in workspace_log, "workspace log lacks input diagnostics")
+    require("data_0 written" in workspace_log, "workspace log lacks data_0 diagnostics")
+    require(
+        "FinDer amplitude companion written" in workspace_log,
+        "workspace log lacks amplitude companion diagnostics",
+    )
     process_log = runtime_context.process_log_path.read_text(encoding="utf-8")
     require("waiting to enter" in process_log, "process log lacks workspace handover")
     require("completed the locked" in process_log, "process log lacks completion handover")
@@ -387,7 +402,12 @@ def main():
     result = {
         "base_digest": build_information["base_digest"],
         "finder_paths": [str(path) for path in finder_paths],
-        "owned_workspace_files": [str(config_path), str(data_path), str(workspace_log_path)],
+        "owned_workspace_files": [
+            str(config_path),
+            str(data_path),
+            str(companion_path),
+            str(workspace_log_path),
+        ],
         "paramws_commit": build_information["paramws"]["commit"],
         "paramws_handler": str(paramws_handler_path),
         "paramws_origin": str(paramws_root),

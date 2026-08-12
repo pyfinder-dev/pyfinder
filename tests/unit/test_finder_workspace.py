@@ -271,6 +271,13 @@ class FinDerWorkspaceTests(unittest.TestCase):
             executable.logger.info("retry marker %s", attempt)
             data_path = Path(executable.get_working_directory()) / "data_0"
             data_path.write_bytes(b"current input")
+            companion_path = (
+                Path(executable.get_working_directory())
+                / "pyfinder_amplitudes_to_Finder.txt"
+            )
+            companion_path.write_bytes(
+                "companion attempt {0}".format(attempt).encode("ascii")
+            )
             return str(data_path), finderexec.FinderChannelList()
 
         write_data.attempt = 1
@@ -286,6 +293,13 @@ class FinDerWorkspaceTests(unittest.TestCase):
                 augmented_event_id=identity,
             )
             first_workspace = Path(executable.get_working_directory())
+            companion = (
+                first_workspace / "pyfinder_amplitudes_to_Finder.txt"
+            )
+            self.assertEqual(
+                companion.read_bytes(),
+                b"companion attempt 1",
+            )
             sentinel = first_workspace / "operator-sentinel.txt"
             finder_output = (
                 first_workspace
@@ -310,6 +324,7 @@ class FinDerWorkspaceTests(unittest.TestCase):
             finder_output.read_text(encoding="utf-8"),
             "finder output",
         )
+        self.assertEqual(companion.read_bytes(), b"companion attempt 2")
         self.assertTrue((second_workspace / "finder_file.config").is_file())
         self.assertTrue((second_workspace / ".pyfinder.lock").is_file())
         event_log = (second_workspace / "pyfinder.log").read_text(
@@ -376,8 +391,8 @@ class FinDerWorkspaceTests(unittest.TestCase):
         work_root = self.temporary_root / "runs"
         executable = self.executable(work_root)
         event_data = mock.Mock()
-        event_data.get_latitude.return_value = 46.2
-        event_data.get_longitude.return_value = 7.3
+        event_data.get_latitude.return_value = 0.0
+        event_data.get_longitude.return_value = 0.0
         event_data.get_depth.return_value = 10.0
         event_data.get_magnitude.return_value = 5.6
         event_data.get_origin_time.return_value = (
@@ -385,8 +400,8 @@ class FinDerWorkspaceTests(unittest.TestCase):
         )
         records = [
             {
-                "latitude": 46.1,
-                "longitude": 7.2,
+                "latitude": 0.0,
+                "longitude": 1.0,
                 "network": "CH",
                 "station": "TEST",
                 "location": "00",
@@ -400,11 +415,19 @@ class FinDerWorkspaceTests(unittest.TestCase):
         ]
         expected_data = (
             b"# 1786349730 0\n"
-            b"46.2 7.3 1.101231386790699\n"
-            b"46.1 7.2 1.0969100130080565"
+            b"0.0 0.0 1.101231386790699\n"
+            b"0.0 1.0 1.0969100130080565"
+        )
+        expected_companion = (
+            b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
+            b"XX.NONE.00.HNZ 12.625 0.0\n"
+            b"CH.TEST.00.HNZ 12.5 111.2"
         )
         identity = "event-one_t00010"
+        workspace = work_root / identity
         original_import = builtins.__import__
+        original_open = builtins.open
+        opened_invocation_inputs = []
 
         def reject_downstream_import(name, *args, **kwargs):
             if name in (
@@ -417,6 +440,23 @@ class FinDerWorkspaceTests(unittest.TestCase):
                     "input materialization reached a downstream module"
                 )
             return original_import(name, *args, **kwargs)
+
+        def assert_input_open_under_lock(file, *args, **kwargs):
+            try:
+                opened_path = Path(file)
+            except TypeError:
+                return original_open(file, *args, **kwargs)
+            if (
+                opened_path.parent == workspace
+                and opened_path.name in {
+                    "finder_file.config",
+                    "data_0",
+                    "pyfinder_amplitudes_to_Finder.txt",
+                }
+            ):
+                self.assert_workspace_locked(workspace)
+                opened_invocation_inputs.append(opened_path.name)
+            return original_open(file, *args, **kwargs)
 
         with mock.patch.object(
             executable,
@@ -448,17 +488,32 @@ class FinDerWorkspaceTests(unittest.TestCase):
             builtins,
             "__import__",
             side_effect=reject_downstream_import,
+        ), mock.patch.object(
+            builtins,
+            "open",
+            side_effect=assert_input_open_under_lock,
         ):
-            config_path, data_path = executable.materialize_inputs(
+            materialized_paths = executable.materialize_inputs(
                 records,
                 event_data,
                 augmented_event_id=identity,
             )
+        self.assertEqual(len(materialized_paths), 2)
+        config_path, data_path = materialized_paths
 
-        workspace = work_root / identity
         self.assertEqual(Path(config_path), workspace / "finder_file.config")
         self.assertEqual(Path(data_path), workspace / "data_0")
         self.assertEqual(Path(data_path).read_bytes(), expected_data)
+        companion_path = workspace / "pyfinder_amplitudes_to_Finder.txt"
+        self.assertEqual(companion_path.read_bytes(), expected_companion)
+        self.assertEqual(
+            opened_invocation_inputs,
+            [
+                "finder_file.config",
+                "data_0",
+                "pyfinder_amplitudes_to_Finder.txt",
+            ],
+        )
         self.assertEqual(
             Path(config_path).read_text(encoding="utf-8"),
             "DATA_FOLDER {0}\nMODEL unchanged\n".format(workspace),
@@ -905,6 +960,90 @@ class FinDerWorkspaceTests(unittest.TestCase):
             )
 
         self.assertFalse((workspace / "data_0").exists())
+        self.assertFalse(
+            (workspace / "pyfinder_amplitudes_to_Finder.txt").exists()
+        )
+
+    def test_companion_render_or_write_failure_prevents_finder_execution(self):
+        event_data = mock.Mock()
+        event_data.get_event_id.return_value = "event-one"
+        event_data.get_latitude.return_value = 0.0
+        event_data.get_longitude.return_value = 0.0
+        event_data.get_depth.return_value = 10.0
+        event_data.get_magnitude.return_value = 5.6
+        event_data.get_origin_time.return_value = (
+            "2026-08-10T08:15:30.250000Z"
+        )
+        records = [
+            {
+                "latitude": 0.0,
+                "longitude": 1.0,
+                "network": "CH",
+                "station": "TEST",
+                "location": "00",
+                "channel": "HNZ",
+                "pga": 12.5,
+                "timestamp": 1786349730.25,
+                "source": "RRSM",
+                "provider_value": 12.5,
+                "provider_unit": "cm/s^2",
+            }
+        ]
+
+        render_executable = self.executable(self.temporary_root / "render-runs")
+        with mock.patch.object(
+            render_executable,
+            "_check_finder_executable",
+        ), mock.patch.object(
+            render_executable,
+            "_render_amplitude_companion",
+            side_effect=ValueError("controlled companion rendering failure"),
+        ), mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=1.0,
+        ), mock.patch.object(
+            render_executable,
+            "_run_finder",
+        ) as render_run:
+            with self.assertRaisesRegex(ValueError, "companion rendering"):
+                render_executable.execute(
+                    records,
+                    event_data,
+                    augmented_event_id="event-one_t00010",
+                )
+        render_run.assert_not_called()
+
+        write_executable = self.executable(self.temporary_root / "write-runs")
+        original_open = builtins.open
+
+        def fail_companion_write(file, *args, **kwargs):
+            if Path(file).name == "pyfinder_amplitudes_to_Finder.txt":
+                raise OSError("controlled companion write failure")
+            return original_open(file, *args, **kwargs)
+
+        with mock.patch.object(
+            write_executable,
+            "_check_finder_executable",
+        ), mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=1.0,
+        ), mock.patch.object(
+            write_executable,
+            "_run_finder",
+        ) as write_run, mock.patch.object(
+            builtins,
+            "open",
+            side_effect=fail_companion_write,
+        ):
+            with self.assertRaisesRegex(OSError, "companion write failure"):
+                write_executable.execute(
+                    records,
+                    event_data,
+                    augmented_event_id="event-one_t00010",
+                )
+        write_run.assert_not_called()
 
     def test_output_lookup_uses_only_the_returned_finder_identifier(self):
         executable = self.executable(self.temporary_root / "runs")

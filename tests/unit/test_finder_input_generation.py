@@ -381,6 +381,12 @@ class FinDerInputGenerationTests(unittest.TestCase):
                 self.assertFalse(
                     (Path(temporary_directory.name) / "data_0").exists()
                 )
+                self.assertFalse(
+                    (
+                        Path(temporary_directory.name)
+                        / "pyfinder_amplitudes_to_Finder.txt"
+                    ).exists()
+                )
 
     def test_production_writer_calls_explicit_artificial_method_once(self):
         executable = self.executable(live_mode=True)
@@ -402,6 +408,7 @@ class FinDerInputGenerationTests(unittest.TestCase):
             *real_channels,
         ])
 
+        event_data = ControlledEvent()
         with mock.patch.object(
             executable,
             "_build_real_finder_channels",
@@ -418,10 +425,14 @@ class FinDerInputGenerationTests(unittest.TestCase):
             finderexec.FinDerInputFormatter,
             "format",
             return_value=b"controlled-data",
-        ) as format_data:
+        ) as format_data, mock.patch.object(
+            executable,
+            "_render_amplitude_companion",
+            return_value=b"controlled-companion",
+        ) as render_companion:
             data_path, returned_channels = executable._write_data_for_finder(
                 observations,
-                ControlledEvent(),
+                event_data,
             )
 
         build.assert_called_once_with(observations)
@@ -431,15 +442,34 @@ class FinDerInputGenerationTests(unittest.TestCase):
             event_time_epoch=1000.75,
             is_live_mode=True,
         )
+        render_companion.assert_called_once_with(
+            finder_channels=completed_channels,
+            event_latitude=46.2,
+            event_longitude=7.3,
+        )
         self.assertIs(returned_channels, completed_channels)
         self.assertEqual(Path(data_path).read_bytes(), b"controlled-data")
+        companion_path = (
+            Path(temporary_directory.name)
+            / "pyfinder_amplitudes_to_Finder.txt"
+        )
+        self.assertEqual(companion_path.read_bytes(), b"controlled-companion")
 
         messages = self.info_messages(executable)
         self.assertIn("Preparing 2 merged real observations", messages)
         self.assertIn("Assembled 2 real FinDer channels", messages)
         self.assertIn("Serializing 3 completed FinDer channels", messages)
         self.assertIn("data_0 in live mode", messages)
+        self.assertIn(
+            "Writing 3 completed channels to the FinDer amplitude companion",
+            messages,
+        )
+        self.assertIn("descending linear PGA order", messages)
         self.assertIn(f"data_0 written: {data_path}", messages)
+        self.assertIn(
+            f"FinDer amplitude companion written: {companion_path}",
+            messages,
+        )
 
     def test_production_writer_reports_non_live_serialization_mode(self):
         executable = self.executable(live_mode=False)
@@ -463,6 +493,183 @@ class FinDerInputGenerationTests(unittest.TestCase):
             "Serializing 3 completed FinDer channels to data_0 in non-live mode",
             self.info_messages(executable),
         )
+
+    def test_companion_exact_bytes_sort_stably_without_mutating_channels_or_data(self):
+        channels = FinderChannelList([
+            FinderChannel(
+                latitude=0.0,
+                longitude=0.0,
+                sncl="XX.NONE.00.HNZ",
+                pga=12.5,
+                is_artificial=True,
+            ),
+            FinderChannel(
+                latitude=0.0,
+                longitude=0.0,
+                sncl="IV.LOW.00.HNZ",
+                pga=1e-12,
+                is_artificial=False,
+            ),
+            FinderChannel(
+                latitude=0.0,
+                longitude=1.0,
+                sncl="CH.FAR.00.HNZ",
+                pga=12.5,
+                is_artificial=False,
+            ),
+            FinderChannel(
+                latitude=0.0,
+                longitude=0.5,
+                sncl="FR.MID.00.HNZ",
+                pga=2.0,
+                is_artificial=False,
+            ),
+        ])
+        original_channels = list(channels)
+        original_state = [vars(channel).copy() for channel in channels]
+        original_data = FinDerInputFormatter.format(channels, 1000.0, True)
+
+        rendered = self.executable()._render_amplitude_companion(
+            finder_channels=channels,
+            event_latitude=0.0,
+            event_longitude=0.0,
+        )
+
+        self.assertEqual(
+            rendered,
+            b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
+            b"XX.NONE.00.HNZ 12.5 0.0\n"
+            b"CH.FAR.00.HNZ 12.5 111.2\n"
+            b"FR.MID.00.HNZ 2.0 55.6\n"
+            b"IV.LOW.00.HNZ 1e-12 0.0",
+        )
+        self.assertEqual(list(channels), original_channels)
+        self.assertEqual(
+            [vars(channel).copy() for channel in channels],
+            original_state,
+        )
+        self.assertEqual(
+            FinDerInputFormatter.format(channels, 1000.0, True),
+            original_data,
+        )
+        self.assertEqual(
+            [channel.get_sncl() for channel in channels],
+            [
+                "XX.NONE.00.HNZ",
+                "IV.LOW.00.HNZ",
+                "CH.FAR.00.HNZ",
+                "FR.MID.00.HNZ",
+            ],
+        )
+
+    def test_companion_renders_supplied_real_only_membership_in_both_modes(self):
+        real_channels = FinderChannelList([
+            FinderChannel(
+                latitude=0.0,
+                longitude=1.0,
+                sncl="CH.FIRST.00.HNZ",
+                pga=2.0,
+                is_artificial=False,
+            ),
+            FinderChannel(
+                latitude=0.0,
+                longitude=0.0,
+                sncl="IV.SECOND.00.HNZ",
+                pga=4.0,
+                is_artificial=False,
+            ),
+        ])
+        non_live = self.executable(live_mode=False)
+        live = self.executable(live_mode=True)
+
+        non_live_rendered = non_live._render_amplitude_companion(
+            real_channels,
+            0.0,
+            0.0,
+        )
+        live_rendered = live._render_amplitude_companion(
+            real_channels,
+            0.0,
+            0.0,
+        )
+
+        expected = (
+            b"# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
+            b"IV.SECOND.00.HNZ 4.0 0.0\n"
+            b"CH.FIRST.00.HNZ 2.0 111.2"
+        )
+        self.assertEqual(non_live_rendered, expected)
+        self.assertEqual(live_rendered, expected)
+        self.assertNotIn(b"XX.NONE.00.HNZ", non_live_rendered)
+
+    def test_invalid_companion_distance_fails_visibly(self):
+        invalid_results = (None, True, "12.0", math.nan, math.inf, -0.1)
+        for result in invalid_results:
+            with self.subTest(result=result), mock.patch.object(
+                finderexec.Calculator,
+                "haversine",
+                return_value=result,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "FinDer amplitude companion distance",
+                ):
+                    self.executable()._render_amplitude_companion(
+                        self.channels(),
+                        0.0,
+                        0.0,
+                    )
+
+        with mock.patch.object(
+            finderexec.Calculator,
+            "haversine",
+            side_effect=TypeError("controlled Haversine failure"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "distance calculation failed",
+            ):
+                self.executable()._render_amplitude_companion(
+                    self.channels(),
+                    0.0,
+                    0.0,
+                )
+
+    def test_companion_render_failure_does_not_refresh_either_data_artifact(self):
+        executable = self.executable()
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix="pyfinder-companion-render-failure-unit-"
+        )
+        self.addCleanup(temporary_directory.cleanup)
+        executable.working_directory = temporary_directory.name
+        data_path = Path(temporary_directory.name) / "data_0"
+        companion_path = (
+            Path(temporary_directory.name)
+            / "pyfinder_amplitudes_to_Finder.txt"
+        )
+        data_path.write_bytes(b"stale-data")
+        companion_path.write_bytes(b"stale-companion")
+
+        with mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=20.0,
+        ), mock.patch.object(
+            finderexec.Calculator,
+            "haversine",
+            return_value=math.nan,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "FinDer amplitude companion distance",
+            ):
+                executable._write_data_for_finder(
+                    self.observations(),
+                    ControlledEvent(),
+                )
+
+        self.assertEqual(data_path.read_bytes(), b"stale-data")
+        self.assertEqual(companion_path.read_bytes(), b"stale-companion")
 
     def test_formatter_serializes_supplied_real_only_list_without_artificial_point(self):
         real_channels = self.channels(pgas=(12.5, 1e-8))

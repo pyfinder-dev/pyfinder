@@ -333,6 +333,20 @@ exit 90
         self.assertIn("executable.materialize_inputs(", self.helper_contents)
         self.assertNotIn("executable.execute(", self.helper_contents)
 
+    def test_materialization_helper_requires_exact_amplitude_companion(self):
+        for expected_fragment in (
+            'workspace / "pyfinder_amplitudes_to_Finder.txt"',
+            "# SNCL PGA_CM_S2 EPI_DISTANCE_KM",
+            "XX.NONE.00.HNZ 12.625 0.0",
+            "CH.IMAGECHECK.00.HNZ 12.5 111.2",
+            '"FinDer amplitude companion written"',
+            "companion_path.read_bytes() == expected_companion",
+            "str(companion_path)",
+        ):
+            with self.subTest(expected_fragment=expected_fragment):
+                self.assertIn(expected_fragment, self.helper_contents)
+        self.assertNotIn("Data file written", self.helper_contents)
+
     def test_verifier_and_helper_are_excluded_from_the_image_context(self):
         self.assertTrue(is_ignored("scripts/verify-pyfinder-image.sh"))
         self.assertTrue(is_ignored("tests/container/verify_installed_image.py"))

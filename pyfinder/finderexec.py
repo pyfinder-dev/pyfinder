@@ -224,7 +224,7 @@ class FinDerExecutable(object):
         os.makedirs(output_root_folder, exist_ok=True)
 
         # Reusing an event-and-delay workspace retains every existing FinDer
-        # file. PyFinder only rewrites the two invocation files it owns.
+        # file. PyFinder only rewrites the three invocation files it owns.
         self.working_directory = str(workspace)
         os.makedirs(self.working_directory, exist_ok=True)
 
@@ -394,7 +394,7 @@ class FinDerExecutable(object):
         event_data,
     ) -> tuple[str, FinderChannelList]:
         """
-        Assemble merged observations and write the serialized ``data_0``.
+        Assemble merged observations and write both data artifacts.
 
         Service normalization and StationMerger have already selected the real
         observations and their order. This boundary assembles those decisions
@@ -402,6 +402,10 @@ class FinDerExecutable(object):
         returns the completed list alongside the written path.
         """
         data_file_path = os.path.join(self.working_directory, "data_0")
+        companion_file_path = os.path.join(
+            self.working_directory,
+            "pyfinder_amplitudes_to_Finder.txt",
+        )
 
         if not isinstance(observations, list):
             raise TypeError(
@@ -438,12 +442,88 @@ class FinDerExecutable(object):
             is_live_mode=self.is_live_mode,
         )
 
-        # Write the data to the working directory
+        # Render the companion from the same completed linear membership as
+        # data_0. Both payloads are ready before either artifact is opened.
+        self.logger.info(
+            f"Writing {len(finder_channels)} completed channels to the "
+            "FinDer amplitude companion in descending linear PGA order."
+        )
+        companion_bytes = self._render_amplitude_companion(
+            finder_channels=finder_channels,
+            event_latitude=event_data.get_latitude(),
+            event_longitude=event_data.get_longitude(),
+        )
+
         with open(data_file_path, "wb") as data_file:
             data_file.write(data_0_bytes)
+        with open(companion_file_path, "wb") as companion_file:
+            companion_file.write(companion_bytes)
 
         self.logger.info(f"data_0 written: {data_file_path}")
+        self.logger.info(
+            f"FinDer amplitude companion written: {companion_file_path}"
+        )
         return data_file_path, finder_channels
+
+    def _render_amplitude_companion(
+        self,
+        finder_channels: FinderChannelList,
+        event_latitude,
+        event_longitude,
+    ) -> bytes:
+        """Render operator-facing linear PGA and epicentral-distance rows."""
+        # Sorting a copy keeps the completed channel list and data_0 order
+        # unchanged. Python's stable sort retains supplied order for PGA ties.
+        ordered_channels = sorted(
+            finder_channels,
+            key=lambda channel: float(channel.pga),
+            reverse=True,
+        )
+        lines = ["# SNCL PGA_CM_S2 EPI_DISTANCE_KM"]
+        for index, channel in enumerate(ordered_channels):
+            channel_identity = channel.get_sncl()
+            try:
+                distance_result = Calculator.haversine(
+                    event_latitude,
+                    event_longitude,
+                    channel.latitude,
+                    channel.longitude,
+                )
+            except Exception as error:
+                raise ValueError(
+                    "FinDer amplitude companion distance calculation failed "
+                    f"for channel {index} ({channel_identity})"
+                ) from error
+
+            if isinstance(distance_result, bool) or not isinstance(
+                distance_result,
+                Real,
+            ):
+                raise ValueError(
+                    "FinDer amplitude companion distance must be numerical "
+                    f"for channel {index} ({channel_identity})"
+                )
+            try:
+                distance_km = float(distance_result)
+            except (OverflowError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "FinDer amplitude companion distance must be a finite "
+                    f"number for channel {index} ({channel_identity})"
+                ) from error
+            if not math.isfinite(distance_km) or distance_km < 0:
+                raise ValueError(
+                    "FinDer amplitude companion distance must be finite and "
+                    f"nonnegative for channel {index} ({channel_identity})"
+                )
+
+            # Distance is derived only for operator information; it is not
+            # retained in FinderChannel or used to order companion rows.
+            lines.append(
+                f"{channel_identity} {repr(float(channel.pga))} "
+                f"{distance_km:.1f}"
+            )
+
+        return "\n".join(lines).encode("ascii")
 
     @staticmethod
     def _build_real_finder_channels(
