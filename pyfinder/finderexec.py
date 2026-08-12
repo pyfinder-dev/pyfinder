@@ -26,7 +26,7 @@ from pyfinder.workspace import select_workspace_path
 
 
 class FinDerExecutionError(RuntimeError):
-    """Report one nonzero FinDer subprocess result to the workflow caller."""
+    """Report one unsuccessful FinDer invocation to the workflow caller."""
 
     def __init__(
         self,
@@ -37,6 +37,7 @@ class FinDerExecutionError(RuntimeError):
         command,
         executable_path,
         working_directory,
+        reason,
     ):
         self.returncode = returncode
         self.stdout = stdout
@@ -44,9 +45,11 @@ class FinDerExecutionError(RuntimeError):
         self.command = tuple(command)
         self.executable_path = executable_path
         self.working_directory = working_directory
+        self.reason = reason
         super().__init__(
-            "FinDer execution failed with return code {0}; "
-            "executable={1}; workspace={2}".format(
+            "FinDer execution failed: {0}; returncode={1}; "
+            "executable={2}; workspace={3}".format(
+                reason,
                 returncode,
                 executable_path,
                 working_directory,
@@ -608,6 +611,18 @@ class FinDerExecutable(object):
                 command=command,
                 executable_path=self.executable_path,
                 working_directory=self.working_directory,
+                reason="nonzero-return-code",
+            )
+
+        if self.finder_event_id is None:
+            raise FinDerExecutionError(
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                command=command,
+                executable_path=self.executable_path,
+                working_directory=self.working_directory,
+                reason="missing-event-id",
             )
 
         # Return the stdout, stderr, and the return code, although we don't need them

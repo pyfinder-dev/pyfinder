@@ -774,6 +774,7 @@ class FinDerWorkspaceTests(unittest.TestCase):
         self.assertEqual(error.stderr, stderr)
         self.assertEqual(error.executable_path, str(controlled_child))
         self.assertEqual(error.working_directory, str(workspace))
+        self.assertEqual(error.reason, "nonzero-return-code")
         self.assertEqual(
             error.command,
             (
@@ -803,6 +804,115 @@ class FinDerWorkspaceTests(unittest.TestCase):
         event_log = (workspace / "pyfinder.log").read_text(encoding="utf-8")
         self.assertIn("CONTROLLED NONZERO STDOUT", event_log)
         self.assertIn("CONTROLLED NONZERO STDERR", event_log)
+
+    def test_zero_return_without_identifier_fails_before_output_collection(self):
+        identity = "event-missing-id_t00010"
+        work_root = self.temporary_root / "runs"
+        workspace = work_root / identity
+        controlled_child = self.temporary_root / "controlled-missing-id-finder"
+        stdout = b"CONTROLLED MISSING-ID STDOUT\n"
+        stderr = b"CONTROLLED MISSING-ID STDERR\n"
+        _write_controlled_executable(
+            controlled_child,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=0,
+        )
+        executable = self.executable(work_root)
+        executable.executable_path = str(controlled_child)
+        process_logger = executable.logger
+        event_data = mock.Mock()
+        event_data.get_event_id.return_value = "event-missing-id"
+        transient_handlers = []
+        original_new_handler = finderexec.customlogger._new_handler
+
+        def record_handler(*args, **kwargs):
+            handler = original_new_handler(*args, **kwargs)
+            transient_handlers.append(handler)
+            return handler
+
+        def write_configuration():
+            self.assert_workspace_locked(workspace)
+            executable.finder_file_config_path = str(
+                workspace / "finder_file.config"
+            )
+
+        with mock.patch.object(
+            finderexec.customlogger,
+            "_new_handler",
+            side_effect=record_handler,
+        ), mock.patch.object(
+            executable,
+            "_write_finder_configuration",
+            side_effect=write_configuration,
+        ), mock.patch.object(
+            executable,
+            "_write_data_for_finder",
+            return_value=(
+                str(workspace / "data_0"),
+                finderexec.FinderChannelList(),
+            ),
+        ), mock.patch.object(
+            executable,
+            "_collect_finder_output",
+        ) as collect_output, mock.patch.object(
+            finderexec,
+            "read_event_solution_from_file",
+        ) as read_event, mock.patch.object(
+            finderexec,
+            "read_rupture_polygon_from_file",
+        ) as read_rupture, mock.patch.object(
+            finderexec,
+            "read_finder_channels_from_file",
+        ) as read_channels:
+            with self.assertRaises(finderexec.FinDerExecutionError) as raised:
+                executable.execute(
+                    amplitudes=[],
+                    event_data=event_data,
+                    augmented_event_id=identity,
+                )
+
+        error = raised.exception
+        self.assertIsInstance(error, Exception)
+        self.assertNotIsInstance(error, SystemExit)
+        self.assertEqual(error.reason, "missing-event-id")
+        self.assertEqual(error.returncode, 0)
+        self.assertEqual(error.stdout, stdout)
+        self.assertEqual(error.stderr, stderr)
+        self.assertEqual(error.executable_path, str(controlled_child))
+        self.assertEqual(error.working_directory, str(workspace))
+        self.assertEqual(
+            error.command,
+            (
+                str(controlled_child),
+                str(workspace / "finder_file.config"),
+                str(workspace),
+                "0",
+                "0",
+                "yes" if executable.is_live_mode else "no",
+            ),
+        )
+        self.assertEqual(
+            json.loads(
+                (workspace / "controlled-child-arguments.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            list(error.command[1:]),
+        )
+        collect_output.assert_not_called()
+        read_event.assert_not_called()
+        read_rupture.assert_not_called()
+        read_channels.assert_not_called()
+        self.assert_execution_cleanup(
+            executable,
+            workspace,
+            process_logger,
+            transient_handlers,
+        )
+        event_log = (workspace / "pyfinder.log").read_text(encoding="utf-8")
+        self.assertIn("CONTROLLED MISSING-ID STDOUT", event_log)
+        self.assertIn("CONTROLLED MISSING-ID STDERR", event_log)
 
     def test_launch_failure_propagates_original_exception_and_cleans_up(self):
         identity = "event-launch_t00010"
