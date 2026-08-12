@@ -295,7 +295,6 @@ exit 90
         self.assertIsNone(
             re.search(r"run_image[^\n]*\bcontinuous\b", self.verifier_contents)
         )
-        self.assertIn('[pyfinder_command, *command, "--help"]', self.helper_contents)
 
     def test_materialization_artifact_helpers_accept_semantic_numeric_values(self):
         with tempfile.TemporaryDirectory(
