@@ -20,7 +20,8 @@ from pyfinder.finderutils import (FinderChannelList, FinderChannel,
 from pyfinder.finderutils import (read_event_solution_from_file,
                                   read_rupture_polygon_from_file,
                                   read_finder_channels_from_file)
-from pyfinder.utils.dataformatter import (FinDerFormatterFromRawList,
+from pyfinder.utils.calculator import Calculator
+from pyfinder.utils.dataformatter import (FinDerInputFormatter,
                                           get_epoch_time)
 from pyfinder.utils.station_merger import RawStationMeasurement
 from pyfinder.workspace import select_workspace_path
@@ -393,11 +394,12 @@ class FinDerExecutable(object):
         event_data,
     ) -> tuple[str, FinderChannelList]:
         """
-        Format merged normalized observations and write ``data_0``.
-        Per-service formatters have already normalized the observations into a common
-        RawStationMesurement list. This method formats that list into the FinDer input
-        format and writes it to the working directory. It returns the path to the
-        data file and the list of FinderChannel objects used by FinDer.
+        Assemble merged observations and write the serialized ``data_0``.
+
+        Service normalization and StationMerger have already selected the real
+        observations and their order. This boundary assembles those decisions
+        into linear channels, adds the invocation's artificial point, and
+        returns the completed list alongside the written path.
         """
         data_file_path = os.path.join(self.working_directory, "data_0")
 
@@ -408,27 +410,185 @@ class FinDerExecutable(object):
             )
 
         self.logger.info(
-            "FinDerExecutable received merged normalized observations. "
-            "Formatting now..."
+            f"Preparing {len(observations)} merged real observations for FinDer."
         )
-        out_str, finder_stations = FinDerFormatterFromRawList.format(
-            event_lat=event_data.get_latitude(),
-            event_lon=event_data.get_longitude(),
-            event_depth_km=event_data.get_depth(),
-            event_mag=event_data.get_magnitude(),
-            event_time_epoch=get_epoch_time(event_data.get_origin_time()),
-            station_list=observations,
-        )
+        finder_channels = self._build_real_finder_channels(observations)
         self.logger.info(
-            "FinDerExecutable formatted the merged normalized observations."
+            f"Assembled {len(finder_channels)} real FinDer channels in merger "
+            "order."
+        )
+
+        # The artificial point is built here so data_0 and the later companion
+        # can use the same completed membership. Keep this call visible: a
+        # developer may comment it out for a controlled experiment, while the
+        # committed production path always leaves it enabled.
+        finder_channels = self.add_artificial_observation_point(
+            finder_channels,
+            event_data,
+        )
+
+        mode_name = "live" if self.is_live_mode else "non-live"
+        self.logger.info(
+            f"Serializing {len(finder_channels)} completed FinDer channels to "
+            f"data_0 in {mode_name} mode."
+        )
+        data_0_bytes = FinDerInputFormatter.format(
+            finder_channels=finder_channels,
+            event_time_epoch=get_epoch_time(event_data.get_origin_time()),
+            is_live_mode=self.is_live_mode,
         )
 
         # Write the data to the working directory
         with open(data_file_path, "wb") as data_file:
-            data_file.write(out_str)
-            
-        self.logger.info("Data file written: {}".format(data_file_path))
-        return data_file_path, finder_stations
+            data_file.write(data_0_bytes)
+
+        self.logger.info(f"data_0 written: {data_file_path}")
+        return data_file_path, finder_channels
+
+    @staticmethod
+    def _build_real_finder_channels(
+        observations: list[RawStationMeasurement],
+    ) -> FinderChannelList:
+        """Copy the merger-selected observations into linear channels."""
+        if not isinstance(observations, list):
+            raise TypeError(
+                "FinDerExecutable requires merged normalized observations "
+                "as a list"
+            )
+        if not observations:
+            raise ValueError(
+                "FinDerExecutable requires at least one merged normalized "
+                "observation"
+            )
+
+        finder_channels = FinderChannelList()
+        for index, observation in enumerate(observations):
+            if not isinstance(observation, Mapping):
+                raise TypeError(
+                    f"Merged normalized observation {index} must be a mapping"
+                )
+            try:
+                finder_channels.append(FinderChannel(
+                    latitude=observation["latitude"],
+                    longitude=observation["longitude"],
+                    network_code=observation["network"],
+                    station_code=observation["station"],
+                    location_code=observation["location"],
+                    channel_code=observation["channel"],
+                    pga=observation["pga"],
+                    is_artificial=False,
+                ))
+            except KeyError as error:
+                raise ValueError(
+                    f"Merged normalized observation {index} is missing "
+                    f"required field {error.args[0]!r}"
+                ) from error
+
+        return finder_channels
+
+    def _calculate_artificial_linear_pga(
+        self,
+        finder_channels: FinderChannelList,
+        event_magnitude: float,
+        event_depth: float,
+    ) -> float:
+        """Select the stabilizing PGA from linear event and observed values."""
+        predicted_event_linear_pga = Calculator.predict_PGA_from_magnitude(
+            event_magnitude,
+            event_depth,
+            log_scale=False,
+        )
+        if (
+            isinstance(predicted_event_linear_pga, bool)
+            or not isinstance(predicted_event_linear_pga, Real)
+        ):
+            raise ValueError("predicted artificial PGA must be numerical")
+        try:
+            predicted_event_linear_pga = float(predicted_event_linear_pga)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                "predicted artificial PGA must be finite"
+            ) from error
+        if (
+            not math.isfinite(predicted_event_linear_pga)
+            or predicted_event_linear_pga <= 0
+        ):
+            raise ValueError(
+                "predicted artificial PGA must be finite and greater than zero"
+            )
+
+        maximum_real_linear_pga = max(
+            float(channel.pga) for channel in finder_channels
+        )
+        observed_margin_pga = maximum_real_linear_pga * (
+            1 + self.artificial_point_margin_percent / 100
+        )
+        if not math.isfinite(observed_margin_pga):
+            raise ValueError("observed-margin artificial PGA must be finite")
+
+        artificial_linear_pga = max(
+            predicted_event_linear_pga,
+            observed_margin_pga,
+        )
+        if (
+            not math.isfinite(artificial_linear_pga)
+            or artificial_linear_pga <= 0
+        ):
+            raise ValueError(
+                "selected artificial PGA must be finite and greater than zero"
+            )
+
+        self.logger.info("Adding artificial PGA:")
+        self.logger.info(
+            "Maximum observed linear PGA: "
+            f"{maximum_real_linear_pga:.5f} cm/s^2"
+        )
+        self.logger.info(
+            "Event-predicted linear PGA: "
+            f"{predicted_event_linear_pga:.5f} cm/s^2"
+        )
+        self.logger.info(
+            "Configured artificial-point margin: "
+            f"{self.artificial_point_margin_percent}%"
+        )
+        self.logger.info(
+            "Observed PGA with artificial margin: "
+            f"{observed_margin_pga:.5f} cm/s^2"
+        )
+        self.logger.info(
+            f"Selected artificial PGA: {artificial_linear_pga:.5f} cm/s^2"
+        )
+
+        return artificial_linear_pga
+
+    def add_artificial_observation_point(
+        self,
+        finder_channels: FinderChannelList,
+        event_data,
+    ) -> FinderChannelList:
+        """Prepend the configured linear stabilizing observation."""
+        event_latitude = event_data.get_latitude()
+        event_longitude = event_data.get_longitude()
+        artificial_linear_pga = self._calculate_artificial_linear_pga(
+            finder_channels=finder_channels,
+            event_magnitude=event_data.get_magnitude(),
+            event_depth=event_data.get_depth(),
+        )
+
+        # This is a stabilizing observation created by PyFinder, not provider
+        # data, so it carries the fixed artificial SNCL and no provenance.
+        artificial_channel = FinderChannel(
+            latitude=event_latitude, longitude=event_longitude,
+            sncl="XX.NONE.00.HNZ", pga=artificial_linear_pga,
+            is_artificial=True,
+        )
+        self.logger.info(
+            "Added artificial channel XX.NONE.00.HNZ at event coordinates "
+            f"({event_latitude}, {event_longitude}) with PGA "
+            f"{artificial_linear_pga:.5f} cm/s^2."
+        )
+
+        return FinderChannelList([artificial_channel, *finder_channels])
 
 
     def _is_live_mode_on(self):

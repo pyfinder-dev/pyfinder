@@ -307,13 +307,10 @@ def main():
             "provider_unit": "cm/s^2",
         }
     ]
-    expected_data, _expected_channels = finderexec.FinDerFormatterFromRawList.format(
-        event_lat=event_data.get_latitude(),
-        event_lon=event_data.get_longitude(),
-        event_depth_km=event_data.get_depth(),
-        event_mag=event_data.get_magnitude(),
-        event_time_epoch=finderexec.get_epoch_time(event_data.get_origin_time()),
-        station_list=observations,
+    expected_data = (
+        b"# 1786349730 0\n"
+        b"46.2 7.3 1.101231386790699\n"
+        b"46.1 7.2 1.0969100130080565"
     )
     process_logger = customlogger.file_logger(
         runtime_context.process_log_path,
@@ -339,7 +336,7 @@ def main():
 
     # Materialization ends before FinDer starts. The mocks make accidental
     # FinDer, provider, network, ShakeMap, or email activity fail immediately.
-    with mock.patch.object(executable, "_check_finder_executable", side_effect=forbidden_call("FinDer validation")) as finder_check, mock.patch.object(executable, "_run_finder", side_effect=forbidden_call("FinDer execution")) as finder_run, mock.patch.object(finderexec.subprocess, "Popen", side_effect=forbidden_call("FinDer subprocess")) as process_constructor, mock.patch.object(finderexec, "read_event_solution_from_file", side_effect=forbidden_call("FinDer output")) as read_event, mock.patch.object(finderexec, "read_rupture_polygon_from_file", side_effect=forbidden_call("FinDer output")) as read_rupture, mock.patch.object(finderexec, "read_finder_channels_from_file", side_effect=forbidden_call("FinDer output")) as read_channels, mock.patch.object(BaseWebServiceConnector, "query", side_effect=forbidden_call("provider query")) as provider_query, mock.patch.object(BaseWebServiceConnector, "open_url", side_effect=forbidden_call("provider transport")) as provider_transport, mock.patch.object(socket, "socket", side_effect=forbidden_call("network socket")) as socket_constructor, mock.patch.object(smtplib, "SMTP", side_effect=forbidden_call("SMTP")) as smtp_constructor, mock.patch.object(smtplib, "SMTP_SSL", side_effect=forbidden_call("SMTP SSL")) as smtp_ssl_constructor, mock.patch("builtins.__import__", side_effect=guarded_import):
+    with mock.patch.object(executable, "_check_finder_executable", side_effect=forbidden_call("FinDer validation")) as finder_check, mock.patch.object(executable, "_run_finder", side_effect=forbidden_call("FinDer execution")) as finder_run, mock.patch.object(finderexec.subprocess, "Popen", side_effect=forbidden_call("FinDer subprocess")) as process_constructor, mock.patch.object(finderexec, "read_event_solution_from_file", side_effect=forbidden_call("FinDer output")) as read_event, mock.patch.object(finderexec, "read_rupture_polygon_from_file", side_effect=forbidden_call("FinDer output")) as read_rupture, mock.patch.object(finderexec, "read_finder_channels_from_file", side_effect=forbidden_call("FinDer output")) as read_channels, mock.patch.object(finderexec, "get_epoch_time", return_value=1786349730.25), mock.patch.object(finderexec.Calculator, "predict_PGA_from_magnitude", return_value=1.0), mock.patch.object(BaseWebServiceConnector, "query", side_effect=forbidden_call("provider query")) as provider_query, mock.patch.object(BaseWebServiceConnector, "open_url", side_effect=forbidden_call("provider transport")) as provider_transport, mock.patch.object(socket, "socket", side_effect=forbidden_call("network socket")) as socket_constructor, mock.patch.object(smtplib, "SMTP", side_effect=forbidden_call("SMTP")) as smtp_constructor, mock.patch.object(smtplib, "SMTP_SSL", side_effect=forbidden_call("SMTP SSL")) as smtp_ssl_constructor, mock.patch("builtins.__import__", side_effect=guarded_import):
         config_path, data_path = executable.materialize_inputs(
             observations,
             event_data,

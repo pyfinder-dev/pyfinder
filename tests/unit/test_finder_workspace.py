@@ -398,17 +398,10 @@ class FinDerWorkspaceTests(unittest.TestCase):
                 "provider_unit": "cm/s^2",
             }
         ]
-        expected_data, expected_channels = (
-            finderexec.FinDerFormatterFromRawList.format(
-                event_lat=event_data.get_latitude(),
-                event_lon=event_data.get_longitude(),
-                event_depth_km=event_data.get_depth(),
-                event_mag=event_data.get_magnitude(),
-                event_time_epoch=finderexec.get_epoch_time(
-                    event_data.get_origin_time()
-                ),
-                station_list=records,
-            )
+        expected_data = (
+            b"# 1786349730 0\n"
+            b"46.2 7.3 1.101231386790699\n"
+            b"46.1 7.2 1.0969100130080565"
         )
         identity = "event-one_t00010"
         original_import = builtins.__import__
@@ -444,6 +437,14 @@ class FinDerWorkspaceTests(unittest.TestCase):
             finderexec,
             "read_finder_channels_from_file",
         ) as read_channels, mock.patch.object(
+            finderexec,
+            "get_epoch_time",
+            return_value=1786349730.25,
+        ), mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=1.0,
+        ), mock.patch.object(
             builtins,
             "__import__",
             side_effect=reject_downstream_import,
@@ -464,7 +465,21 @@ class FinDerWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(
             len(executable.get_finder_used_channels()),
-            len(expected_channels),
+            2,
+        )
+        self.assertEqual(
+            [
+                channel.get_sncl()
+                for channel in executable.get_finder_used_channels()
+            ],
+            ["XX.NONE.00.HNZ", "CH.TEST.00.HNZ"],
+        )
+        self.assertEqual(
+            [
+                channel.pga
+                for channel in executable.get_finder_used_channels()
+            ],
+            [12.625, 12.5],
         )
         check_executable.assert_not_called()
         run_finder.assert_not_called()

@@ -1,0 +1,575 @@
+"""Offline tests for common FinDer channel assembly and data_0 formatting."""
+
+import atexit
+from copy import deepcopy
+import math
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+
+_PARAMWS_LOG_DIRECTORY = tempfile.TemporaryDirectory(
+    prefix="pyfinder-input-generation-unit-"
+)
+atexit.register(_PARAMWS_LOG_DIRECTORY.cleanup)
+_original_paramws_log_file = os.environ.get("PARAMWS_LOG_FILE")
+os.environ["PARAMWS_LOG_FILE"] = str(
+    Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log"
+)
+try:
+    from pyfinder import finderexec
+    from pyfinder.finderutils import FinderChannel, FinderChannelList
+    from pyfinder.utils import dataformatter
+    from pyfinder.utils.dataformatter import FinDerInputFormatter
+finally:
+    if _original_paramws_log_file is None:
+        os.environ.pop("PARAMWS_LOG_FILE", None)
+    else:
+        os.environ["PARAMWS_LOG_FILE"] = _original_paramws_log_file
+
+
+class ControlledEvent:
+    """Supply one authoritative common event context to the executable."""
+
+    def __init__(
+        self,
+        *,
+        latitude=46.2,
+        longitude=7.3,
+        magnitude=5.6,
+        depth=10.0,
+        origin_time="2026-08-10T08:15:30.250000Z",
+    ):
+        self.latitude = latitude
+        self.longitude = longitude
+        self.magnitude = magnitude
+        self.depth = depth
+        self.origin_time = origin_time
+
+    def get_latitude(self):
+        return self.latitude
+
+    def get_longitude(self):
+        return self.longitude
+
+    def get_magnitude(self):
+        return self.magnitude
+
+    def get_depth(self):
+        return self.depth
+
+    def get_origin_time(self):
+        return self.origin_time
+
+
+class FinDerInputGenerationTests(unittest.TestCase):
+    def executable(self, *, live_mode=False, margin_percent=1.0):
+        return finderexec.FinDerExecutable(
+            options={"command_line_args": "input-generation-test"},
+            configuration={
+                "finder-executable": {
+                    "path": "/not-executed/finder_run",
+                    "output-root-folder": "/not-created/finder-output",
+                    "finder-live-mode": live_mode,
+                    "artificial-point-margin-percent": margin_percent,
+                }
+            },
+            finder_configuration_name="global",
+            finder_configuration={"DATA_FOLDER": "unused"},
+            logger=mock.Mock(),
+        )
+
+    @staticmethod
+    def observations():
+        return [
+            {
+                "latitude": 46.10000000000001,
+                "longitude": 7.2,
+                "network": "CH",
+                "station": "FIRST",
+                "location": "",
+                "channel": "HHE",
+                "pga": 12.5,
+                "timestamp": 111.25,
+                "source": "ESM",
+                "provider_value": 1.25,
+                "provider_unit": "%g",
+            },
+            {
+                "latitude": 45.9,
+                "longitude": 8.4,
+                "network": "IV",
+                "station": "SECOND",
+                "location": "01",
+                "channel": "HNZ",
+                "pga": 0.00000001,
+                "timestamp": 999999.75,
+                "source": "unrecognized-provenance-is-irrelevant",
+                "provider_value": 0.00000001,
+                "provider_unit": "cm/s^2",
+            },
+        ]
+
+    @staticmethod
+    def channels(*, pgas=(12.5, 0.00000001)):
+        return FinderChannelList([
+            FinderChannel(
+                latitude=46.10000000000001,
+                longitude=7.2,
+                network_code="CH",
+                station_code="FIRST",
+                location_code="",
+                channel_code="HHE",
+                pga=pgas[0],
+                is_artificial=False,
+            ),
+            FinderChannel(
+                latitude=45.9,
+                longitude=8.4,
+                network_code="IV",
+                station_code="SECOND",
+                location_code="01",
+                channel_code="HNZ",
+                pga=pgas[1],
+                is_artificial=False,
+            ),
+        ])
+
+    @staticmethod
+    def info_messages(executable):
+        """Return recorded operator-facing messages for substring checks."""
+        return "\n".join(
+            call.args[0] for call in executable.logger.info.call_args_list
+        )
+
+    def test_real_channel_assembly_preserves_membership_order_values_and_input(self):
+        observations = self.observations()
+        original = deepcopy(observations)
+
+        channels = self.executable()._build_real_finder_channels(observations)
+
+        self.assertIsInstance(channels, FinderChannelList)
+        self.assertEqual(len(channels), 2)
+        self.assertEqual(
+            [channel.get_sncl() for channel in channels],
+            ["CH.FIRST..HHE", "IV.SECOND.01.HNZ"],
+        )
+        self.assertEqual(
+            [channel.pga for channel in channels],
+            [12.5, 0.00000001],
+        )
+        self.assertTrue(all(channel.is_artificial is False
+                            for channel in channels))
+        self.assertEqual(observations, original)
+
+    def test_source_never_selects_channel_assembly_behavior(self):
+        observations = self.observations()
+        observations[0]["source"] = "RRSM"
+        observations[1]["source"] = "EMSC-FELT"
+
+        channels = self.executable()._build_real_finder_channels(observations)
+
+        self.assertEqual(
+            [channel.get_sncl() for channel in channels],
+            ["CH.FIRST..HHE", "IV.SECOND.01.HNZ"],
+        )
+        self.assertEqual([channel.pga for channel in channels], [12.5, 1e-8])
+
+    def test_real_channel_assembly_rejects_empty_non_list_and_invalid_records(self):
+        executable = self.executable()
+        with self.assertRaisesRegex(TypeError, "as a list"):
+            executable._build_real_finder_channels(tuple(self.observations()))
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            executable._build_real_finder_channels([])
+        with self.assertRaisesRegex(TypeError, "must be a mapping"):
+            executable._build_real_finder_channels([object()])
+
+    def test_duplicate_and_malformed_final_sncl_fail_at_formatter_boundary(self):
+        duplicate = self.observations()
+        duplicate[1].update({
+            "network": "CH",
+            "station": "FIRST",
+            "location": "",
+            "channel": "HHE",
+        })
+        duplicate_channels = self.executable()._build_real_finder_channels(
+            duplicate
+        )
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            FinDerInputFormatter.format(duplicate_channels, 1000.0, False)
+
+        cases = (
+            ("network", ""),
+            ("station", "BAD.CODE"),
+            ("location", "é"),
+            ("channel", "HN Z"),
+            ("channel", "HN\x00"),
+            ("station", "BAD/CODE"),
+        )
+        for field_name, value in cases:
+            with self.subTest(field_name=field_name, value=value):
+                observations = self.observations()[:1]
+                observations[0][field_name] = value
+                channels = self.executable()._build_real_finder_channels(
+                    observations
+                )
+                with self.assertRaises(ValueError):
+                    FinDerInputFormatter.format(channels, 1000.0, False)
+                self.assertEqual(observations[0][field_name], value)
+
+    def test_artificial_point_uses_stored_margin_and_observed_maximum(self):
+        real_channels = self.channels(pgas=(10.0, 2.0))
+        original_channels = list(real_channels)
+        executable = self.executable(margin_percent=7.5)
+
+        with mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=3.0,
+        ) as predict:
+            completed = executable.add_artificial_observation_point(
+                real_channels,
+                ControlledEvent(magnitude=5.0, depth=8.0),
+            )
+
+        predict.assert_called_once_with(5.0, 8.0, log_scale=False)
+        self.assertEqual(executable.artificial_point_margin_percent, 7.5)
+        self.assertIsNot(completed, real_channels)
+        self.assertEqual(list(real_channels), original_channels)
+        self.assertEqual(completed[1:], original_channels)
+        artificial = completed[0]
+        self.assertEqual(artificial.get_sncl(), "XX.NONE.00.HNZ")
+        self.assertEqual(artificial.latitude, 46.2)
+        self.assertEqual(artificial.longitude, 7.3)
+        self.assertEqual(artificial.pga, 10.75)
+        self.assertTrue(artificial.is_artificial)
+
+        messages = self.info_messages(executable)
+        self.assertIn("Adding artificial PGA:", messages)
+        self.assertIn(
+            "Maximum observed linear PGA: 10.00000 cm/s^2",
+            messages,
+        )
+        self.assertIn(
+            "Event-predicted linear PGA: 3.00000 cm/s^2",
+            messages,
+        )
+        self.assertIn("Configured artificial-point margin: 7.5%", messages)
+        self.assertIn(
+            "Observed PGA with artificial margin: 10.75000 cm/s^2",
+            messages,
+        )
+        self.assertIn(
+            "Selected artificial PGA: 10.75000 cm/s^2",
+            messages,
+        )
+        self.assertIn("XX.NONE.00.HNZ", messages)
+        self.assertIn("event coordinates (46.2, 7.3)", messages)
+        self.assertIn("PGA 10.75000 cm/s^2", messages)
+
+    def test_zero_margin_and_prediction_dominant_values_remain_linear(self):
+        cases = (
+            (0.0, 2.0, 10.0, 10.0),
+            (4.0, 20.0, 10.0, 20.0),
+        )
+        for margin, prediction, observed, expected in cases:
+            with self.subTest(margin=margin, prediction=prediction):
+                executable = self.executable(margin_percent=margin)
+                real_channels = self.channels(pgas=(observed, 1.0))
+                with mock.patch.object(
+                    finderexec.Calculator,
+                    "predict_PGA_from_magnitude",
+                    return_value=prediction,
+                ):
+                    completed = executable.add_artificial_observation_point(
+                        real_channels,
+                        ControlledEvent(),
+                    )
+                self.assertEqual(completed[0].pga, expected)
+                self.assertEqual([channel.pga for channel in real_channels],
+                                 [observed, 1.0])
+
+    def test_invalid_predictions_fail_visibly(self):
+        for prediction in (None, True, "12", 0.0, -1.0, math.nan, math.inf):
+            with self.subTest(prediction=prediction):
+                with mock.patch.object(
+                    finderexec.Calculator,
+                    "predict_PGA_from_magnitude",
+                    return_value=prediction,
+                ):
+                    with self.assertRaises(ValueError):
+                        self.executable().add_artificial_observation_point(
+                            self.channels(),
+                            ControlledEvent(),
+                        )
+
+    def test_invalid_observed_margin_result_fails_visibly(self):
+        with mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=1.0,
+        ):
+            with self.assertRaisesRegex(ValueError, "observed-margin"):
+                self.executable(
+                    margin_percent=100.0,
+                ).add_artificial_observation_point(
+                    self.channels(pgas=(1e308, 1.0)),
+                    ControlledEvent(),
+                )
+
+    def test_artificial_sncl_collision_fails_at_formatter_boundary(self):
+        real_channels = FinderChannelList([
+            FinderChannel(
+                latitude=45.0,
+                longitude=8.0,
+                sncl="XX.NONE.00.HNZ",
+                pga=2.0,
+                is_artificial=False,
+            )
+        ])
+        with mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=3.0,
+        ):
+            completed = self.executable().add_artificial_observation_point(
+                real_channels,
+                ControlledEvent(),
+            )
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
+                FinDerInputFormatter.format(completed, 1000.0, False)
+
+    def test_invalid_final_data_fails_before_data_0_is_written(self):
+        cases = (
+            ("duplicate SNCL", {"duplicate": True}),
+            ("malformed SNCL", {"station": "BAD.CODE"}),
+            ("invalid coordinates", {"latitude": 91.0}),
+            ("invalid PGA", {"pga": 0.0}),
+        )
+        for label, changes in cases:
+            with self.subTest(label=label):
+                executable = self.executable()
+                temporary_directory = tempfile.TemporaryDirectory(
+                    prefix="pyfinder-invalid-final-input-unit-"
+                )
+                self.addCleanup(temporary_directory.cleanup)
+                executable.working_directory = temporary_directory.name
+                observations = self.observations()
+                if changes.get("duplicate", False):
+                    observations[1].update({
+                        "network": observations[0]["network"],
+                        "station": observations[0]["station"],
+                        "location": observations[0]["location"],
+                        "channel": observations[0]["channel"],
+                    })
+                else:
+                    observations[0].update(changes)
+
+                with mock.patch.object(
+                    finderexec.Calculator,
+                    "predict_PGA_from_magnitude",
+                    return_value=3.0,
+                ):
+                    with self.assertRaises(ValueError):
+                        executable._write_data_for_finder(
+                            observations,
+                            ControlledEvent(),
+                        )
+
+                self.assertFalse(
+                    (Path(temporary_directory.name) / "data_0").exists()
+                )
+
+    def test_production_writer_calls_explicit_artificial_method_once(self):
+        executable = self.executable(live_mode=True)
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix="pyfinder-input-writer-unit-"
+        )
+        self.addCleanup(temporary_directory.cleanup)
+        executable.working_directory = temporary_directory.name
+        observations = self.observations()
+        real_channels = self.channels()
+        completed_channels = FinderChannelList([
+            FinderChannel(
+                latitude=46.2,
+                longitude=7.3,
+                sncl="XX.NONE.00.HNZ",
+                pga=20.0,
+                is_artificial=True,
+            ),
+            *real_channels,
+        ])
+
+        with mock.patch.object(
+            executable,
+            "_build_real_finder_channels",
+            return_value=real_channels,
+        ) as build, mock.patch.object(
+            executable,
+            "add_artificial_observation_point",
+            return_value=completed_channels,
+        ) as add_artificial, mock.patch.object(
+            finderexec,
+            "get_epoch_time",
+            return_value=1000.75,
+        ), mock.patch.object(
+            finderexec.FinDerInputFormatter,
+            "format",
+            return_value=b"controlled-data",
+        ) as format_data:
+            data_path, returned_channels = executable._write_data_for_finder(
+                observations,
+                ControlledEvent(),
+            )
+
+        build.assert_called_once_with(observations)
+        add_artificial.assert_called_once_with(real_channels, mock.ANY)
+        format_data.assert_called_once_with(
+            finder_channels=completed_channels,
+            event_time_epoch=1000.75,
+            is_live_mode=True,
+        )
+        self.assertIs(returned_channels, completed_channels)
+        self.assertEqual(Path(data_path).read_bytes(), b"controlled-data")
+
+        messages = self.info_messages(executable)
+        self.assertIn("Preparing 2 merged real observations", messages)
+        self.assertIn("Assembled 2 real FinDer channels", messages)
+        self.assertIn("Serializing 3 completed FinDer channels", messages)
+        self.assertIn("data_0 in live mode", messages)
+        self.assertIn(f"data_0 written: {data_path}", messages)
+
+    def test_production_writer_reports_non_live_serialization_mode(self):
+        executable = self.executable(live_mode=False)
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix="pyfinder-input-non-live-log-unit-"
+        )
+        self.addCleanup(temporary_directory.cleanup)
+        executable.working_directory = temporary_directory.name
+
+        with mock.patch.object(
+            finderexec.Calculator,
+            "predict_PGA_from_magnitude",
+            return_value=20.0,
+        ):
+            executable._write_data_for_finder(
+                self.observations(),
+                ControlledEvent(),
+            )
+
+        self.assertIn(
+            "Serializing 3 completed FinDer channels to data_0 in non-live mode",
+            self.info_messages(executable),
+        )
+
+    def test_formatter_serializes_supplied_real_only_list_without_artificial_point(self):
+        real_channels = self.channels(pgas=(12.5, 1e-8))
+
+        rendered = FinDerInputFormatter.format(
+            finder_channels=real_channels,
+            event_time_epoch=1000.75,
+            is_live_mode=True,
+        )
+
+        self.assertEqual(
+            rendered,
+            b"# 1000 0\n"
+            b"46.10000000000001 7.2 CH.FIRST..HHE 1000 12.5\n"
+            b"45.9 8.4 IV.SECOND.01.HNZ 1000 1e-08",
+        )
+        self.assertEqual(len(rendered.splitlines()), 3)
+        self.assertNotIn(b"XX.NONE.00.HNZ", rendered)
+        self.assertEqual([channel.pga for channel in real_channels],
+                         [12.5, 1e-8])
+
+    def test_live_formatter_uses_common_timestamp_linear_pga_and_exact_order(self):
+        channels = self.channels(pgas=(12.5, 1e-8))
+
+        rendered = FinDerInputFormatter.format(
+            finder_channels=channels,
+            event_time_epoch=2000.99,
+            is_live_mode=True,
+        )
+
+        self.assertEqual(
+            rendered,
+            b"# 2000 0\n"
+            b"46.10000000000001 7.2 CH.FIRST..HHE 2000 12.5\n"
+            b"45.9 8.4 IV.SECOND.01.HNZ 2000 1e-08",
+        )
+        self.assertEqual([channel.get_sncl() for channel in channels],
+                         ["CH.FIRST..HHE", "IV.SECOND.01.HNZ"])
+        self.assertEqual([channel.pga for channel in channels], [12.5, 1e-8])
+
+    def test_non_live_formatter_calculates_log10_only_in_output(self):
+        channels = self.channels(pgas=(100.0, 0.01))
+
+        rendered = FinDerInputFormatter.format(
+            finder_channels=channels,
+            event_time_epoch=3000.25,
+            is_live_mode=False,
+        )
+
+        self.assertEqual(
+            rendered,
+            b"# 3000 0\n"
+            b"46.10000000000001 7.2 2.0\n"
+            b"45.9 8.4 -2.0",
+        )
+        self.assertEqual([channel.pga for channel in channels], [100.0, 0.01])
+
+    def test_formatter_rejects_invalid_channel_values_and_duplicate_sncl(self):
+        invalid_values = (
+            ("latitude", True),
+            ("latitude", 91.0),
+            ("longitude", -181.0),
+            ("longitude", math.nan),
+            ("pga", "1.0"),
+            ("pga", 0.0),
+            ("pga", -1.0),
+            ("pga", math.inf),
+        )
+        for field_name, value in invalid_values:
+            with self.subTest(field_name=field_name, value=value):
+                channels = self.channels()
+                setattr(channels[0], field_name, value)
+                with self.assertRaises(ValueError):
+                    FinDerInputFormatter.format(channels, 1000.0, False)
+
+        channels = self.channels()
+        channels[1].set_sncl("CH.FIRST..HHE")
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            FinDerInputFormatter.format(channels, 1000.0, False)
+
+    def test_formatter_rejects_invalid_timestamp_mode_list_and_sncl(self):
+        for timestamp in (None, True, "1000", math.nan, math.inf):
+            with self.subTest(timestamp=timestamp):
+                with self.assertRaises(ValueError):
+                    FinDerInputFormatter.format(
+                        self.channels(), timestamp, False
+                    )
+        with self.assertRaises(ValueError):
+            FinDerInputFormatter.format(self.channels(), 1000.0, "no")
+        with self.assertRaises(TypeError):
+            FinDerInputFormatter.format(list(self.channels()), 1000.0, False)
+
+        malformed = self.channels()
+        malformed[0].network = "C.H"
+        with self.assertRaises(ValueError):
+            FinDerInputFormatter.format(malformed, 1000.0, False)
+
+    def test_formatter_does_not_consult_module_global_configuration(self):
+        with mock.patch.object(dataformatter, "pyfinderconfig", object()):
+            rendered = FinDerInputFormatter.format(
+                self.channels(pgas=(100.0, 0.01)),
+                1000.0,
+                False,
+            )
+
+        self.assertEqual(rendered.splitlines()[0], b"# 1000 0")
+
+
+if __name__ == "__main__":
+    unittest.main()
