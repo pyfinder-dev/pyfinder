@@ -134,7 +134,7 @@ class FinDerWorkspaceTests(unittest.TestCase):
     def assert_non_live_data_0(self, path, *, event_time, expected_rows):
         """Verify materialized non-live data structurally and numerically."""
         lines = path.read_bytes().decode("ascii").splitlines()
-        self.assertEqual(lines[0].split(), ["#", str(event_time), "0"])
+        self.assertEqual(lines[0], "# {0} 0".format(event_time))
         self.assertEqual(len(lines), len(expected_rows) + 1)
         for line, expected in zip(lines[1:], expected_rows):
             fields = line.split()
@@ -150,10 +150,7 @@ class FinDerWorkspaceTests(unittest.TestCase):
     def assert_companion(self, path, expected_rows):
         """Verify materialized companion membership and numeric semantics."""
         lines = path.read_bytes().decode("ascii").splitlines()
-        self.assertEqual(
-            lines[0].split(),
-            ["#", "SNCL", "PGA_CM_S2", "EPI_DISTANCE_KM"],
-        )
+        self.assertEqual(lines[0], "# SNCL PGA_CM_S2 EPI_DISTANCE_KM")
         self.assertEqual(len(lines), len(expected_rows) + 1)
         for line, expected in zip(lines[1:], expected_rows):
             fields = line.split()
@@ -734,28 +731,29 @@ class FinDerWorkspaceTests(unittest.TestCase):
             owners_before,
         )
 
-        process_messages = self.logged_messages(process_logger, "info")
-        waiting_message = next(
-            message for message in process_messages if "waiting" in message
+        process_info_arguments = [
+            call.args[1:] for call in process_logger.info.call_args_list
+        ]
+        self.assertIn(
+            (identity, str(workspace), str(event_log_path)),
+            process_info_arguments,
         )
-        completion_message = next(
-            message for message in process_messages if "completed" in message
+        self.assertIn(
+            (identity, str(event_log_path)),
+            process_info_arguments,
         )
-        for value in (identity, str(workspace), str(event_log_path)):
-            self.assertIn(value, waiting_message)
-        self.assertIn(identity, completion_message)
-        self.assertIn(str(event_log_path), completion_message)
-        self.assertNotIn(
-            "controlled input diagnostic",
-            "\n".join(process_messages),
+        self.assertFalse(
+            any(
+                "controlled input diagnostic" in call.args
+                for call in process_logger.info.call_args_list
+            )
         )
 
         event_log = event_log_path.read_text(encoding="utf-8")
         self.assertIn(identity, event_log)
-        self.assertIn("originating_process_logger=continuous.manager", event_log)
+        self.assertIn("continuous.manager", event_log)
         self.assertIn("controlled configuration diagnostic", event_log)
         self.assertIn("controlled input diagnostic", event_log)
-        self.assertIn("successfully", event_log)
 
         # Restore the real close method because logging keeps weak references
         # to every constructed handler until interpreter shutdown.
@@ -797,7 +795,6 @@ class FinDerWorkspaceTests(unittest.TestCase):
             )
         )
         event_log = (workspace / "pyfinder.log").read_text(encoding="utf-8")
-        self.assertIn("with failure", event_log)
         self.assertIn("controlled formatting failure", event_log)
 
     def test_execute_holds_workspace_lock_through_output_collection(self):

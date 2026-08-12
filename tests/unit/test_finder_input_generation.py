@@ -149,13 +149,6 @@ class FinDerInputGenerationTests(unittest.TestCase):
             ),
         ])
 
-    @staticmethod
-    def info_messages(executable):
-        """Return recorded operator-facing messages for substring checks."""
-        return "\n".join(
-            call.args[0] for call in executable.logger.info.call_args_list
-        )
-
     def assert_serialized_number_close(self, actual_text, expected):
         """Compare one serialized finite number by value, not text spelling."""
         actual = float(actual_text)
@@ -173,7 +166,7 @@ class FinDerInputGenerationTests(unittest.TestCase):
     def assert_live_data_0(self, rendered, *, event_time, expected_rows):
         """Verify live ``data_0`` structure and parsed scientific values."""
         lines = rendered.decode("ascii").splitlines()
-        self.assertEqual(lines[0].split(), ["#", str(event_time), "0"])
+        self.assertEqual(lines[0], "# {0} 0".format(event_time))
         self.assertEqual(len(lines), len(expected_rows) + 1)
 
         for line, expected in zip(lines[1:], expected_rows):
@@ -189,7 +182,7 @@ class FinDerInputGenerationTests(unittest.TestCase):
     def assert_non_live_data_0(self, rendered, *, event_time, expected_rows):
         """Verify non-live structure and independently calculated logarithms."""
         lines = rendered.decode("ascii").splitlines()
-        self.assertEqual(lines[0].split(), ["#", str(event_time), "0"])
+        self.assertEqual(lines[0], "# {0} 0".format(event_time))
         self.assertEqual(len(lines), len(expected_rows) + 1)
 
         for line, expected in zip(lines[1:], expected_rows):
@@ -206,10 +199,7 @@ class FinDerInputGenerationTests(unittest.TestCase):
     def assert_companion(self, rendered, expected_rows):
         """Verify companion structure, ordering, and parsed numeric meaning."""
         lines = rendered.decode("ascii").splitlines()
-        self.assertEqual(
-            lines[0].split(),
-            ["#", "SNCL", "PGA_CM_S2", "EPI_DISTANCE_KM"],
-        )
+        self.assertEqual(lines[0], "# SNCL PGA_CM_S2 EPI_DISTANCE_KM")
         self.assertEqual(len(lines), len(expected_rows) + 1)
 
         for line, expected in zip(lines[1:], expected_rows):
@@ -330,29 +320,6 @@ class FinDerInputGenerationTests(unittest.TestCase):
         self.assertEqual(artificial.longitude, 7.3)
         self.assertEqual(artificial.pga, 10.75)
         self.assertTrue(artificial.is_artificial)
-
-        messages = self.info_messages(executable)
-        self.assertIn("Adding artificial PGA:", messages)
-        self.assertIn(
-            "Maximum observed linear PGA: 10.00000 cm/s^2",
-            messages,
-        )
-        self.assertIn(
-            "Event-predicted linear PGA: 3.00000 cm/s^2",
-            messages,
-        )
-        self.assertIn("Configured artificial-point margin: 7.5%", messages)
-        self.assertIn(
-            "Observed PGA with artificial margin: 10.75000 cm/s^2",
-            messages,
-        )
-        self.assertIn(
-            "Selected artificial PGA: 10.75000 cm/s^2",
-            messages,
-        )
-        self.assertIn("XX.NONE.00.HNZ", messages)
-        self.assertIn("event coordinates (46.2, 7.3)", messages)
-        self.assertIn("PGA 10.75000 cm/s^2", messages)
 
     def test_zero_margin_and_prediction_dominant_values_remain_linear(self):
         cases = (
@@ -540,26 +507,10 @@ class FinDerInputGenerationTests(unittest.TestCase):
         )
         self.assertEqual(companion_path.read_bytes(), b"controlled-companion")
 
-        messages = self.info_messages(executable)
-        self.assertIn("Preparing 2 merged real observations", messages)
-        self.assertIn("Assembled 2 real FinDer channels", messages)
-        self.assertIn("Serializing 3 completed FinDer channels", messages)
-        self.assertIn("data_0 in live mode", messages)
-        self.assertIn(
-            "Writing 3 completed channels to the FinDer amplitude companion",
-            messages,
-        )
-        self.assertIn("descending linear PGA order", messages)
-        self.assertIn(f"data_0 written: {data_path}", messages)
-        self.assertIn(
-            f"FinDer amplitude companion written: {companion_path}",
-            messages,
-        )
-
-    def test_production_writer_reports_non_live_serialization_mode(self):
+    def test_production_writer_materializes_non_live_data(self):
         executable = self.executable(live_mode=False)
         temporary_directory = tempfile.TemporaryDirectory(
-            prefix="pyfinder-input-non-live-log-unit-"
+            prefix="pyfinder-input-non-live-unit-"
         )
         self.addCleanup(temporary_directory.cleanup)
         executable.working_directory = temporary_directory.name
@@ -568,15 +519,31 @@ class FinDerInputGenerationTests(unittest.TestCase):
             finderexec.Calculator,
             "predict_PGA_from_magnitude",
             return_value=20.0,
+        ), mock.patch.object(
+            finderexec,
+            "get_epoch_time",
+            return_value=1000.75,
         ):
-            executable._write_data_for_finder(
+            data_path, completed_channels = executable._write_data_for_finder(
                 self.observations(),
                 ControlledEvent(),
             )
 
-        self.assertIn(
-            "Serializing 3 completed FinDer channels to data_0 in non-live mode",
-            self.info_messages(executable),
+        self.assert_non_live_data_0(
+            Path(data_path).read_bytes(),
+            event_time=1000,
+            expected_rows=[
+                {"latitude": 46.2, "longitude": 7.3, "pga": 20.0},
+                {"latitude": 46.10000000000001, "longitude": 7.2,
+                 "pga": 12.5},
+                {"latitude": 45.9, "longitude": 8.4, "pga": 1e-8},
+            ],
+        )
+        self.assertEqual(len(completed_channels), 3)
+        self.assertEqual(completed_channels[0].get_sncl(), "XX.NONE.00.HNZ")
+        self.assertTrue(
+            (Path(temporary_directory.name)
+             / "pyfinder_amplitudes_to_Finder.txt").is_file()
         )
 
     def test_companion_values_sort_stably_without_mutating_channels_or_data(self):

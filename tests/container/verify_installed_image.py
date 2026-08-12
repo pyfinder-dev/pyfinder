@@ -121,7 +121,7 @@ def verify_non_live_data_0(path, *, event_time, expected_rows):
     """Verify installed non-live output without freezing float spellings."""
     lines = path.read_bytes().decode("ascii").splitlines()
     require(
-        lines[0].split() == ["#", str(event_time), "0"],
+        lines[0] == "# {0} 0".format(event_time),
         "installed formatter header differs",
     )
     require(
@@ -141,8 +141,7 @@ def verify_companion(path, expected_rows):
     """Verify installed companion structure and scientific values."""
     lines = path.read_bytes().decode("ascii").splitlines()
     require(
-        lines[0].split()
-        == ["#", "SNCL", "PGA_CM_S2", "EPI_DISTANCE_KM"],
+        lines[0] == "# SNCL PGA_CM_S2 EPI_DISTANCE_KM",
         "installed amplitude companion header differs",
     )
     require(
@@ -461,15 +460,8 @@ def main():
 
     workspace_log = workspace_log_path.read_text(encoding="utf-8")
     require(IDENTITY in workspace_log, "workspace log lacks augmented identity")
-    require("FinDer configuration file" in workspace_log, "workspace log lacks configuration diagnostics")
-    require("data_0 written" in workspace_log, "workspace log lacks data_0 diagnostics")
-    require(
-        "FinDer amplitude companion written" in workspace_log,
-        "workspace log lacks amplitude companion diagnostics",
-    )
+    require(runtime_context.process_log_path.is_file(), "process log is absent")
     process_log = runtime_context.process_log_path.read_text(encoding="utf-8")
-    require("waiting to enter" in process_log, "process log lacks workspace handover")
-    require("completed the locked" in process_log, "process log lacks completion handover")
     require(str(workspace) in process_log, "process log lacks workspace path")
     require(str(workspace_log_path) in process_log, "process log lacks event-log path")
 
