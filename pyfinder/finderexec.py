@@ -21,8 +21,8 @@ from pyfinder.finderutils import (read_event_solution_from_file,
                                   read_rupture_polygon_from_file,
                                   read_finder_channels_from_file)
 from pyfinder.utils.calculator import Calculator
-from pyfinder.utils.dataformatter import (FinDerInputFormatter,
-                                          get_epoch_time)
+from pyfinder.utils.dataformatter import FinDerInputFormatter
+from pyfinder.utils.timeutils import get_epoch_time
 from pyfinder.utils.station_merger import RawStationMeasurement
 from pyfinder.workspace import select_workspace_path
 

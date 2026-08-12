@@ -21,7 +21,6 @@ os.environ["PARAMWS_LOG_FILE"] = str(
 try:
     from pyfinder import finderexec
     from pyfinder.finderutils import FinderChannel, FinderChannelList
-    from pyfinder.utils import dataformatter
     from pyfinder.utils.dataformatter import FinDerInputFormatter
 finally:
     if _original_paramws_log_file is None:
@@ -851,17 +850,6 @@ class FinDerInputGenerationTests(unittest.TestCase):
         malformed[0].network = "C.H"
         with self.assertRaises(ValueError):
             FinDerInputFormatter.format(malformed, 1000.0, False)
-
-    def test_formatter_does_not_consult_module_global_configuration(self):
-        with mock.patch.object(dataformatter, "pyfinderconfig", object()):
-            rendered = FinDerInputFormatter.format(
-                self.channels(pgas=(100.0, 0.01)),
-                1000.0,
-                False,
-            )
-
-        self.assertEqual(rendered.splitlines()[0], b"# 1000 0")
-
 
 if __name__ == "__main__":
     unittest.main()

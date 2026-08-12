@@ -26,7 +26,7 @@ try:
     from pyfinder.eventcontext import EventContext, ProviderModelAccessError
     from pyfinder.pyfinderconfig import EMSC_FELT_REPORT_SERVICE
     from pyfinder.utils.calculator import Calculator
-    from pyfinder.utils import dataformatter
+    import pyfinder.utils.dataformatter.emsc_felt_report as emsc_felt_report
     from pyfinder.utils.dataformatter import EMSCFeltReportDataFormatter
 finally:
     if _original_paramws_log_file is None:
@@ -220,18 +220,18 @@ class FeltReportStationCodeTests(unittest.TestCase):
     """Verify the accepted finite FeltReport identity namespace by index."""
 
     def test_first_last_and_exact_namespace_exhaustion(self):
-        self.assertEqual(dataformatter._felt_report_station_code(0), "A001")
+        self.assertEqual(emsc_felt_report._felt_report_station_code(0), "A001")
         self.assertEqual(
-            dataformatter._felt_report_station_code(1_212_353),
+            emsc_felt_report._felt_report_station_code(1_212_353),
             "9ZZZ",
         )
         self.assertEqual(
-            dataformatter._FELT_REPORT_STATION_CODE_COUNT,
+            emsc_felt_report._FELT_REPORT_STATION_CODE_COUNT,
             1_212_354,
         )
 
         with self.assertRaisesRegex(ValueError, "namespace exhausted"):
-            dataformatter._felt_report_station_code(1_212_354)
+            emsc_felt_report._felt_report_station_code(1_212_354)
 
     def test_every_pattern_transition_uses_the_accepted_sequence(self):
         transitions = (
@@ -252,11 +252,11 @@ class FeltReportStationCodeTests(unittest.TestCase):
         for last_index, expected_last, expected_next in transitions:
             with self.subTest(last_index=last_index):
                 self.assertEqual(
-                    dataformatter._felt_report_station_code(last_index),
+                    emsc_felt_report._felt_report_station_code(last_index),
                     expected_last,
                 )
                 self.assertEqual(
-                    dataformatter._felt_report_station_code(last_index + 1),
+                    emsc_felt_report._felt_report_station_code(last_index + 1),
                     expected_next,
                 )
 
@@ -275,7 +275,7 @@ class FeltReportStationCodeTests(unittest.TestCase):
         for index, expected_code in expected_codes:
             with self.subTest(index=index):
                 self.assertEqual(
-                    dataformatter._felt_report_station_code(index),
+                    emsc_felt_report._felt_report_station_code(index),
                     expected_code,
                 )
 
@@ -416,7 +416,7 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(
             records[0]["timestamp"],
-            dataformatter.get_epoch_time(context.get_origin_time()),
+            emsc_felt_report.get_epoch_time(context.get_origin_time()),
         )
         haversine.assert_called_once_with(44.5, 9.5, 45.0, 10.0)
         allen.assert_called_once_with(5.75, 12.0, 25.0)
@@ -845,7 +845,7 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
         with patch.object(
                 Calculator, "I_Allen2012_Rhypo", return_value=6.0), \
                 patch.object(
-                    dataformatter,
+                    emsc_felt_report,
                     "_FELT_REPORT_STATION_CODE_COUNT",
                     2,
                 ):
@@ -960,7 +960,7 @@ class EMSCFeltReportNormalizationTests(unittest.TestCase):
             _row(corrected=6.0),
         ]))
         with patch(
-                "pyfinder.utils.dataformatter.get_epoch_time",
+                "pyfinder.utils.dataformatter.emsc_felt_report.get_epoch_time",
                 return_value=123.0) as epoch_time, patch.object(
                     Calculator, "I_Allen2012_Rhypo", return_value=6.0), \
                 patch.object(

@@ -19,6 +19,8 @@
 !pyfinder/services/*.py
 !pyfinder/utils/
 !pyfinder/utils/*.py
+!pyfinder/utils/dataformatter/
+!pyfinder/utils/dataformatter/*.py
 
 !pyfinder/extern/
 !pyfinder/extern/finder_regional_wkt/
