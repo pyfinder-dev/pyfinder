@@ -176,16 +176,11 @@ def main():
     )
     require((os.geteuid(), os.getegid()) == (1000, 1000), "runtime identity is not 1000:1000")
     supplied_python_version = os.environ["PYFINDER_IMAGE_PYTHON_VERSION"]
-    supplied_base_digest = os.environ["PYFINDER_IMAGE_BASE_DIGEST"]
     actual_python_version = platform.python_version()
     require(sys.version_info[:2] == (3, 12), "Python is not from the 3.12 series")
     require(
         re.fullmatch(r"3\.12\.\d+", supplied_python_version) is not None,
         "image Python version context is invalid",
-    )
-    require(
-        re.fullmatch(r"sha256:[0-9a-f]{64}", supplied_base_digest) is not None,
-        "image base digest context is invalid",
     )
     require(
         actual_python_version == supplied_python_version,
@@ -333,7 +328,6 @@ def main():
     build_information_path = Path("/usr/local/share/pyfinder/build-info.json")
     build_information = json.loads(build_information_path.read_text(encoding="utf-8"))
     require(build_information["base_image"] == EXPECTED_BASE_IMAGE, "base image record differs")
-    require(build_information["base_digest"] == supplied_base_digest, "base digest record differs from the image label")
     require(build_information["python_version"] == supplied_python_version, "Python record differs from the image label")
     require(build_information["python_version"] == actual_python_version, "Python record differs from the interpreter")
     require(build_information["pyfinder"]["version"] == pyfinder_distribution.version, "PyFinder version record differs")
@@ -471,7 +465,6 @@ def main():
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     result = {
-        "base_digest": build_information["base_digest"],
         "finder_paths": [str(path) for path in finder_paths],
         "owned_workspace_files": [
             str(config_path),

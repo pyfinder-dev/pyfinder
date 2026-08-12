@@ -142,19 +142,19 @@ class DockerfileRequirementsTests(unittest.TestCase):
         )
         self.assertIn('CMD ["continuous"]', self.lines)
 
-    def test_base_digest_is_required_and_used_for_label_and_build_information(self):
+    def test_build_records_the_required_base_without_caller_supplied_identity(self):
         normalized = self.contents.lower()
-        self.assertIn("arg pyfinder_base_digest", normalized)
-        self.assertNotRegex(normalized, r"arg pyfinder_base_digest\s*=")
         self.assertIn(
-            'io.pyfinder.base.digest="${pyfinder_base_digest}"',
+            'org.opencontainers.image.base.name="{0}"'.format(BASE_IMAGE),
             normalized,
         )
         self.assertIn(
-            '"base_digest": os.environ["pyfinder_base_digest"]',
+            '"base_image": "{0}"'.format(BASE_IMAGE),
             normalized,
         )
-        self.assertIn('[ -z "${pyfinder_base_digest}" ]', normalized)
+        self.assertNotIn("pyfinder_base_digest", normalized)
+        self.assertNotIn("io.pyfinder.base.digest", normalized)
+        self.assertNotIn('"base_digest"', normalized)
         self.assertIn("platform.freedesktop_os_release()", normalized)
 
     def test_build_checks_cover_durable_installed_image_requirements(self):

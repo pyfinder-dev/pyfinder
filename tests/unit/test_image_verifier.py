@@ -20,7 +20,6 @@ OWNERSHIP_LABEL = "io.pyfinder.verification=installed-image"
 OWNED_CONTAINER_ID = "a" * 64
 OTHER_CONTAINER_ID = "b" * 64
 OBSERVED_IMAGE_ID = "sha256:" + "c" * 64
-OBSERVED_BASE_DIGEST = "sha256:" + "d" * 64
 OBSERVED_PYTHON_VERSION = "3.12.99"
 
 
@@ -89,9 +88,8 @@ if [[ "${1:-}" == "container" && "${2:-}" == "ls" ]]; then
 fi
 
 if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
-    printf '%s|linux|amd64|1000:1000|["/usr/local/bin/pyfinder-entrypoint"]|["continuous"]|ghcr.io/sceylan/finder-base:gmt5|%s|%s\\n' \
+    printf '%s|linux|amd64|1000:1000|["/usr/local/bin/pyfinder-entrypoint"]|["continuous"]|ghcr.io/sceylan/finder-base:gmt5|%s\\n' \
         "${FAKE_IMAGE_ID:?}" \
-        "${FAKE_BASE_DIGEST:?}" \
         "${FAKE_PYTHON_VERSION:?}"
     exit 0
 fi
@@ -156,7 +154,6 @@ exit 90
                     "FAKE_DOCKER_SCENARIO": scenario,
                     "FAKE_DOCKER_STATE": str(fake_state),
                     "FAKE_IMAGE_ID": OBSERVED_IMAGE_ID,
-                    "FAKE_BASE_DIGEST": OBSERVED_BASE_DIGEST,
                     "FAKE_PYTHON_VERSION": OBSERVED_PYTHON_VERSION,
                     "FAKE_OWNED_CONTAINER_ID": OWNED_CONTAINER_ID,
                     "FAKE_OTHER_CONTAINER_ID": OTHER_CONTAINER_ID,
@@ -238,12 +235,7 @@ exit 90
                 self.assertEqual(len(run_commands), 1)
                 self.assertIn(OBSERVED_IMAGE_ID, run_commands[0])
                 self.assertNotIn(IMAGE_NAME, run_commands[0])
-                self.assertIn(
-                    "PYFINDER_IMAGE_BASE_DIGEST={0}".format(
-                        OBSERVED_BASE_DIGEST
-                    ),
-                    run_commands[0],
-                )
+                self.assertNotIn("PYFINDER_IMAGE_BASE_DIGEST", run_commands[0])
                 self.assertIn(
                     "PYFINDER_IMAGE_PYTHON_VERSION={0}".format(
                         OBSERVED_PYTHON_VERSION

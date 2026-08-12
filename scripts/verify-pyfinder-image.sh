@@ -20,7 +20,6 @@ TEMPORARY_DIRECTORY=""
 RUNTIME_ROOT=""
 CONTAINER_CID_FILE=""
 OBSERVED_IMAGE_ID=""
-OBSERVED_BASE_DIGEST=""
 OBSERVED_PYTHON_VERSION=""
 VERIFIER_OWNS_ACTIVE_CONTAINER=false
 
@@ -131,7 +130,6 @@ run_image() {
         --platform linux/amd64
         --pull=never
         --user "$CONTAINER_USER"
-        --env "PYFINDER_IMAGE_BASE_DIGEST=${OBSERVED_BASE_DIGEST}"
         --env "PYFINDER_IMAGE_PYTHON_VERSION=${OBSERVED_PYTHON_VERSION}"
     )
     shift 2
@@ -171,12 +169,11 @@ inspect_required_image() {
     local image_entrypoint
     local image_command
     local base_image
-    local base_digest
     local python_version
 
     if ! image_metadata=$(
         docker image inspect "$IMAGE_NAME" \
-            --format '{{.Id}}|{{.Os}}|{{.Architecture}}|{{.Config.User}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}|{{index .Config.Labels "org.opencontainers.image.base.name"}}|{{index .Config.Labels "io.pyfinder.base.digest"}}|{{index .Config.Labels "io.pyfinder.python.version"}}'
+            --format '{{.Id}}|{{.Os}}|{{.Architecture}}|{{.Config.User}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}|{{index .Config.Labels "org.opencontainers.image.base.name"}}|{{index .Config.Labels "io.pyfinder.python.version"}}'
     ); then
         fail "could not inspect the required local image ${IMAGE_NAME}"
     fi
@@ -188,7 +185,6 @@ inspect_required_image() {
         image_entrypoint \
         image_command \
         base_image \
-        base_digest \
         python_version <<< "$image_metadata"
 
     [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
@@ -203,13 +199,10 @@ inspect_required_image() {
         || fail "local ${IMAGE_NAME} default command differs from the accepted command"
     [[ "$base_image" == "$EXPECTED_BASE_IMAGE" ]] \
         || fail "local ${IMAGE_NAME} base label differs from ${EXPECTED_BASE_IMAGE}"
-    [[ "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
-        || fail "local ${IMAGE_NAME} base digest label is invalid: ${base_digest}"
     [[ "$python_version" =~ ^3\.12\.[0-9]+$ ]] \
         || fail "local ${IMAGE_NAME} Python label is not a Python 3.12 patch release: ${python_version}"
 
     OBSERVED_IMAGE_ID="$image_id"
-    OBSERVED_BASE_DIGEST="$base_digest"
     OBSERVED_PYTHON_VERSION="$python_version"
     printf 'Observed image metadata: %s linux/amd64 user=%s Python=%s\n' \
         "$OBSERVED_IMAGE_ID" "$image_user" "$python_version"

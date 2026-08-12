@@ -75,13 +75,8 @@ RUN git clone \
 FROM ghcr.io/sceylan/finder-base:gmt5
 
 ARG PYTHON_VERSION
-# The caller supplies the digest observed after pulling the required base. A
-# missing value is a build error so image provenance cannot silently reuse an
-# old digest merely because the Dockerfile was not updated.
-ARG PYFINDER_BASE_DIGEST
 
 LABEL org.opencontainers.image.base.name="ghcr.io/sceylan/finder-base:gmt5" \
-      io.pyfinder.base.digest="${PYFINDER_BASE_DIGEST}" \
       io.pyfinder.python.version="${PYTHON_VERSION}" \
       io.pyfinder.build-information="/usr/local/share/pyfinder/build-info.json"
 
@@ -98,11 +93,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN <<'SHELL'
 set -eu
 
-if [ -z "${PYFINDER_BASE_DIGEST}" ]; then
-    printf 'PYFINDER_BASE_DIGEST is required; pull and inspect the base image before building.\n' >&2
-    exit 1
-fi
-
 python3.12 -m pip install \
     --no-cache-dir \
     --no-index \
@@ -115,7 +105,6 @@ mkdir -p /usr/local/share/pyfinder
 # supports build-time imports and is removed again before this layer ends.
 export PARAMWS_COMMIT="$(cat /tmp/paramws-commit)"
 export PARAMWS_LOG_FILE=/tmp/pyfinder-build-paramws.log
-export PYFINDER_BASE_DIGEST
 
 test "$(python3.12 -c 'import platform; print(platform.python_version())')" = "${PYTHON_VERSION}"
 test "$(python3 -c 'import platform; print(platform.python_version())')" = "${PYTHON_VERSION}"
@@ -188,7 +177,6 @@ for path in pyfinder_root.rglob("*"):
 
 base_os = platform.freedesktop_os_release()
 information = {
-    "base_digest": os.environ["PYFINDER_BASE_DIGEST"],
     "base_image": "ghcr.io/sceylan/finder-base:gmt5",
     "base_os": base_os["PRETTY_NAME"],
     "paramws": {
