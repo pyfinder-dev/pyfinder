@@ -116,7 +116,7 @@ class FinderChannel:
 
         # A channel is aritificial if it is not a real channel
         # but a synthetic one to ensure the FinDer solution is stable.
-        self.is_artificial = is_artificial
+        self._is_artificial = is_artificial
 
         if sncl:
             # Parse the SNCL string to override the individual codes
@@ -204,11 +204,11 @@ class FinderChannel:
 
     def is_artificial(self):
         """ Return whether the channel is artificial or not """
-        return self.is_artificial
+        return self._is_artificial
     
     def set_artificial(self, is_artificial):
         """ Mark whether the channel is artificial or not """
-        self.is_artificial = is_artificial
+        self._is_artificial = is_artificial
 
     def get_trigger_flag(self):
         """ Return the trigger flag """
@@ -484,4 +484,3 @@ class FinderSolution:
 
     def __str__(self):
         return f"Finder event :: {self.event}\nFinDer rupture :: {self.rupture}"
-    

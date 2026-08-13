@@ -178,6 +178,9 @@ class FinDerExecutable(object):
         Returns either the raw amplitude-based or FinDer-processed FinderSolution
         based on the configuration setting under 'shakemap.use-amplitude-from-finder-output'.
         """
+        if self.finder_solution is None:
+            return None
+
         use_finder_amplitudes = self.configuration.get("shakemap", {}).get("use-amplitude-from-finder-output", False)
         
         print(self.configuration["shakemap"])
@@ -630,6 +633,9 @@ class FinDerExecutable(object):
         
     def _collect_finder_output(self, event_id):
         """ Collect the FinDer output. """
+        # A solution becomes public only after every required FinDer output has
+        # been read and both existing amplitude views have been assembled.
+        self.finder_solution = None
         self.logger.info("Collecting the FinDer output...")
 
         # Check if the event ID is set
@@ -645,26 +651,47 @@ class FinDerExecutable(object):
         event_output_folder = os.path.join(
             self.working_directory, "temp_data", self.finder_event_id)
          
-        # Create a FinderSolution object to store the FinDer output
-        self.finder_solution = FinderSolution()
-        self.finder_solution.set_finder_event_id(self.get_finder_event_id())
-        self.finder_solution.set_event_id(event_id)
-
         # Read the FinDer output files
         event_file = os.path.join(event_output_folder, "core_info_0")
-        event_solution = read_event_solution_from_file(event_file)
+        try:
+            event_solution = read_event_solution_from_file(event_file)
+        except (FileNotFoundError, IndexError, ValueError) as exc:
+            self.logger.error(
+                "Required FinDer event output could not be read from %s: %s",
+                event_file,
+                exc,
+            )
+            return
 
         rupture_file = os.path.join(event_output_folder, "finder_rupture_list_0")
-        rupture_polygon = read_rupture_polygon_from_file(rupture_file)
+        try:
+            rupture_polygon = read_rupture_polygon_from_file(rupture_file)
+        except (FileNotFoundError, ValueError) as exc:
+            self.logger.error(
+                "Required FinDer rupture output could not be read from %s: %s",
+                rupture_file,
+                exc,
+            )
+            return
         
         finder_channels_file = os.path.join(event_output_folder, "data_0")
         finder_channels = read_finder_channels_from_file(finder_channels_file)
+        if not finder_channels:
+            self.logger.error(
+                "FinDer processed output contains no valid channels: %s",
+                finder_channels_file,
+            )
+            return
 
-        # Store the FinDer solution
-        self.finder_solution.set_event(event_solution)
-        self.finder_solution.set_rupture(rupture_polygon)
-        self.finder_solution.set_channels(finder_channels)
-        self.finder_solution.set_description("Solution with processed amplitudes")
+        # Build both views locally. This prevents a caller from retrieving a
+        # partially populated solution if any required assembly step fails.
+        processed_solution = FinderSolution()
+        processed_solution.set_finder_event_id(self.get_finder_event_id())
+        processed_solution.set_event_id(event_id)
+        processed_solution.set_event(event_solution)
+        processed_solution.set_rupture(rupture_polygon)
+        processed_solution.set_channels(finder_channels)
+        processed_solution.set_description("Solution with processed amplitudes")
 
         # Attach the input solution (raw input channels) to the finder_solution.
         raw_solution = FinderSolution()
@@ -675,7 +702,10 @@ class FinDerExecutable(object):
         raw_solution.set_rupture(rupture_polygon)
         raw_solution.set_description("Solution with raw amplitudes")
         # Set the input solution to the finder_solution
-        self.finder_solution.input_solution = raw_solution
+        processed_solution.input_solution = raw_solution
+
+        # Publish only the complete processed view with its complete raw view.
+        self.finder_solution = processed_solution
         self.logger.info("A FinDer solution with raw amplitudes are stored in the FinderSolution object.")
 
         # Log the FinDer solution

@@ -234,7 +234,7 @@ class FinDerInputGenerationTests(unittest.TestCase):
             [channel.pga for channel in channels],
             [12.5, 0.00000001],
         )
-        self.assertTrue(all(channel.is_artificial is False
+        self.assertTrue(all(channel.is_artificial() is False
                             for channel in channels))
         self.assertEqual(observations, original)
 
@@ -318,7 +318,7 @@ class FinDerInputGenerationTests(unittest.TestCase):
         self.assertEqual(artificial.latitude, 46.2)
         self.assertEqual(artificial.longitude, 7.3)
         self.assertEqual(artificial.pga, 10.75)
-        self.assertTrue(artificial.is_artificial)
+        self.assertTrue(artificial.is_artificial())
 
     def test_zero_margin_and_prediction_dominant_values_remain_linear(self):
         cases = (
