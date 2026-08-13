@@ -17,17 +17,44 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log"
 )
 try:
-    from pyfinder import finderexec
+    from pyfinder import finderexec, findermanager
     from pyfinder.finderutils import (
         FinderChannel,
         FinderChannelList,
+        FinderSolution,
         read_finder_channels_from_file,
     )
+    from pyfinder.pyfinderconfig import ESM_SHAKEMAP_SERVICE
 finally:
     if _original_paramws_log_file is None:
         os.environ.pop("PARAMWS_LOG_FILE", None)
     else:
         os.environ["PARAMWS_LOG_FILE"] = _original_paramws_log_file
+
+
+class ControlledManagerEvent:
+    """Supply only the event values the normal manager path consumes."""
+
+    def get_event_id(self):
+        return "controlled-event"
+
+    def get_origin_time(self):
+        return "controlled-origin"
+
+    def get_longitude(self):
+        return 7.0
+
+    def get_latitude(self):
+        return 46.0
+
+    def get_magnitude(self):
+        return 5.0
+
+    def get_depth(self):
+        return 8.0
+
+    def get_magnitude_type(self):
+        return "Mw"
 
 
 class FinDerOutputTests(unittest.TestCase):
@@ -98,6 +125,88 @@ class FinDerOutputTests(unittest.TestCase):
             encoding="utf-8",
         )
         return output_directory
+
+    def run_manager_with_solution(self, solution):
+        """Cross the normal manager executable branch with controlled inputs."""
+        workspace = self.temporary_root / "manager-workspace"
+        finder_event_id = "controlled-finder-id"
+        output_directory = workspace / "temp_data" / finder_event_id
+        output_directory.mkdir(parents=True)
+        data_path = output_directory / "data_0"
+        original_data = (
+            b"# controlled header\n"
+            b"46.0 7.0 finder.assigned.00.HNZ 1 2.5\n"
+        )
+        data_path.write_bytes(original_data)
+
+        logger = mock.Mock()
+        manager = findermanager.FinDerManager.for_on_demand(
+            options={"use_library": False},
+            configuration={
+                "general": {
+                    "services-enabled": [ESM_SHAKEMAP_SERVICE],
+                    "services-priority": [ESM_SHAKEMAP_SERVICE],
+                },
+                "finder-executable": {
+                    "finder-temp-data-dir": (
+                        "{FINDER_RUN_DIR}/temp_data"
+                    ),
+                    "finder-temp-dir": "{FINDER_RUN_DIR}/temp",
+                    "finder-live-mode": False,
+                },
+            },
+            finder_configuration_name="controlled",
+            finder_configuration={"DATA_FOLDER": "unused"},
+            logger=logger,
+        )
+
+        event_context = ControlledManagerEvent()
+        outcome = manager._new_provider_outcome()
+        outcome["status_code"] = 200
+        outcome["event_context_usable"] = True
+        acquired = {
+            ESM_SHAKEMAP_SERVICE: {
+                "event_context": event_context,
+                "scientific_value": object(),
+                "outcome": outcome,
+            },
+        }
+        normalized_records = [{"controlled": "normalized-record"}]
+        executable = mock.Mock()
+        executable.execute.return_value = executable
+        executable.get_finder_solution_object.return_value = solution
+        executable.get_working_directory.return_value = str(workspace)
+        executable.get_finder_event_id.return_value = finder_event_id
+
+        with mock.patch.object(
+            manager,
+            "_acquire_enabled_providers",
+            return_value=acquired,
+        ), mock.patch.object(
+            manager,
+            "_normalize_acquired_providers",
+            return_value={ESM_SHAKEMAP_SERVICE: normalized_records},
+        ), mock.patch.object(
+            manager,
+            "_merge_available_results",
+            return_value=normalized_records,
+        ), mock.patch.object(
+            finderexec,
+            "FinDerExecutable",
+            return_value=executable,
+        ):
+            result = manager.process_event("controlled-event")
+
+        return {
+            "data_path": data_path,
+            "executable": executable,
+            "finder_event_id": finder_event_id,
+            "logger": logger,
+            "manager": manager,
+            "original_data": original_data,
+            "result": result,
+            "workspace": workspace,
+        }
 
     def assert_logged_no_solution(self, executable):
         self.assertIsNone(executable.finder_solution)
@@ -202,6 +311,34 @@ class FinDerOutputTests(unittest.TestCase):
             executable.get_finder_solution_object(),
             processed_solution,
         )
+
+    def test_manager_exposes_executable_none_with_error_diagnostic(self):
+        observed = self.run_manager_with_solution(None)
+
+        self.assertIsNone(observed["result"])
+        observed["logger"].error.assert_called()
+
+    def test_successful_non_live_manager_keeps_data_without_renamed_copy(self):
+        solution = FinderSolution(event_id="controlled-event")
+
+        observed = self.run_manager_with_solution(solution)
+
+        self.assertIs(observed["result"], solution)
+        self.assertEqual(
+            observed["data_path"].read_bytes(),
+            observed["original_data"],
+        )
+        self.assertFalse(
+            observed["data_path"].with_name("data_0_renamed").exists()
+        )
+        manager = observed["manager"]
+        workspace = observed["workspace"]
+        self.assertEqual(manager.working_dir, str(workspace))
+        self.assertEqual(
+            manager.finder_temp_data_dir,
+            str(workspace / "temp_data" / observed["finder_event_id"]),
+        )
+        self.assertEqual(manager.finder_temp_dir, str(workspace / "temp"))
 
 
 if __name__ == "__main__":

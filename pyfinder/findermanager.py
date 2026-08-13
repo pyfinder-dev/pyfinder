@@ -36,7 +36,7 @@ from paramws.clients import (
     ESMShakeMapClient,
     RRSMPeakMotionClient,
 )
-from pyfinder.finderutils import (FinderChannelList, FinderSolution)
+from pyfinder.finderutils import FinderSolution
 from pyfinder.utils.dataformatter import (
     EMSCFeltReportDataFormatter,
     ESMShakeMapDataFormatter,
@@ -247,70 +247,6 @@ class FinDerManager:
         """ Read data from a file and process it """
         raise NotImplementedError(
             "FinDerManager.process_file() method is not implemented yet")
-
-    def _rename_channel_codes(self, finder_used_channels: FinderChannelList):
-        """ 
-        Rename the channel codes with the real ones in the FinDer output 
-        by matching the coordinates. This is performed when live_mode is
-        False, where FinDer assigns channel/station codes itself. 
-        """
-        if not finder_used_channels or len(finder_used_channels) == 0:
-            self.logger.error("No FinDer channel codes to rename. List is empty.")
-            return
-        
-        self.logger.info("Renaming the channel codes in the FinDer output.")        
-        
-        # Get FinDer's version of data_0 file
-        finder_data_0 = os.path.join(self.finder_temp_data_dir, "data_0")
-        
-        # Check if the file exists
-        if not os.path.exists(finder_data_0):
-            self.logger.error(f"File {finder_data_0} does not exist. Cannot rename the channel codes.")
-
-        # Read the FinDer data_0 file
-        stations = {
-            "lat": [],
-            "lon": [],
-            "sncl": [],
-            "timestamp": [],
-            "pga": []
-        }
-        header = "# "
-        with open(finder_data_0, 'r') as f:
-            lines = f.readlines()
-
-            # Read the header
-            header = lines[0]
-
-            # And the data
-            lines = lines[1:]
-    
-            for line in lines:
-                _line = line.strip().split()
-                stations['lat'].append(float(_line[0]))
-                stations['lon'].append(float(_line[1]))
-                
-                # Find this station in the used channels
-                for _channel in finder_used_channels:
-                    if _channel.get_latitude() == float(_line[0]) and \
-                        _channel.get_longitude() == float(_line[1]):
-                        # Replace the channel code
-                        _line[2] = _channel.get_sncl()
-                        break
-
-                stations['sncl'].append(_line[2])
-                stations['timestamp'].append(_line[3])
-                stations['pga'].append(float(_line[4]))
-
-        # Write the new data_0 file
-        renamed_data_0 = os.path.join(self.finder_temp_data_dir, "data_0_renamed")
-        with open(renamed_data_0, 'w') as f:
-            f.write(header)
-            for i in range(len(stations['lat'])):
-                f.write(f"{stations['lat'][i]}  {stations['lon'][i]}  {stations['sncl'][i]}  " + \
-                        f"{stations['timestamp'][i]} {stations['pga'][i]}\n")
-
-        self.logger.info(f"Channel codes have been renamed in the FinDer output. New file: {renamed_data_0}")
 
     def _send_failure_email(self, event_id, attachment=None):
         # Alert email remains inactive until terminal notification behavior is
@@ -921,12 +857,6 @@ class FinDerManager:
             #     metadata=self.metadata
             # )
      
-            # Rename the channel codes if live mode is False. When live mode is False,
-            # we pass FinDer only the coordinates and it assigns the channel codes itself.
-            # We rename them back to the real ones for debugging purposes.
-            if not self.configuration["finder-executable"]["finder-live-mode"]:
-                self._rename_channel_codes(executable.get_finder_used_channels())
-
             # Return the FinderSolution object
             return executable.get_finder_solution_object()
             
