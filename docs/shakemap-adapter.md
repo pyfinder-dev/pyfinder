@@ -1,10 +1,10 @@
 # PyFinder's ShakeMap adapter
 
 This adapter prepares native inputs and communicates with the separate ShakeMap
-service. It is not yet connected to the manager or scheduled workflow. Durable
-submission recording, restart reconciliation, product copying, and notifications
-remain later integration work. Existing application execution remains inactive
-at that downstream boundary.
+service. It is not yet connected to the manager or scheduled workflow. A durable
+submission/monitoring helper is available for that integration; automatic restart
+reconciliation, product copying, and notifications remain later work. Existing
+application execution remains inactive at that downstream boundary.
 
 ## Preparing inputs
 
@@ -38,25 +38,27 @@ unknown numeric directions, and names such as UNK according to its own rules;
 export does not force unknown or vertical observations to horizontal. Parsing
 success does not establish that every observation will participate in modeling.
 
-ShakeMap's XML reader ignores location codes when identifying components. If
-two selected observations would share its network/station/component key, export
-fails with their identities rather than silently dropping one. Missing/nonfinite
-required values also fail export instead of silently omitting observations.
+The exporter preserves the existing XML representation: `netid` is the network,
+`code` is the station, `loc` carries the supplied source location code, and each
+selected channel produces a station element in input order. The optional XML
+`loc` attribute is documented by USGS as free-form location description; it does
+not establish a separate sensor identity. See the
+[USGS v4.4.1 input documentation](https://code.usgs.gov/ghsc/esi/shakemap/-/blob/v4.4.1/doc/manual4_0/sg_input_formats.rst?ref_type=tags).
 
-An independent audit found another limitation of the current mapping: different
-components at the same native station can carry different coordinates, and the
-native reader then assigns the final station coordinates to every component.
-This remains an open implementation defect; the readability revision does not
-claim to fix it or add another calculation-rejection rule.
+The installed native XML reader (esi-shakelib 1.2.1 in ShakeMap 4.4.9) groups
+stations by network/station, without the separate `loc` attribute. For repeated
+station/component/PGA entries, the later amplitude replaces the earlier one.
+Different components survive under that shared station, but use the final
+station element's coordinates. Preserving all XML observations therefore does
+not guarantee that native parsing or modeling retains each one independently.
 
-A native-parser experiment verified that using the existing full
-network/station/location identity as the native station code preserves distinct
-locations and their coordinates. That candidate mapping has not been activated.
-Before applying it, check configured station exclusions, which use exact native
-station identifiers. Contradictory coordinates within the same complete sensor
-identity also require separate investigation. Giving every component a unique
-station ID is not an equivalent shortcut: it changes aggregation and can change
-native orientation inference.
+This library limitation is accepted for the current adapter package. Export
+neither rejects those collisions nor renames, deduplicates, reorders, averages,
+or relocates observations to work around native grouping. Location variants
+accepted by the former exporter remain accepted. Missing/nonfinite required
+values still fail serialization instead of silently omitting observations.
+Changing native station identity remains deferred: it can affect component
+grouping and configured station exclusions, so it is not an incidental fix.
 
 Rupture coordinates are serialized as longitude/latitude/depth, with closure
 added to a copy of the supplied ordered points when needed. The exporter does
@@ -96,6 +98,88 @@ Race-safe collection and host/container path translation belong to the later
 workflow integration. Also, `overwrite` governs the previous calculation, not
 cleanup of the caller's retained input directory. An empty files mapping asks
 the service to snapshot existing inputs; it does not mean an empty calculation.
+
+## Durable submission and monitoring
+
+`pyfinder.services.shakemap_workflow.ShakeMapWorkflow` wraps the client with an
+additive `shakemap_submissions` table in an explicitly supplied SQLite database.
+The path must name a persistent filesystem database; empty paths, in-memory
+names, and SQLite URI names are rejected. It can share the scheduler database,
+but never changes scheduled rows, their
+retry counts, their startup failure rule, or their cleanup behavior. External
+records survive scheduled-row cleanup. Opening this helper creates its table;
+this implementation has not opened or migrated the operator database.
+
+```python
+from pyfinder.services.shakemap_client import ShakeMapClient
+from pyfinder.services.shakemap_workflow import ShakeMapWorkflow
+
+client = ShakeMapClient(service_url, timeout=30.0)
+workflow = ShakeMapWorkflow(workflow_database_path, client)
+try:
+    record = workflow.submit(
+        attempt_id, calculation_id, files,
+        configuration=selected_configuration, overwrite=True,
+    )
+    if record["submission_state"] == "ACCEPTED":
+        record = workflow.poll(attempt_id)  # One observation; no waiting loop.
+finally:
+    workflow.close()
+```
+
+The caller supplies a stable `attempt_id` identifying this invocation. It is
+separate from the service's public calculation ID and internal sequence. This
+helper does not invent an ID scheme or decide when another attempt is justified.
+It records the endpoint, public ID, configuration, overwrite choice, and file
+sizes/SHA-256 fingerprints before POST. Fingerprints identify the submitted
+bytes; they neither retain those bytes nor prove which managed scientific data
+was used. Input-file retention remains the caller's responsibility. An empty
+mapping retains the client's existing service-input snapshot semantics; its
+fingerprint cannot describe those service-side inputs.
+
+The submission states describe local evidence, separately from native job state:
+
+- `SUBMITTING`: intent was committed. The request may be in flight, or the
+  process may have stopped before sending or recording its response.
+- `ACCEPTED`: a validated acknowledgement and exact internal sequence were saved.
+- `UNCERTAIN`: the client could not establish whether the service accepted it.
+- `REJECTED`: the client reported an explicit HTTP rejection.
+
+An existing attempt never causes another POST. Repeating the same call returns
+its stored record; changing its endpoint, selections, or input bytes raises a
+local conflict. This also applies to rejected and unresolved attempts. A local
+validation error before recording intent leaves no reserved attempt. Unexpected
+interruption after intent leaves `SUBMITTING`, which requires the same caution
+as `UNCERTAIN`; it is not proof of either acceptance or rejection.
+
+If remote acceptance succeeds but saving it fails, `ShakeMapRecordingError`
+retains `.job` and `.acknowledgement` for the caller. The original persistence
+error remains its cause. The durable intent still prevents replay. No automatic
+resolution or inference from the event's latest sequence is provided.
+
+After reopening, `get(attempt_id)` and `unresolved()` expose retained records
+without contacting the service. `poll(attempt_id)` reads only a durably accepted
+sequence from its recorded endpoint, including retained archives. It saves
+`observation` with `scope` and native `details`, and an `observed_at` timestamp.
+Read failures propagate and set `last_error` to their exception class while
+preserving previous evidence and its timestamp. A missing job, timeout, or bad
+response never becomes a synthetic native `FAILED` result. Successful later
+reads clear that monitoring error. Raw error response bodies are not copied
+into this diagnostic field.
+
+`unresolved()` includes intents, uncertain submissions, accepted jobs without a
+terminal observation, and accepted jobs with a subsequent monitoring error.
+Native `SUCCESS` and `FAILED` are terminal observations. An archived `SUCCESS`
+may have `products_ready=False`; terminality does not prove accessible products,
+artifact collection, notification delivery, or scheduled-chain success.
+
+Use one monitoring owner and close the helper after its work finishes. Its
+synchronous operations serialize within an instance; a database uniqueness
+constraint also prevents two instances from sending the same attempt twice.
+It supplies no distributed monitoring ownership or retry loop. Endpoint URL
+pinning cannot detect an operator replacing the service runtime and reusing its
+sequence numbers. Such recovery, along with scheduler retry mapping, remains
+outside this package. No production submissions are activated by importing it.
 
 ## Verification
 

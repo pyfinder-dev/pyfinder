@@ -179,13 +179,65 @@ class ShakeMapInputTests(unittest.TestCase):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     self.export(solution)
 
-    def test_native_station_component_identity_collision_fails(self):
+    def test_location_variants_preserve_both_observations_in_input_order(self):
+        # The previous writer accepted blank and populated locations for the
+        # same station/component. Preserve both amplitudes in the exported XML;
+        # any later native grouping is outside this serializer's responsibility.
         solution = make_solution()
-        duplicate = deepcopy(solution.channels[1])
-        duplicate.set_location_code("10")
-        solution.channels.append(duplicate)
-        with self.assertRaises(ValueError):
-            self.export(solution)
+        first = solution.channels[1]
+        first.set_pga(9.80665)
+        second = deepcopy(first)
+        second.set_location_code("00")
+        second.set_pga(19.6133)
+        solution.channels = FinderChannelList([first, second])
+        before = deepcopy(solution.channels)
+
+        for channels, locations, amplitudes in (
+            ([first, second], ["", "00"], [1.0, 2.0]),
+            ([second, first], ["00", ""], [2.0, 1.0]),
+        ):
+            with self.subTest(locations=locations):
+                solution.channels = FinderChannelList(channels)
+                xml = self.export(solution)["event_dat.xml"]
+                stations = ElementTree.fromstring(xml).findall("s:station", NS)
+
+                self.assertEqual(len(stations), 2)
+                self.assertEqual([node.get("code") for node in stations], ["REAL"] * 2)
+                self.assertEqual([node.get("netid") for node in stations], ["CH"] * 2)
+                self.assertEqual([node.get("loc") for node in stations], locations)
+
+                for node, expected in zip(stations, amplitudes):
+                    component = node.find("s:comp", NS)
+                    self.assertEqual(component.get("name"), "HNE")
+                    amplitude = component.find("s:acc", NS)
+                    self.assertEqual(amplitude.get("units"), "%g")
+                    self.assertAlmostEqual(float(amplitude.get("value")), expected, places=12)
+
+        self.assertEqual([vars(first), vars(second)], [vars(item) for item in before])
+
+    def test_same_station_components_keep_supplied_coordinates(self):
+        # Accepted native coordinate merging must not prompt the exporter to
+        # relocate observations, rename stations, or reject the whole input.
+        solution = make_solution()
+        solution.channels = FinderChannelList([
+            FinderChannel(latitude=46.0, longitude=7.0, sncl="CH.REAL.00.HNE", pga=9.80665),
+            FinderChannel(latitude=47.0, longitude=8.0, sncl="CH.REAL.10.HNN", pga=19.6133),
+        ])
+
+        xml = self.export(solution)["event_dat.xml"]
+        stations = ElementTree.fromstring(xml).findall("s:station", NS)
+        self.assertEqual(len(stations), 2)
+
+        for node, location, component, latitude, longitude in (
+            (stations[0], "00", "HNE", 46.0, 7.0),
+            (stations[1], "10", "HNN", 47.0, 8.0),
+        ):
+            self.assertEqual(node.get("code"), "REAL")
+            self.assertEqual(node.get("netid"), "CH")
+            self.assertEqual(node.get("loc"), location)
+            self.assertEqual(node.find("s:comp", NS).get("name"), component)
+            self.assertAlmostEqual(float(node.get("lat")), latitude, places=12)
+            self.assertAlmostEqual(float(node.get("lon")), longitude, places=12)
 
     def test_missing_rupture_coordinates_fail_without_inventing_depth(self):
         for invalid in [FinderRupture(), object()]:

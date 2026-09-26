@@ -343,6 +343,38 @@ class ShakeMapClient:
         """Return the current service queue and capacity information."""
         return self._request("GET", "/queue")
 
+    @staticmethod
+    def validate_submission(
+        event_id,
+        files,
+        *,
+        configuration="global",
+        overwrite=True,
+    ):
+        """Validate locally before a workflow records intent to send this request.
+
+        The durable workflow and direct client use the same checks, so a bad
+        local argument need not create a record suggesting possible acceptance.
+        This performs no HTTP request or scientific validation.
+        """
+        # Check the complete request before crossing the service boundary.
+        # Once POST begins, an unusable response cannot prove rejection.
+        _event_id(event_id)
+        _basename(configuration, "configuration")
+        if type(overwrite) is not bool:
+            raise ValueError("overwrite must be a boolean")
+        if not isinstance(files, dict):
+            raise ValueError("files must map native basenames to bytes")
+
+        for name, content in files.items():
+            _basename(name, "filename")
+            # Quoted multipart filename headers must never accept escaping or
+            # header syntax supplied by the caller. Native exporter names need none.
+            if '"' in name or "\\" in name or not isinstance(content, bytes):
+                raise ValueError(
+                    "files require bytes and basenames without quotes/backslashes"
+                )
+
     def submit(
         self,
         event_id,
@@ -357,23 +389,12 @@ class ShakeMapClient:
         Empty mappings retain the service's existing canonical-input behavior.
         No local/shared paths are opened and no scientific input is rewritten.
         """
-        # Check the complete request before crossing the service boundary.
-        # Once POST begins, an unusable response cannot prove rejection.
-        event_id = _event_id(event_id)
-        configuration = _basename(configuration, "configuration")
-        if type(overwrite) is not bool:
-            raise ValueError("overwrite must be a boolean")
-        if not isinstance(files, dict):
-            raise ValueError("files must map native basenames to bytes")
-
-        for name, content in files.items():
-            _basename(name, "filename")
-            # Quoted multipart filename headers must never accept escaping or
-            # header syntax supplied by the caller. Native exporter names need none.
-            if '"' in name or "\\" in name or not isinstance(content, bytes):
-                raise ValueError(
-                    "files require bytes and basenames without quotes/backslashes"
-                )
+        self.validate_submission(
+            event_id,
+            files,
+            configuration=configuration,
+            overwrite=overwrite,
+        )
 
         # Encode the caller's selections as ordinary form fields. Native files
         # remain bytes throughout multipart assembly, including empty files.

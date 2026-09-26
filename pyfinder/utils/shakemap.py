@@ -108,7 +108,6 @@ class ShakeMapExporter:
             "stationlist",
             {"xmlns": "ch.ethz.sed.shakemap.usgs.xml"},
         )
-        native_identities = {}
 
         for index, channel in enumerate(channels):
             label = f"channel {index}"
@@ -127,28 +126,16 @@ class ShakeMapExporter:
                 empty=True,
             )
 
-            # ShakeMap ignores location in its station/component key. Keep
-            # track of that key so the current mapping cannot quietly overwrite
-            # an amplitude when two source identities collapse to one component.
-            native_key = (network, station, component)
-            identity = f"{network}.{station}.{location}.{component}"
-
-            if native_key in native_identities:
-                raise ValueError(
-                    "event_dat.xml cannot preserve native station/component "
-                    "collision: "
-                    f"{native_identities[native_key]} and {identity}"
-                )
-
-            native_identities[native_key] = identity
-
             pga = _number(channel.get_pga(), f"{label} PGA")
 
             if pga <= 0:
                 raise ValueError(f"{label} PGA must be positive linear cm/s²")
 
-            # Each input channel contributes its own XML element. ShakeMap's
-            # reader later groups components by native station identity.
+            # Preserve every selected channel, including location variants,
+            # in input order. The native reader groups stations by network/code,
+            # not loc; repeated components and station coordinates can therefore
+            # be replaced during parsing. This accepted library limitation must
+            # not become an exporter rejection or an invented station identity.
             node = SubElement(
                 root,
                 "station",

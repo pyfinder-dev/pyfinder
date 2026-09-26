@@ -47,6 +47,9 @@ with tempfile.TemporaryDirectory(prefix="pyfinder-native-inputs-", dir="/tmp") a
         "event_id": origin.id,
         "time": origin.time.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "amplitudes": amplitudes,
+        "stations": stations.db.execute(
+            "SELECT id, lat, lon FROM station ORDER BY id"
+        ).fetchall(),
     }
     # Keep native geometry rejection observable. The adapter must not reshape
     # an unsupported FinDer polygon merely to make this parser accept it.
@@ -149,6 +152,50 @@ class ShakeMapNativeInputTests(unittest.TestCase):
             with self.subTest(station=station):
                 self.assertEqual(amplitudes[station, component][0], orientation)
                 self.assertAlmostEqual(amplitudes[station, component][1], math.log(0.1), places=12)
+
+    def test_location_variants_follow_native_grouping_without_export_rejection(self):
+        # Characterize the accepted library behavior using exported bytes, not
+        # a second implementation of its station-key logic. This deliberately
+        # demonstrates native information loss; it does not certify model use.
+        for second_component in ("HNE", "HNN"):
+            with self.subTest(second_component=second_component):
+                solution = _solution()
+                solution.channels = FinderChannelList([
+                    FinderChannel(
+                        latitude=46.0,
+                        longitude=7.0,
+                        sncl="CH.REAL..HNE",
+                        pga=98.0665,
+                    ),
+                    FinderChannel(
+                        latitude=47.0,
+                        longitude=8.0,
+                        sncl=f"CH.REAL.00.{second_component}",
+                        pga=196.133,
+                    ),
+                ])
+                result = self._parse(solution)
+
+                # Both locations share one native station and its final
+                # coordinates, even when their component amplitudes survive.
+                self.assertEqual(len(result["stations"]), 1)
+                station, latitude, longitude = result["stations"][0]
+                self.assertEqual(station, "CH.REAL")
+                self.assertAlmostEqual(latitude, 47.0, places=12)
+                self.assertAlmostEqual(longitude, 8.0, places=12)
+
+                amplitudes = {
+                    (row[0], row[1]): row[3] for row in result["amplitudes"]
+                }
+                expected = {("CH.REAL", second_component): math.log(0.2)}
+                if second_component != "HNE":
+                    expected["CH.REAL", "HNE"] = math.log(0.1)
+
+                self.assertEqual(set(amplitudes), set(expected))
+                for identity, amplitude in expected.items():
+                    # Native PGA storage is ln(g). These inputs are 0.1 g and
+                    # 0.2 g; tolerance allows only floating-point roundoff.
+                    self.assertAlmostEqual(amplitudes[identity], amplitude, places=12)
 
     def test_unsupported_depth_geometry_is_rejected_without_repair(self):
         solution = _solution(equal_depth=True)
