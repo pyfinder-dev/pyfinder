@@ -92,6 +92,38 @@ def _cleanup_continuous_services(
     return failures
 
 
+def _build_shakemap_boundary(configuration, database_path):
+    """Build external resources only for explicitly enabled continuous operation."""
+    settings = configuration.get("shakemap", {})
+    enabled = settings.get("service-enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("shakemap.service-enabled must be a boolean")
+    if not enabled:
+        return None, None
+
+    from pyfinder.services.shakemap_client import ShakeMapClient
+    from pyfinder.services.shakemap_inputs import PreparedShakeMapInputs
+    from pyfinder.services.shakemap_workflow import ShakeMapWorkflow
+
+    client = ShakeMapClient(
+        settings.get("service-url"),
+        timeout=settings.get("request-timeout-seconds", 30.0),
+    )
+
+    # Validate settings before the listener is started or a scheduled item is
+    # assigned. Configuration is a service name, never a legacy local path or
+    # a FinDer profile inferred to be suitable for ShakeMap.
+    client.validate_submission(
+        "configuration-check", {},
+        configuration=settings.get("configuration", "global"),
+        overwrite=settings.get("overwrite", True),
+    )
+
+    inputs = PreparedShakeMapInputs(settings.get("input-directory"))
+    workflow = ShakeMapWorkflow(database_path, client)
+    return workflow, inputs
+
+
 def start_services(*, runtime_context):
     """Start continuous services from one validated runtime context."""
     global _launcher_logger, _listener, _listener_thread, _scheduler
@@ -157,13 +189,27 @@ def start_services(*, runtime_context):
             logger=listener_logger,
             configuration=application_configuration,
         )
-        scheduler = FollowUpScheduler(
-            service_policies=service_policies,
-            finder_config_selector=finder_config_selector,
-            db_path=runtime_context.operational_database_path,
-            logger=scheduler_logger,
-            configuration=application_configuration,
+        workflow, inputs = _build_shakemap_boundary(
+            application_configuration, runtime_context.operational_database_path,
         )
+        boundary = {} if workflow is None else {
+            "shakemap_workflow": workflow,
+            "shakemap_inputs": inputs,
+        }
+        try:
+            scheduler = FollowUpScheduler(
+                service_policies=service_policies,
+                finder_config_selector=finder_config_selector,
+                db_path=runtime_context.operational_database_path,
+                logger=scheduler_logger,
+                configuration=application_configuration,
+                **boundary,
+            )
+        except BaseException:
+            # Ownership transfers to the scheduler only after construction.
+            if workflow is not None:
+                workflow.close()
+            raise
 
         _listener = listener
         _scheduler = scheduler

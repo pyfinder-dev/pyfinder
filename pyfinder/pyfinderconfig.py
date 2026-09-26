@@ -50,15 +50,24 @@ pyfinderconfig = {
     },
 
     "shakemap": {
+        # External execution is enabled only by continuous-process composition.
+        # Set the real service URL and the caller-owned data/inputs mount before
+        # enabling it. Playback/on-demand retain their separate runtime policy.
+        "service-enabled": False,
+        "service-url": None,
+        "request-timeout-seconds": 30.0,
+        "input-directory": None,
+        "configuration": "global",
+        "overwrite": True,
+
         # Use amplitude from FinDer output, or use the original amplitudes
         # from the web services. Original amplitudes are merged if multiple
         # web services are used.
         "use-amplitude-from-finder-output": False,
 
-        # Region-specific ShakeMap configuration. The configuration files
-        # are automatically downloaded and extracted to the extern/shakemap-conf-eu directory.
-        # No need to change this path or do anything else. The regional configuration
-        # will be ignored if the use-region-specific-shakemap-config is False.
+        # Retained settings for the legacy local ShakeMap utilities. Continuous
+        # REST execution does not download these profiles or use this mapping;
+        # its caller-selected service configuration is named above.
         "use-region-specific-shakemap-config": False,
         "region-specific-shakemap-config": {          
             "al": "extern/shakemap-conf-eu/config/albania",

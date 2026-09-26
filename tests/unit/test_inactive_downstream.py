@@ -33,9 +33,10 @@ finally:
 class InactiveDownstreamTests(unittest.TestCase):
     def test_manager_has_no_active_local_shakemap_or_email_calls(self):
         tree = ast.parse(inspect.getsource(findermanager))
+        # The explicit handoff may now use the pure byte exporter. Legacy
+        # local execution and notification delivery remain inactive.
         forbidden_modules = {
             "utils.shakemap",
-            "pyfinder.utils.shakemap",
             "services.alert",
             "pyfinder.services.alert",
         }
@@ -59,7 +60,6 @@ class InactiveDownstreamTests(unittest.TestCase):
                 else:
                     continue
                 if call_name in {
-                    "ShakeMapExporter",
                     "ShakeMapTrigger",
                     "archive_products",
                     "send_email_with_attachment",

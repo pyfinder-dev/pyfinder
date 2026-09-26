@@ -31,16 +31,21 @@ available. These are internal application interfaces.
 
 ## Current execution boundaries
 
-ShakeMap and email execution are currently inactive. Deployment commands and
-final host usage will be documented when the PyFinder container image and host
-controller exist.
+Continuous operation can submit to the separate ShakeMap REST service and
+monitor its accepted jobs. This integration is disabled by default; it requires
+an explicit endpoint and shared caller-owned input directory. See the
+[adapter configuration and limitations](docs/shakemap-adapter.md).
+
+Product collection and email notifications remain unfinished. Playback and
+on-demand do not activate this external workflow. Host unit tests do not establish
+live service integration or deployment readiness.
 
 ---
 
 ## Sequence diagram
 
-The diagrams retain workflow context. Their ShakeMap and email steps are
-inactive in the current application.
+The diagrams show the current continuous workflow. The external ShakeMap
+steps run only when explicitly enabled; notification delivery remains separate.
 
 ### Listening event alerts from EMSC
 
@@ -68,6 +73,7 @@ sequenceDiagram
     participant FM as FinderManager
     participant P as ParamWS package
     participant FE as FinDerExecutable
+    participant SM as ShakeMapService
 
     loop periodic 
       FUS->>ET: poll_due_events()
@@ -82,8 +88,23 @@ sequenceDiagram
       P-->>FM: Return data
       FM->>FE: Execute FinDer
       FE-->>FM: Return solution
-      Note right of FM: ShakeMap and email execution inactive
+      FM-->>FUS: Return selected solution
+      opt ShakeMap service enabled and solution usable
+        FUS->>FM: Prepare native input bytes
+        FM-->>FUS: Existing calculation ID and inputs
+        FUS->>DB: Retain request and submission intent
+        FUS->>SM: Submit when preceding same-ID outcome is recorded
+        SM-->>FUS: Acknowledge accepted sequence
+        FUS->>DB: Retain accepted sequence
+      end
+      Note right of FUS: Email and product copying remain unfinished
     end
 
-    
+    opt ShakeMap service enabled
+      loop Observer passes, including when no events are due
+        FUS->>SM: Read exact accepted job sequence
+        SM-->>FUS: Job outcome
+        FUS->>DB: Save observation and guarded local outcome
+      end
+    end
 ```

@@ -40,6 +40,8 @@ class FollowUpScheduler:
         db_path=None,
         logger=None,
         configuration=None,
+        shakemap_workflow=None,
+        shakemap_inputs=None,
     ):
         # Supported process composition supplies the scheduler-owned logger.
         # Direct construction retains a non-file logger for library use.
@@ -81,6 +83,17 @@ class FollowUpScheduler:
 
             configuration = pyfinderconfig
         self.configuration = configuration
+
+        # Only explicit process composition enables the external workflow.
+        # Playback uses this scheduler too, but its temporary database must not
+        # silently become the owner of jobs that outlive that process.
+        if (shakemap_workflow is None) != (shakemap_inputs is None):
+            raise ValueError("ShakeMap workflow and caller-owned inputs are required together")
+        self.shakemap_workflow = shakemap_workflow
+        self.shakemap_inputs = shakemap_inputs
+        self._shakemap_phase_lock = threading.RLock()
+        self._monitor_executor = None
+        self._monitor_future = None
 
         # A tracker supplied by playback remains caller-owned until this
         # constructor succeeds. A tracker created here has no other owner and
@@ -125,12 +138,22 @@ class FollowUpScheduler:
             # Thread pool with up to 10 workers
             executor = ThreadPoolExecutor(max_workers=10)
             self.executor = executor
+            if self.shakemap_workflow is not None:
+                # Native jobs wait in ShakeMap, not in the FinDer worker pool.
+                # One observer serializes local outcome application and performs
+                # finite HTTP reads; no worker loops until a native job finishes.
+                self._monitor_executor = ThreadPoolExecutor(max_workers=1)
             self.logger.info(
                 "ThreadPoolExecutor initialized for the scheduler."
             )
             self.logger.info("FollowUpScheduler initialization completed.")
         except BaseException as construction_error:
             cleanup_errors = []
+            if self._monitor_executor is not None:
+                try:
+                    self._monitor_executor.shutdown(wait=True)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
             if executor is not None:
                 try:
                     executor.shutdown(wait=True)
@@ -151,17 +174,10 @@ class FollowUpScheduler:
                 )
             raise
 
-        # Local ShakeMap configuration is inactive until the external service
-        # boundary is implemented.
-        # try:
-        #     from pyfinder.utils.config_fetcher import ensure_shakemap_config
-        #
-        #     self.logger.info("Ensuring ShakeMap configuration is available...")
-        #     ensure_shakemap_config()
-        #     self.logger.info("ShakeMap configuration cloned successfully.")
-        # except Exception as e:
-        #     self.logger.error(f"Failed to ensure ShakeMap configuration: {e}")
-            
+        # Native ShakeMap configuration belongs to the separate service.
+        # The caller selects its name at submission; no local profile or
+        # configuration download is prepared by scheduler construction.
+
     @staticmethod
     def _welcome_message(logger):
         """ Print a welcome message to the console and log it. """
@@ -405,6 +421,13 @@ class FollowUpScheduler:
             )
             return None
 
+        if getattr(self, "shakemap_workflow", None) is not None:
+            self._submit_shakemap(
+                finder_manager, finder_solution, event_id, service,
+                current_delay_time, event_meta, policy,
+            )
+            return finder_solution
+
         identity = (event_id, service, current_delay_time)
         affected_rows = self.tracker.mark_completed(
             event_id=event_id,
@@ -424,6 +447,303 @@ class FollowUpScheduler:
             service,
         )
         return finder_solution
+
+    def _submit_shakemap(
+        self, manager, solution, event_id, service, delay, event_meta, policy,
+    ):
+        """Retain each deliberate request without changing its public ID."""
+        with self._shakemap_phase_lock:
+            attempt_id = self.tracker.get_execution_id(
+                event_id=event_id,
+                service=service,
+                current_delay_time=delay,
+            )
+            if not attempt_id:
+                raise SchedulerLifecycleError(
+                    "Assigned execution has no persisted attempt identity"
+                )
+
+            workflow = self.shakemap_workflow
+            workflow.bind_scheduled_attempt(attempt_id, event_id, service, delay)
+
+            try:
+                # Persist the exact bundle so a later same-ID request can wait
+                # for its predecessor without rerunning FinDer or changing IDs.
+                # An existing intent is authoritative even if its ack was lost.
+                if workflow.get(attempt_id) is not None:
+                    return
+
+                calculation_id, files = manager.prepare_shakemap(solution)
+                settings = self.configuration.get("shakemap", {})
+                workflow.prepare_scheduled_submission(
+                    attempt_id,
+                    calculation_id,
+                    files,
+                    configuration=settings.get("configuration", "global"),
+                    overwrite=settings.get("overwrite", True),
+                )
+            except Exception as error:
+                self._record_failed_attempt(
+                    event_id=event_id,
+                    service=service,
+                    current_delay_time=delay,
+                    event_meta=event_meta,
+                    policy=policy,
+                    diagnostic=self._failure_diagnostic("ShakeMap preparation failed", error),
+                )
+                workflow.finish_scheduled_attempt(attempt_id)
+                return
+
+            self._dispatch_shakemap_submissions()
+
+    def _retry_rejected_shakemap(self, link, error):
+        """Apply existing retry pacing only when there is no remote acceptance."""
+        event_id, service, delay = (
+            link["event_id"], link["service"], link["current_delay_time"],
+        )
+        metadata = self.tracker.get_event_meta(
+            event_id=event_id,
+            service=service,
+            current_delay_time=delay,
+        )
+        if (
+            metadata is not None
+            and metadata[EventTracker.Field.status] == "processing"
+            and self.tracker.get_execution_id(
+                event_id=event_id,
+                service=service,
+                current_delay_time=delay,
+            ) == link["attempt_id"]
+        ):
+            policy = self.service_policies.get(service)
+            if policy is None:
+                self.tracker.finish_shakemap_execution(
+                    execution_id=link["attempt_id"], success=False,
+                    diagnostic="ShakeMap submission has no configured scheduler policy",
+                )
+            else:
+                self._record_failed_attempt(
+                    event_id=event_id,
+                    service=service,
+                    current_delay_time=delay,
+                    event_meta=metadata,
+                    policy=policy,
+                    diagnostic=self._failure_diagnostic("ShakeMap submission failed", error),
+                )
+        self.shakemap_workflow.finish_scheduled_attempt(link["attempt_id"])
+
+    def _dispatch_shakemap_submissions(self):
+        """Send retained requests in order, preserving evidence before same-ID overwrite.
+
+        A preceding accepted job must have a recorded terminal observation before
+        a later same-ID POST may replace it. Uncertain acceptance also holds that
+        ID: its server handler may still be writing canonical inputs. Other IDs
+        remain eligible. This queue retains deliberate requests; it never renames
+        their public calculation ID or retries an already-sent request.
+        """
+        workflow = self.shakemap_workflow
+        links = {
+            link["attempt_id"]: link for link in workflow.pending_scheduled_attempts()
+        }
+        unresolved = workflow.unresolved()
+        active_ids = set(links) | {record["attempt_id"] for record in unresolved}
+        prepared = workflow.prepared_scheduled_submissions(attempt_ids=active_ids)
+        prepared_ids = {item["attempt_id"] for item in prepared}
+        # Also respect older standalone attempts in this same workflow database.
+        blocked_ids = {
+            record["request"]["event_id"] for record in unresolved
+            if record["attempt_id"] not in prepared_ids
+        }
+        for request in prepared:
+            attempt_id = request["attempt_id"]
+            calculation_id = request["event_id"]
+            record = workflow.get(attempt_id)
+
+            if record is not None:
+                if record["submission_state"] == "REJECTED" and attempt_id in links:
+                    # The normal rejection path already attempted the paced
+                    # retry transition. If it was interrupted, observe that
+                    # persistence failure just as the worker callback does:
+                    # finalize remaining local ownership, without incrementing
+                    # retry_count again or replaying the rejected request.
+                    self.tracker.finish_shakemap_execution(
+                        execution_id=attempt_id, success=False,
+                        diagnostic="Local retry finalization after ShakeMap rejection was interrupted",
+                    )
+                    workflow.finish_scheduled_attempt(attempt_id)
+
+                observation = record["observation"]
+                terminal = (
+                    record["submission_state"] == "REJECTED"
+                    or (
+                        observation is not None
+                        and observation["details"]["status"] in {"SUCCESS", "FAILED"}
+                        and record["last_error"] is None
+                    )
+                )
+                if not terminal:
+                    blocked_ids.add(calculation_id)
+                continue
+
+            link = links.get(attempt_id)
+            if link is None:
+                continue
+            metadata = self.tracker.get_event_meta(
+                event_id=link["event_id"], service=link["service"],
+                current_delay_time=link["current_delay_time"],
+            )
+            if (
+                metadata is None
+                or metadata[EventTracker.Field.status] != "processing"
+                or self.tracker.get_execution_id(
+                    event_id=link["event_id"], service=link["service"],
+                    current_delay_time=link["current_delay_time"],
+                ) != attempt_id
+            ):
+                # Forced restart has already failed local processing. Observe
+                # jobs that were sent, but do not start this abandoned request.
+                workflow.finish_scheduled_attempt(attempt_id)
+                continue
+
+            if calculation_id in blocked_ids:
+                continue
+
+            try:
+                if request["base_url"] != workflow.client.base_url:
+                    raise ValueError("Prepared ShakeMap request belongs to a different endpoint")
+                with self.shakemap_inputs.submission(calculation_id, request["files"]):
+                    workflow.submit(
+                        attempt_id,
+                        calculation_id,
+                        request["files"],
+                        configuration=request["configuration"],
+                        overwrite=request["overwrite"],
+                    )
+            except Exception as error:
+                record = workflow.get(attempt_id)
+                if record is None or record["submission_state"] == "REJECTED":
+                    self._retry_rejected_shakemap(link, error)
+                else:
+                    blocked_ids.add(calculation_id)
+                    self.logger.error(
+                        "ShakeMap attempt %s requires observation/reconciliation: %s",
+                        attempt_id, type(error).__name__,
+                    )
+            else:
+                blocked_ids.add(calculation_id)
+
+    def _apply_shakemap_result(self, link, record):
+        """Finalize only the execution that owns this recorded native outcome."""
+        observation = record["observation"]
+        if observation is None:
+            return
+
+        details = observation["details"]
+        if details["status"] not in {"SUCCESS", "FAILED"}:
+            return
+
+        # A native failure is reported without another scientific calculation.
+        # Archived SUCCESS can lack products; that is not usable chain success.
+        success = details["status"] == "SUCCESS" and details["products_ready"]
+        diagnostic = None if success else (
+            "ShakeMap reported FAILED" if details["status"] == "FAILED"
+            else "ShakeMap completed but its products are unavailable"
+        )
+        changed = self.tracker.finish_shakemap_execution(
+            execution_id=link["attempt_id"], success=success, diagnostic=diagnostic,
+        )
+        if changed not in (0, 1):
+            raise SchedulerLifecycleError("ShakeMap finalization changed multiple scheduled rows")
+
+        # Zero means the row was already finalized, removed, or abandoned on
+        # restart. Never reopen it or attach this result to a new registration.
+        self.shakemap_workflow.finish_scheduled_attempt(link["attempt_id"])
+
+    def _poll_shakemap_once(self):
+        """Observe external jobs independently of discovery of new due work."""
+        with self._shakemap_phase_lock:
+            workflow = self.shakemap_workflow
+            links = {
+                item["attempt_id"]: item
+                for item in workflow.pending_scheduled_attempts()
+            }
+            records = {item["attempt_id"]: item for item in workflow.unresolved()}
+            # A terminal result may already be saved while its local transition
+            # failed. Such records are absent from unresolved(), but still need
+            # guarded finalization through their retained association.
+            for attempt_id in links:
+                record = workflow.get(attempt_id)
+                if record is not None:
+                    records[attempt_id] = record
+
+            for attempt_id, record in records.items():
+                if record["submission_state"] != "ACCEPTED":
+                    continue
+                try:
+                    observation = record["observation"]
+                    if (
+                        observation is None
+                        or observation["details"]["status"] not in {"SUCCESS", "FAILED"}
+                        or record["last_error"] is not None
+                    ):
+                        record = workflow.poll(attempt_id)
+                    if attempt_id in links:
+                        self._apply_shakemap_result(links[attempt_id], record)
+                except Exception as error:
+                    # A lost read or local write is not a native FAILED result.
+                    # Keep evidence/association and let the next pass observe
+                    # this same sequence while other jobs continue to progress.
+                    self.logger.error(
+                        "ShakeMap observation for attempt %s failed: %s",
+                        attempt_id, type(error).__name__,
+                    )
+
+            # Observation precedes replacement. Once the older result is saved,
+            # a retained same-ID request can be sent during this same pass.
+            self._dispatch_shakemap_submissions()
+
+    def _schedule_shakemap_monitor(self):
+        """Keep at most one finite observation pass running in this scheduler."""
+        if getattr(self, "shakemap_workflow", None) is None:
+            return
+        if self._monitor_future is not None:
+            if not self._monitor_future.done():
+                return
+            try:
+                self._monitor_future.result()
+            except Exception:
+                self.logger.exception("ShakeMap monitor pass failed")
+        self._monitor_future = self._monitor_executor.submit(self._poll_shakemap_once)
+
+    def _drain_shakemap_monitor(self):
+        """Stop local monitoring without waiting for remote calculations to finish."""
+        if getattr(self, "shakemap_workflow", None) is None:
+            return
+        self._monitor_executor.shutdown(wait=True)
+        if self._monitor_future is not None:
+            try:
+                self._monitor_future.result()
+            except Exception:
+                self.logger.exception("ShakeMap monitor failed during shutdown")
+
+        # Workers have already drained, so no new submission can appear here.
+        # Preserve terminal evidence already recorded; otherwise explicitly fail
+        # local ownership while retaining external jobs for observation on restart.
+        for link in self.shakemap_workflow.pending_scheduled_attempts():
+            record = self.shakemap_workflow.get(link["attempt_id"])
+            if (
+                record is not None
+                and record["observation"] is not None
+                and record["observation"]["details"]["status"] in {"SUCCESS", "FAILED"}
+                and record["last_error"] is None
+            ):
+                self._apply_shakemap_result(link, record)
+            else:
+                self.tracker.finish_shakemap_execution(
+                    execution_id=link["attempt_id"], success=False,
+                    diagnostic="Local scheduler stopped; external ShakeMap outcome remains separate",
+                )
+                self.shakemap_workflow.finish_scheduled_attempt(link["attempt_id"])
 
     def _retain_future(self, future, identity):
         """Keep a submitted future reachable until its result is observed."""
@@ -523,6 +843,7 @@ class FollowUpScheduler:
         self.logger.info("Waiting for scheduler worker finalization.")
         self.executor.shutdown(wait=True)
         self._drain_future_observations()
+        self._drain_shakemap_monitor()
         self._drain_complete = True
 
     def stop_and_drain(self):
@@ -536,7 +857,11 @@ class FollowUpScheduler:
             if self._shutdown_complete:
                 return
             self._stop_and_drain_locked()
-            self.tracker.close()
+            try:
+                if getattr(self, "shakemap_workflow", None) is not None:
+                    self.shakemap_workflow.close()
+            finally:
+                self.tracker.close()
             self._shutdown_complete = True
             self.logger.info("FollowUpScheduler shutdown complete.")
 
@@ -550,6 +875,9 @@ class FollowUpScheduler:
             if not self._accepting_work:
                 return
 
+            # External calculations progress even when there are no newly due
+            # FinDer executions. Observation runs outside the discovery lock.
+            self._schedule_shakemap_monitor()
             due_events = self.tracker.get_due_events(service=None)
             if not due_events:
                 return

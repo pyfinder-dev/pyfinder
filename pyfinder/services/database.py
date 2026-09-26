@@ -10,6 +10,7 @@ updates and follow-ups.
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from uuid import uuid4
 
 
 STATUS_PENDING = "pending"
@@ -38,16 +39,23 @@ class ThreadSafeDB:
     def __init__(self, db_path="event_update_follow_up.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.cursor = self.conn.cursor()
-        self._enable_wal()
-        self._create_table()
+        try:
+            self._enable_wal()
+            self._create_table()
+        except BaseException:
+            self.conn.close()
+            raise
 
     def _enable_wal(self):
         """Enable Write-Ahead Logging (WAL) mode for better concurrency."""
         self.cursor.execute('PRAGMA journal_mode=WAL;')
 
     def _create_table(self):
-        """Create the event tracking table if it doesn't exist."""
+        """Create the table and preserve existing rows when adding execution IDs."""
         with self._lock:
+            # Serialize schema inspection and alteration across connections.
+            # Existing databases keep their rows and composite primary key.
+            self.cursor.execute("BEGIN IMMEDIATE")
             # All timestamps are stored as UTC ISO 8601 strings
             self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS event_tracker (
@@ -68,9 +76,18 @@ class ThreadSafeDB:
                 last_data_snapshot TEXT DEFAULT NULL,
                 emsc_alert_json TEXT DEFAULT NULL,
                 last_modified TEXT DEFAULT (DATETIME('now')),
+                execution_id TEXT DEFAULT NULL,
                 PRIMARY KEY (event_id, service, current_delay_time)
             )
             ''')
+            columns = {
+                row[1] for row in self.cursor.execute("PRAGMA table_info(event_tracker)")
+            }
+            if "execution_id" not in columns:
+                self.cursor.execute(
+                    "ALTER TABLE event_tracker ADD COLUMN execution_id TEXT DEFAULT NULL"
+                )
+
             self.conn.commit()
 
     def _execute_write(self, statement, parameters):
@@ -191,11 +208,15 @@ class ThreadSafeDB:
         current_delay_time,
         last_query_time,
     ):
-        """Assign one known pending row to processing."""
+        """Assign a fresh internal execution identity to one pending row.
+
+        This token identifies a deliberate execution, not the public calculation
+        ID. A retry gets a new token; a repeated claim of processing work does not.
+        """
         return self._execute_write(
             statement='''
                 UPDATE event_tracker
-                SET status = ?, last_query_time = ?
+                SET status = ?, last_query_time = ?, execution_id = ?
                 WHERE event_id = ?
                     AND service = ?
                     AND current_delay_time = ?
@@ -204,10 +225,43 @@ class ThreadSafeDB:
             parameters=(
                 STATUS_PROCESSING,
                 last_query_time,
+                uuid4().hex,
                 event_id,
                 service,
                 current_delay_time,
                 STATUS_PENDING,
+            ),
+        )
+
+    def get_execution_id(self, event_id, service, current_delay_time):
+        """Read the current internal attempt without changing scheduler metadata."""
+        with self._lock:
+            row = self.cursor.execute('''
+                SELECT execution_id FROM event_tracker
+                WHERE event_id = ? AND service = ? AND current_delay_time = ?
+            ''', (event_id, service, current_delay_time)).fetchone()
+            return row[0] if row is not None else None
+
+    def finish_shakemap_execution(self, execution_id, *, success, diagnostic=None):
+        """Apply an external outcome only to its still-owned processing row.
+
+        Cleanup and re-registration can reuse the scheduled row's public fields.
+        The execution token prevents a late external result from finalizing that
+        replacement. Forced-restart failures remain failed for the same reason.
+        """
+        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        return self._execute_write(
+            statement='''
+                UPDATE event_tracker
+                SET status = ?, last_query_time = ?, last_error = ?
+                WHERE execution_id = ? AND status = ?
+            ''',
+            parameters=(
+                STATUS_COMPLETED if success else STATUS_FAILED,
+                now,
+                None if success else diagnostic,
+                execution_id,
+                STATUS_PROCESSING,
             ),
         )
 

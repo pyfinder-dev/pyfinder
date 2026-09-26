@@ -1,10 +1,10 @@
 # PyFinder's ShakeMap adapter
 
 This adapter prepares native inputs and communicates with the separate ShakeMap
-service. It is not yet connected to the manager or scheduled workflow. A durable
-submission/monitoring helper is available for that integration; automatic restart
-reconciliation, product copying, and notifications remain later work. Existing
-application execution remains inactive at that downstream boundary.
+service. The manager and scheduler now have an explicit continuous-operation
+handoff, durable submission queue, and exact-job monitoring. It is disabled by
+default until the service endpoint and caller-owned canonical input mount are
+configured. Product copying and notifications remain separate unfinished work.
 
 ## Preparing inputs
 
@@ -104,11 +104,10 @@ the service to snapshot existing inputs; it does not mean an empty calculation.
 `pyfinder.services.shakemap_workflow.ShakeMapWorkflow` wraps the client with an
 additive `shakemap_submissions` table in an explicitly supplied SQLite database.
 The path must name a persistent filesystem database; empty paths, in-memory
-names, and SQLite URI names are rejected. It can share the scheduler database,
-but never changes scheduled rows, their
-retry counts, their startup failure rule, or their cleanup behavior. External
+names, and SQLite URI names are rejected. The helper shares the scheduler database
+but leaves scheduled lifecycle changes to the scheduler/EventTracker boundary. External
 records survive scheduled-row cleanup. Opening this helper creates its table;
-this implementation has not opened or migrated the operator database.
+development and verification use temporary databases, not the operator database.
 
 ```python
 from pyfinder.services.shakemap_client import ShakeMapClient
@@ -133,7 +132,9 @@ helper does not invent an ID scheme or decide when another attempt is justified.
 It records the endpoint, public ID, configuration, overwrite choice, and file
 sizes/SHA-256 fingerprints before POST. Fingerprints identify the submitted
 bytes; they neither retain those bytes nor prove which managed scientific data
-was used. Input-file retention remains the caller's responsibility. An empty
+was used. Direct callers remain responsible for input-file retention. The integrated
+scheduler separately retains exact prepared bytes in its scheduled-attempt
+association before dispatch. An empty
 mapping retains the client's existing service-input snapshot semantics; its
 fingerprint cannot describe those service-side inputs.
 
@@ -178,8 +179,110 @@ synchronous operations serialize within an instance; a database uniqueness
 constraint also prevents two instances from sending the same attempt twice.
 It supplies no distributed monitoring ownership or retry loop. Endpoint URL
 pinning cannot detect an operator replacing the service runtime and reusing its
-sequence numbers. Such recovery, along with scheduler retry mapping, remains
-outside this package. No production submissions are activated by importing it.
+sequence numbers. Such service-runtime replacement recovery remains outside this package.
+No submissions are activated by importing it.
+
+## Manager and scheduler integration
+
+`FinDerManager.run()` retains its `FinderSolution | None` result. The explicit
+`prepare_shakemap(solution)` handoff uses that selected solution, authoritative
+EventContext, and existing augmented calculation ID. It requires an explicit
+timezone in the physical-origin text and does not round-trip through the old
+host-dependent epoch helper. Continuous EMSC timestamps include UTC; a provider
+context that lost separate timezone metadata still needs that upstream metadata
+preserved before an experimental handoff can use it.
+
+The public calculation ID stays unchanged. Every deliberately assigned execution
+gets a fresh internal `execution_id`, including retries and later registration
+after cleanup. Reusing the public ID creates a new calculation, with
+`overwrite=True` by default. Internal attempt records prevent accidental replay
+of that same request; they do not suppress a later deliberate calculation.
+The scheduler's composite row identity and FinDer workspace names are unchanged.
+
+The SQLite upgrade is additive: `event_tracker.execution_id` and the separate
+`shakemap_scheduled_attempts` table preserve existing rows and retained external
+history. Associations guard lifecycle writes by execution token, so a late result
+cannot complete a newly registered row or reopen a row failed during restart.
+
+After FinDer succeeds, the scheduler binds the execution and persists the exact
+exported bytes, configuration, overwrite choice, and endpoint using
+`prepare_scheduled_submission`. These prepared bundles can be inspected through
+`prepared_scheduled_submissions`; preparation itself does not mean a POST occurred.
+The scheduler reads only active bundles during dispatch. Retained historical
+bundles are not automatically deleted or decoded on every monitoring cycle.
+
+Same-ID requests dispatch in their retained preparation order. Before posting a
+later request, PyFinder saves the preceding accepted job's terminal observation;
+otherwise `overwrite=True` could erase the evidence before it is observed. A
+`SUBMITTING` or `UNCERTAIN` predecessor holds later requests for that ID without
+changing their bytes or IDs. It could still be writing inputs server-side after
+a client timeout. Other IDs can progress. Unknown acceptance is not resolved by
+guessing the latest service sequence, and no automatic operator-resolution
+mechanism is supplied in this package.
+
+A dedicated observer performs one pass per scheduler discovery cycle, even when
+no events are due. Native execution does not occupy the FinDer worker pool while
+waiting for its result. Read errors retain the accepted sequence and are retried
+as observations, without rerunning FinDer or POST. Explicit pre-acceptance rejection
+uses the existing three-attempt/ten-second execution retry policy. Native `FAILED`
+is recorded as terminal without another scientific calculation, following the
+approved integration direction. Native `SUCCESS` requires `products_ready` before
+local completion; an unavailable archive is not usable chain success. These
+outcomes do not imply copied products or delivered notifications.
+
+A stored terminal result whose local transition failed is reapplied through its
+association, even though `unresolved()` excludes terminal jobs. Interrupted local
+retry persistence after rejection receives guarded failure finalization without
+incrementing its retry count again. Local persistence errors remain observable.
+
+Startup still marks abandoned local processing rows failed. Accepted external
+jobs can continue to be observed, but never reopen those rows. Prepared requests
+that had not been sent are retained for inspection and are not automatically
+started after their local execution was abandoned. Orderly shutdown drains
+finite in-flight operations, finalizes remaining local ownership, and retains
+external records. It does not wait for native calculations to finish.
+
+## Continuous configuration and input ownership
+
+Only `start_monitoring` composes the external workflow. Configure the existing
+`shakemap` settings explicitly:
+
+```python
+"service-enabled": True,
+"service-url": "http://<reachable-shakemap-host>:<port>",
+"request-timeout-seconds": 30.0,
+"input-directory": "/absolute/resolved/caller-visible/data/inputs",
+"configuration": "global",  # Or an explicitly selected service configuration name.
+"overwrite": True,
+```
+
+The input directory must be the same canonical storage the service uses and be
+readable/writable by both processes. It must already exist as an absolute,
+resolved directory. Do not point it at products or an unrelated operator folder.
+This code does not establish deployment mounts, network routing, credentials,
+regional data suitability, or host/container path equivalence. Operators must
+provide those deployment resources before enabling the feature.
+
+`PreparedShakeMapInputs` requires exclusive caller ownership of these event
+inputs. It holds a per-event PyFinder advisory lock across preparation and POST,
+and uses the service's event-directory lock while inspecting/removing stale input.
+The latter lock is released before POST so the service can acquire it. Locks
+serialize requests rather than reject a deliberate same-ID submission.
+Only an omitted stale `rupture.json` is removed; new `event.xml` and `event_dat.xml`
+are always uploaded as a complete bundle. Unknown files, symlinks, and special
+entries are refused untouched. Products, service state, and datasets are not
+modified by this helper. All callers that write these inputs must respect this
+ownership; unrelated REST writers do not participate in the PyFinder lock.
+
+The service configuration is explicitly caller-selected, defaults to `global`,
+and has no fallback. Legacy local regional paths and the FinDer profile name
+are not silently translated into ShakeMap configuration selections. Existing
+legacy modules remain retained; removed commented call sequences are preserved
+in `legacy/manager-downstream-reference.md`.
+
+Playback and on-demand are not automatically enabled by these settings. They
+retain their existing isolation and do not use the operational scheduler database.
+Experimental external execution and its retention policy remain separate work.
 
 ## Verification
 
@@ -207,4 +310,6 @@ adapter and parser behavior, not continuous-operation or deployment readiness.
 The former exporter, local runner, profile mutation, and product ZIP collection
 are preserved unchanged in `legacy/shakemap.py`. See `legacy/README.md`. They
 are historical reference, excluded from installed packages and Docker builds,
-and are not used as a fallback. Related old helper modules remain present.
+and are not used as a fallback. The removed manager/scheduler call sequences and
+notification construction remain in `legacy/manager-downstream-reference.md`.
+Related old helper modules remain present.

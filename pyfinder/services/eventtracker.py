@@ -96,6 +96,22 @@ class EventTracker:
             last_query_time=now,
         )
 
+    def get_execution_id(self, event_id, service, current_delay_time):
+        """Return the current internal execution token for a scheduled row."""
+        return self._db.get_execution_id(
+            event_id=event_id,
+            service=service,
+            current_delay_time=current_delay_time,
+        )
+
+    def finish_shakemap_execution(self, execution_id, *, success, diagnostic=None):
+        """Finalize only the processing execution associated with this result."""
+        return self._db.finish_shakemap_execution(
+            execution_id=execution_id,
+            success=success,
+            diagnostic=diagnostic,
+        )
+
     def cleanup_terminal_events(self):
         """Explicitly remove rows for events whose work is fully terminal."""
         return self._db.cleanup_terminal_events()

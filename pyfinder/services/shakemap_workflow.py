@@ -2,10 +2,12 @@
 
 This is a callable integration building block, not a scheduler. The caller owns
 attempt identity, polling cadence, and the interpretation of terminal outcomes.
-Scheduled rows, scientific inputs, service configuration, and products are never
-modified here. A committed intent is never automatically submitted a second time.
+This helper retains exact prepared input bytes and association records, but
+does not change scheduled-row lifecycle, canonical input files, service
+configuration or products. A committed intent is never automatically sent twice.
 """
 
+from base64 import b64decode, b64encode
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
@@ -69,6 +71,8 @@ class ShakeMapWorkflow:
         try:
             self._connection.execute("PRAGMA journal_mode=WAL")
             with self._connection:
+                # Keep schema inspection and addition atomic across connections.
+                self._connection.execute("BEGIN IMMEDIATE")
                 self._connection.execute('''
                     CREATE TABLE IF NOT EXISTS shakemap_submissions (
                         attempt_id TEXT PRIMARY KEY NOT NULL,
@@ -83,6 +87,25 @@ class ShakeMapWorkflow:
                         last_error TEXT
                     )
                 ''')
+                self._connection.execute("""
+                    CREATE TABLE IF NOT EXISTS shakemap_scheduled_attempts (
+                        attempt_id TEXT PRIMARY KEY NOT NULL,
+                        event_id TEXT NOT NULL,
+                        service TEXT NOT NULL,
+                        current_delay_time REAL NOT NULL,
+                        finalized INTEGER NOT NULL DEFAULT 0,
+                        prepared_json TEXT
+                    )
+                """)
+                columns = {
+                    row[1] for row in self._connection.execute(
+                        "PRAGMA table_info(shakemap_scheduled_attempts)"
+                    )
+                }
+                if "prepared_json" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE shakemap_scheduled_attempts ADD COLUMN prepared_json TEXT"
+                    )
         except BaseException:
             self._connection.close()
             raise
@@ -137,6 +160,165 @@ class ShakeMapWorkflow:
             )
         ]
 
+    def bind_scheduled_attempt(self, attempt_id, event_id, service, current_delay_time):
+        """Retain the scheduled execution owning an impending external request.
+
+        The caller supplies its execution token as attempt_id. This association
+        deliberately outlives terminal scheduled-row cleanup and never changes
+        the public calculation ID sent to ShakeMap.
+        """
+        if not isinstance(attempt_id, str) or not attempt_id.strip():
+            raise ValueError("attempt_id must be a nonempty execution token")
+
+        with self._lock, self._connection:
+            # Reserve the write before checking ownership. Another connection
+            # cannot retire/reassign the scheduled row between the check and bind.
+            self._connection.execute("BEGIN IMMEDIATE")
+            previous = self._connection.execute("""
+                SELECT event_id, service, current_delay_time
+                FROM shakemap_scheduled_attempts WHERE attempt_id = ?
+            """, (attempt_id,)).fetchone()
+
+            if previous is not None:
+                if tuple(previous) != (event_id, service, current_delay_time):
+                    raise ValueError("attempt_id already belongs to another scheduled row")
+                return
+
+            owned = self._connection.execute("""
+                SELECT 1 FROM event_tracker
+                WHERE event_id = ? AND service = ? AND current_delay_time = ?
+                    AND execution_id = ? AND status = 'processing'
+            """, (event_id, service, current_delay_time, attempt_id)).fetchone()
+            if owned is None:
+                raise ValueError("scheduled attempt does not own a processing row")
+
+            self._connection.execute("""
+                INSERT INTO shakemap_scheduled_attempts (
+                    attempt_id, event_id, service, current_delay_time
+                ) VALUES (?, ?, ?, ?)
+            """, (attempt_id, event_id, service, current_delay_time))
+
+    def pending_scheduled_attempts(self):
+        """Read associations still requiring local lifecycle reconciliation.
+
+        Include associations whose external result is already terminal: a crash
+        may have interrupted the later local transition. External monitoring uses
+        unresolved() separately and survives association finalization.
+        """
+        with self._lock:
+            rows = self._connection.execute("""
+                SELECT attempt_id, event_id, service, current_delay_time, finalized
+                FROM shakemap_scheduled_attempts
+                WHERE finalized = 0 ORDER BY attempt_id
+            """).fetchall()
+            return [dict(row) for row in rows]
+
+    def finish_scheduled_attempt(self, attempt_id):
+        """Record completed local reconciliation without deleting job evidence."""
+        with self._lock, self._connection:
+            return self._connection.execute("""
+                UPDATE shakemap_scheduled_attempts SET finalized = 1
+                WHERE attempt_id = ? AND finalized = 0
+            """, (attempt_id,)).rowcount
+
+    def prepare_scheduled_submission(
+        self,
+        attempt_id,
+        event_id,
+        files,
+        *,
+        configuration="global",
+        overwrite=True,
+    ):
+        """Save a complete immutable handoff before the scheduler permits POST.
+
+        Retaining the actual bytes allows a later deliberate request with the
+        same public ID to wait for its predecessor without rerunning FinDer or
+        rereading mutable input files. Preparing is not evidence of submission.
+        """
+        self.client.validate_submission(
+            event_id, files, configuration=configuration, overwrite=overwrite,
+        )
+        files = dict(files)
+        prepared = {
+            "event_id": event_id,
+            "configuration": configuration,
+            "overwrite": overwrite,
+            "base_url": self.client.base_url,
+            "files": {
+                name: b64encode(content).decode("ascii")
+                for name, content in files.items()
+            },
+        }
+        prepared_json = json.dumps(prepared, sort_keys=True)
+
+        with self._lock, self._connection:
+            # Ownership was recorded by bind_scheduled_attempt. Serialize this
+            # read/write so independent connections cannot replace its payload.
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute("""
+                SELECT prepared_json FROM shakemap_scheduled_attempts
+                WHERE attempt_id = ?
+            """, (attempt_id,)).fetchone()
+            if row is None:
+                raise ValueError("prepare requires a bound scheduled attempt")
+
+            if row["prepared_json"] is not None:
+                if json.loads(row["prepared_json"]) != prepared:
+                    raise ValueError("attempt_id already has a different prepared request")
+                return
+
+            self._connection.execute("""
+                UPDATE shakemap_scheduled_attempts SET prepared_json = ?
+                WHERE attempt_id = ?
+            """, (prepared_json, attempt_id))
+
+    def prepared_scheduled_submissions(self, *, attempt_ids=None):
+        """Return exact retained requests in association insertion order.
+
+        Include finalized associations: an unresolved predecessor may still
+        protect its public ID after local restart handling retires its row.
+        The scheduler owns eligibility and must consult submission evidence.
+        An optional selection avoids loading settled historical file bundles on
+        each monitoring pass; omitting it still exposes the retained history.
+        """
+        selected_ids = None if attempt_ids is None else tuple(dict.fromkeys(attempt_ids))
+        if selected_ids == ():
+            return []
+
+        with self._lock:
+            query = """
+                SELECT rowid AS insertion_order, attempt_id, prepared_json
+                FROM shakemap_scheduled_attempts WHERE prepared_json IS NOT NULL
+            """
+            if selected_ids is None:
+                rows = self._connection.execute(query + " ORDER BY rowid").fetchall()
+            else:
+                # Keep each statement below SQLite's traditional parameter limit.
+                # Apply selection in SQL so excluded native bundles never cross
+                # into Python; restore global insertion order across the chunks.
+                rows = []
+                for offset in range(0, len(selected_ids), 900):
+                    chunk = selected_ids[offset:offset + 900]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    rows.extend(self._connection.execute(
+                        query + f" AND attempt_id IN ({placeholders})",
+                        chunk,
+                    ).fetchall())
+                rows.sort(key=lambda row: row["insertion_order"])
+
+        requests = []
+        for row in rows:
+            prepared = json.loads(row["prepared_json"])
+            prepared["attempt_id"] = row["attempt_id"]
+            prepared["files"] = {
+                name: b64decode(content, validate=True)
+                for name, content in prepared["files"].items()
+            }
+            requests.append(prepared)
+
+        return requests
+
     def submit(
         self,
         attempt_id,
@@ -151,7 +333,7 @@ class ShakeMapWorkflow:
         Repeating an identical call returns its durable record without network
         access. Reusing the attempt key for different inputs/selections raises
         ValueError. A deliberate new attempt requires a new caller key; choosing
-        when that is appropriate belongs to the eventual retry policy.
+        when that is appropriate belongs to the caller's retry policy.
         """
         if not isinstance(attempt_id, str) or not attempt_id.strip():
             raise ValueError("attempt_id must be a nonempty caller-owned string")

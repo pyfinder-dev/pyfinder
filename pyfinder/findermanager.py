@@ -43,6 +43,8 @@ from pyfinder.utils.dataformatter import (
     RRSMPeakMotionDataFormatter,
 )
 from pyfinder.utils.station_merger import StationMerger
+from pyfinder.utils.shakemap import ShakeMapExporter
+from pyfinder.utils.timeutils import normalize_iso8601
 from pyfinder.workspace import build_augmented_event_id
 
 
@@ -243,33 +245,54 @@ class FinDerManager:
         else:
             raise ValueError("An event_id or file_path must be provided")
 
+    def prepare_shakemap(self, solution):
+        """Prepare the selected result for an explicit scheduler submission.
+
+        Running FinDer still returns its existing solution type. This separate
+        handoff is called only by the external workflow, after successful local
+        execution; it performs no file writes or network requests.
+        """
+        if not isinstance(self.event_context, EventContext):
+            raise EventContextError(
+                "ShakeMap handoff requires the authoritative earthquake context"
+            )
+
+        # Use the earthquake's physical origin, never FinDer's internally
+        # assigned timestamp. The common parser preserves explicit offsets.
+        # Contexts without a timezone cannot safely be repaired here: provider
+        # timezone metadata must first be retained at its acquisition boundary.
+        origin = normalize_iso8601(self.event_context.get_origin_time())
+        if origin.tzinfo is None or origin.utcoffset() is None:
+            raise EventContextError(
+                "ShakeMap origin time requires an explicit timezone in the "
+                "authoritative event context"
+            )
+
+        # Keep the calculation identity already used for the FinDer workspace.
+        # A later intentional submission may reuse it; attempt tracking belongs
+        # to the scheduler and must not alter this public calculation ID.
+        delay = None
+        if self.entry_kind == self.ALERT_BACKED:
+            delay = self.metadata.get("current_delay")
+
+        calculation_id = build_augmented_event_id(
+            self.event_context.get_event_id(), delay
+        )
+        files = ShakeMapExporter(solution, calculation_id, origin).export_all()
+
+        return calculation_id, files
+
     def process_file(self, file_path) -> FinderSolution:
         """ Read data from a file and process it """
         raise NotImplementedError(
             "FinDerManager.process_file() method is not implemented yet")
 
     def _send_failure_email(self, event_id, attachment=None):
-        # Alert email remains inactive until terminal notification behavior is
-        # owned by the external workflow boundary.
-        # try:
-        #     from services.alert import send_email_with_attachment
-        #     subject = f"pyFinder Alert - event {event_id}"
-        #     body = f"pyFinder attempted a shakemap calculation for {event_id},\n"
-        #     body += f"but FinDer executable failed to produce a solution for the event.\n"
-        #     body += f"Check the FinDer logs for more details.\n"
-        #
-        #     send_email_with_attachment(
-        #         subject=subject,
-        #         body=body,
-        #         attachments=[attachment],
-        #         event_id=event_id,
-        #         finder_solution=None,
-        #         metadata=self.metadata
-        #     )
-        #     self.logger.info(f"Failure notification sent.")
-        #
-        # except Exception as e:
-        #     self.logger.error(f"Failed to send failure notification: {e}")
+        """Retain the no-op hook until terminal notification delivery is integrated.
+
+        Historical email construction is preserved in
+        legacy/manager-downstream-reference.md, not used as a fallback.
+        """
         return None
 
 
@@ -789,13 +812,9 @@ class FinDerManager:
                 self.logger.error("Check the FinDer ouput in the pyfinder logs for more details.")
                 self.logger.warning("Returning to caller with no solution.")
 
-                # Failure notification remains inactive with downstream email.
-                # self._send_failure_email(
-                #     event_id=event_id,
-                #     attachment=os.path.join(
-                #         executable.get_working_directory(), "pyfinder.log")
-                # )
-                    
+                # The scheduler records this failed execution. Notification
+                # delivery remains a separate integration step.
+
                 # Return None for no solution
                 return None
             self.logger.info("FinDer executable completed successfully")
@@ -807,56 +826,11 @@ class FinDerManager:
                 working_dir=executable.get_working_directory(), 
                 finder_event_id=executable.get_finder_event_id())
             
-            # Local ShakeMap execution and success email remain inactive until
-            # the external service workflow is implemented.
-            # Build a new eventid with the scheduled delay time and export the data for shakemap
-            # from utils.shakemap import ShakeMapExporter
-            # augmented_event_id = self._build_augmented_event_id(
-            #     event_id=event_id, delay_minutes=self.metadata['current_delay'])
-            # self.logger.info(f"Augmented event id for shakemap is {augmented_event_id}")
-            #
-            # Check if we are passing the amplitudes from FinDer output
-            # use_finder_amplitudes = self.configuration.get("shakemap", {}).get("use-amplitude-from-finder-output", False)
-            # self.logger.info(f"To ShakeMap :: Are you passing the amplitudes from FinDer output? {use_finder_amplitudes}")
-            #
-            # smap_exporter = ShakeMapExporter(
-            #     solution=executable.get_finder_solution_object(),
-            #     augmented_id=augmented_event_id,
-            #     logger=self.logger)
-            # shakemapexp = smap_exporter.export_all()
-            # self.logger.info(f"ShakeMap files exported to: {shakemapexp['output_dir']}")
-            #
-            # Trigger ShakeMap using exported files
-            # from utils.shakemap import ShakeMapTrigger
-            # Create the products directory
-            # products_dir = os.path.join(shakemapexp["output_dir"], "products")
-            # os.makedirs(products_dir, exist_ok=True)
-            # Copy the ShakeMap files to the products directory
-            # trigger = ShakeMapTrigger(
-            #     event_id=augmented_event_id,#event_id,
-            #     event_xml=shakemapexp["event.xml"],
-            #     stationlist_path=shakemapexp["stationlist.json"],
-            #     rupture_path=shakemapexp["rupture.json"]
-            # )
-            # trigger.run()
-            #
-            # Archive the products via ShakeMap exporter under the temp_data directory
-            # smap_exporter.archive_products(target_base_dir=self.finder_temp_data_dir)
-            #
-            # from services.alert import send_email_with_attachment
-            # products_dir = os.path.join(shakemapexp["output_dir"], "products")
-            # attachment = f"{products_dir}/intensity.jpg"
-            # subject = f"pyFinder Alert - event {event_id}"
-            # body = f"A new ShakeMap has been produced for event {event_id}.\n"
-            # send_email_with_attachment(
-            #     subject=subject,
-            #     body=body,
-            #     attachments=[attachment],
-            #     event_id=event_id,
-            #     finder_solution=executable.get_finder_solution_object(),
-            #     metadata=self.metadata
-            # )
-     
+            # Continuous scheduling passes this selected solution to the
+            # external ShakeMap workflow through prepare_shakemap(). The old
+            # local execution/archive/email sequence is retained in
+            # legacy/manager-downstream-reference.md for reference.
+
             # Return the FinderSolution object
             return executable.get_finder_solution_object()
             
