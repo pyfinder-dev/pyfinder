@@ -1,452 +1,278 @@
-# -*- coding: utf-8 -*-
-""" Module to manage the shakemap input files from FinDer solution."""
+"""Build native ShakeMap inputs from the caller's selected FinDer solution."""
 
-from filelock import FileLock
-# ShakeMapExporter: exports ShakeMap-compatible event.xml and stationlist.json from a FinderSolution
-import os
-import json
+from copy import copy
 from datetime import datetime, timezone
-from xml.etree.ElementTree import Element, ElementTree
-import subprocess
-from finderutils import FinderSolution
-from utils.regionlocator import RegionLocator
-from pyfinderconfig import pyfinderconfig
-import logging
-import zipfile
-import shutil
-from utils.config_fetcher import ensure_shakemap_config
+import json
+import math
+from numbers import Real
+from xml.etree.ElementTree import Element, SubElement, tostring
+
+from ..finderutils import FinderChannel, FinderEvent, FinderRupture, FinderSolution
 
 
-# --------------------------------------------
-# ShakeMapExporter utility for exporting ShakeMap-compatible files
-# --------------------------------------------
 class ShakeMapExporter:
-    """
-    A utility class to export ShakeMap-compatible input files from a FinderSolution.
-    It generates event.xml and stationlist.json in a temporary or specified directory.
+    """Prepare native input bytes without writing files or running ShakeMap.
+
+    The caller supplies the already-selected raw or processed FinDer solution.
+    This class translates that solution into ShakeMap's file formats; it does
+    not choose observations, select regional models, or manage calculations.
+
+    ``origin_time`` is the physical earthquake time as an aware datetime.
+    FinDer's internally assigned timestamp has a different purpose and is
+    deliberately not used as a fallback.
     """
 
-    def __init__(self, solution: FinderSolution, logger=None,
-                 output_dir: str = None, augmented_id: str = None):
-        # Get the finder-manager logger
-        if logger is None:
-            self.logger = logging.getLogger("FinDerManager")
-        else:
-            self.logger = logger
+    def __init__(
+        self,
+        solution: FinderSolution,
+        event_id: str,
+        origin_time: datetime,
+    ):
+        """Keep the caller's solution and normalize its physical time to UTC."""
+        if not isinstance(solution, FinderSolution):
+            raise TypeError("solution must be a FinderSolution")
 
-        # Validate that the solution is a FinderSolution instance. Do not react to the
-        # FinderSolution being wrong, but rather log it so that we can debug it.
-        if solution is None:
-            self.logger.error("No solution provided to ShakeMapExporter.")
-        elif not isinstance(solution, FinderSolution):
-            self.logger.error(f"Provided solution {type(solution)} is not a {FinderSolution.__module__} instance.")
-            
-        self.logger.info(f"ShakeMapExporter initialized with FinderSolution: {solution.get_description()}")
+        self.event_id = _text(event_id, "event_id")
+
+        # An explicit timezone avoids depending on the machine's local clock
+        # settings when the same event is exported on different hosts.
+        if not isinstance(origin_time, datetime):
+            raise TypeError("origin_time must be a timezone-aware datetime")
+
+        if origin_time.tzinfo is None or origin_time.utcoffset() is None:
+            raise ValueError("origin_time must include its timezone")
+
+        self.origin_time = origin_time.astimezone(timezone.utc)
         self.solution = solution
 
-        # Set the augmented ID: This is the eventID with delay appended
-        # to it. This is used to create a unique event ID for ShakeMap.
-        self.augmented_id = augmented_id
-        if self.augmented_id is not None:
-            self.logger.info(f"Augmented ID set to: {self.augmented_id}")
-        else:
-            self.logger.info("No augmented ID provided.")
+    def export_all(self) -> dict[str, bytes]:
+        """Return the complete native input bundle for the supplied solution.
 
-        # Create a default output directory in the user's home. Use the augmented ID 
-        # if provided, otherwise use the event ID or finder event ID.
-        _id_to_use = self.augmented_id or self.solution.get_event_id() or self.solution.get_finder_event_id()
-        
-        self.output_dir = output_dir or os.path.join(
-            os.path.expanduser("~"), "shakemap_profiles", "default", "data", _id_to_use, "current"
-        )
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.logger.info(f"ShakeMapExporter output directory: {self.output_dir}")
-
-    def archive_products(self, target_base_dir=None, extensions=("json", "jpg", "jpeg")):
-        """ 
-        Archive ShakeMap products into a zip file under the given target_base_dir. 
-        The files are filtered by the provided extensions to avoid large file sizes.
-        In the current implementation, the default extensions are json, jpg, and jpeg;
-        no wildcards are accepted.
+        The result always contains event.xml and event_dat.xml. A supplied
+        rupture adds rupture.json. Nothing is written until the caller decides
+        what to do with these bytes, so a serialization error leaves no partial
+        files behind. Native ShakeMap remains responsible for accepting the
+        scientific geometry.
         """
-        # Check if target_base_dir is provided
-        if target_base_dir is None:
-            raise ValueError("target_base_dir for the zip archive must be provided")  # <<==
-
-        # Ensure products folder exists. This is where we copy the files to.
-        my_products_dir = os.path.join(target_base_dir, "shakemap_products")
-        os.makedirs(my_products_dir, exist_ok=True)
-
-        # Where the original files are
-        shmap_products_dir = os.path.join(self.output_dir, "products")
-
-        # Check if the original products directory exists
-        if not os.path.exists(shmap_products_dir):  # <<==
-            self.logger.warning(f"ShakeMap products directory does not exist: {shmap_products_dir}") 
-            return None 
-
-        # Create a zip file with the products
-        datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_filename = f"shakemap_output_{datetime_str}.zip"  # <<==
-        zip_path = os.path.join(my_products_dir, zip_filename)
-
-        # Zip everything in the products directory that matches the extensions
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, _, files in os.walk(shmap_products_dir):
-                for file in files:
-                    if file.lower().endswith(extensions):
-                        file_path = os.path.join(root, file)
-                        # Create a relative path to the file
-                        relative_path = os.path.relpath(file_path, shmap_products_dir)
-
-                        zipf.write(file_path, relative_path)
-                        self.logger.info(f"Added {file_path} to zip as {relative_path}")
-        self.logger.info(f"Created zip file: {zip_path}")
-
-        # Return the path to the zip file
-        return zip_path
-
-
-    def export_all(self):
-        """Exports both event.xml and stationlist.json as well as rupture.json """
-        event_path = self._write_event_xml()
-        # station_path = self._write_stationlist_json()
-        rupture_path = self._write_rupture_json()
-        event_dat_xml_path = self._write_event_dat_xml()
-
-        # Ensure products dir exists
-        products_dir = os.path.join(self.output_dir, "products")
-        os.makedirs(products_dir, exist_ok=True)
-
-        self.logger.info(f"ShakeMap files written to {self.output_dir}")
-
-        return {
-            "event.xml": event_path,
-            "stationlist.json": event_dat_xml_path, #station_path,
-            "rupture.json": rupture_path,
-            "output_dir": self.output_dir
+        files = {
+            "event.xml": self._event_xml(),
+            "event_dat.xml": self._event_dat_xml(),
         }
 
+        if self.solution.get_rupture() is not None:
+            files["rupture.json"] = self._rupture_json()
 
-    def _write_rupture_json(self):
-        rupture = self.solution.get_rupture()
-        if rupture is None:
-            return None
+        return files
 
-        # Create closed loop of points for MultiPolygon
-        coords = [[lon, lat, depth] for lat, lon, depth in rupture.get_points()]
-        if coords and coords[0] != coords[-1]:
-            coords.append(coords[0])  # Ensure loop is closed
-
-        rupture_data = {
-            "type": "FeatureCollection",
-            "metadata": {
-                "reference": "Generated by FinDer during pyfinder runtime"
-            },
-            "features": [{
-                "type": "Feature",
-                "properties": {
-                    "rupture type": "rupture extent"
-                },
-                "geometry": {
-                    "type": "MultiPolygon",
-                    "coordinates": [[coords]]
-                }
-            }]
-        }
-
-        path = os.path.join(self.output_dir, "rupture.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(rupture_data, f, indent=2)
-        return path
-    
-    def _write_event_dat_xml(self):
-        """Writes event_dat.xml using the standard ShakeMap XML format for station data."""
-        from xml.dom.minidom import Document
-        import os
-        from datetime import datetime
-
-        if self.solution.get_channels() is None:
-            self.logger.error("No channels found in the solution.")
-            return None
-
-        doc = Document()
-        root = doc.createElement("stationlist")
-        root.setAttribute("created", datetime.now().isoformat())
-        root.setAttribute("xmlns", "ch.ethz.sed.shakemap.usgs.xml")
-        doc.appendChild(root)
-
-        for ch in self.solution.get_channels():
-            pga = ch.get_pga()
-            pga_g = pga / 9.806 if pga is not None else None
-            if pga_g is None:
-                continue
-
-            station = doc.createElement("station")
-            station.setAttribute("code", ch.get_station_code())
-            station.setAttribute("name", ch.get_station_code())
-            station.setAttribute("insttype", ch.get_channel_code())
-            station.setAttribute("lat", str(ch.get_latitude()))
-            station.setAttribute("lon", str(ch.get_longitude()))
-            station.setAttribute("source", ch.get_network_code())
-            station.setAttribute("commtype", "DIG")
-            station.setAttribute("netid", ch.get_network_code())
-            station.setAttribute("loc", ch.get_location_code())
-
-            comp = doc.createElement("comp")
-            comp.setAttribute("name", f"{ch.get_channel_code()}N")
-
-            acc = doc.createElement("acc")
-            acc.setAttribute("value", f"{pga_g:.5f}")
-            acc.setAttribute("flag", "0")
-
-            comp.appendChild(acc)
-            station.appendChild(comp)
-            root.appendChild(station)
-
-        path = os.path.join(self.output_dir, "event_dat.xml")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(doc.toprettyxml(indent="  "))
-
-        self.logger.info(f"event_dat.xml written to {path}")
-        return path
-    
-    
-    def _write_event_xml(self):
+    def _event_xml(self) -> bytes:
+        """Combine FinDer's spatial result with the supplied physical origin."""
         event = self.solution.get_event()
-        root = Element("earthquake")
-        root.set("event_id", self.solution.get_event_id() or self.solution.get_finder_event_id())
-        root.set("id", self.solution.get_finder_event_id() or self.solution.get_event_id())
-        root.set("netid", "FinDer")
-        root.set("mag", str(event.get_magnitude()))
-        root.set("lat", str(event.get_latitude()))
-        root.set("lon", str(event.get_longitude()))
-        root.set("depth", str(event.get_depth()))
-        root.set("time", datetime.fromtimestamp(event.get_origin_time_epoch(), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-        root.set("locstring", "FinDer Origin")
-        root.set("event_type", "ACTUAL")
 
-        tree = ElementTree(root)
-        path = os.path.join(self.output_dir, "event.xml")
-        tree.write(path, encoding="utf-8", xml_declaration=True)
-        return path
+        if not isinstance(event, FinderEvent):
+            raise ValueError("event.xml requires a FinderEvent")
 
-    def _write_stationlist_json(self):
-        features = []
+        # FinderEvent's getters can normalize stored strings in place. Read a
+        # copy so exporting cannot alter the caller's original FinDer result.
+        event = copy(event)
 
-        if self.solution.get_channels() is None:
-            self.logger.error("No channels found in the solution.")
+        # Both XML identity fields describe this caller-owned calculation.
+        # Magnitude, location, and depth come from the selected FinDer result;
+        # only time comes from the separately supplied earthquake origin.
+        root = Element(
+            "earthquake",
+            {
+                "id": self.event_id,
+                "event_id": self.event_id,
+                "netid": "FinDer",
+                "network": "FinDer",
+                "mag": str(_number(event.get_magnitude(), "event magnitude")),
+                "lat": str(_number(event.get_latitude(), "event latitude")),
+                "lon": str(_number(event.get_longitude(), "event longitude")),
+                "depth": str(_number(event.get_depth(), "event depth")),
+                "time": self.origin_time.isoformat().replace("+00:00", "Z"),
+                "locstring": "FinDer Origin",
+                "event_type": "ACTUAL",
+            },
+        )
 
-        for ch in self.solution.get_channels():
-            pga = ch.get_pga()
-            pga_g = pga / 9.81 if pga is not None else None
-            # Build properties dict, extending with pgm and units field
-            properties = {
-                "network": ch.get_network_code(),
-                "netid": ch.get_network_code(),
-                "intensity_flag": "",
-                "mmi_from_pgm": [],
-                "commType": "UNK",
-                "intensity": None,
-                "pgv": None,
-                "source": ch.get_network_code(),
-                "instrumentType": "OBSERVED",
-                "station_type": "seismic",
-                "code": f"{ch.get_network_code()}.{ch.get_station_code()}",
-                "name": ch.get_station_code(),
-                "pga": pga_g,
-                "pgm": {
-                    "pga": {
-                        "value": pga_g,
-                        "units": "g",
-                        "flag": 0
-                    }
-                } if pga_g is not None else {},
-                "units": {
-                    "pga": "g"
-                } if pga_g is not None else {},
-                "intensity_stddev": None,
-                # "distance": ch.get_distance_km() or 0.0,
-                # "distances": {
-                #     "ry0": ch.get_distance_km() or 0.0,
-                #     "rrup": ch.get_distance_km() or 0.0,
-                #     "rjb": ch.get_distance_km() or 0.0,
-                #     "rx": 0.0,
-                #     "rhypo": ch.get_distance_km() or 0.0
-                # },
-                "location": ch.get_location_code(),
-                "channels": [
-                    {
-                        "name": f"{ch.get_location_code()}.{ch.get_channel_code()}",
-                        "amplitudes": [
-                            {
-                                "name": "pga",
-                                "value": pga_g,
-                                "units": "g",
-                                "flag": "0",
-                                "ln_sigma": 0
-                            }
-                        ] if pga_g is not None else []
-                    }
-                ],
-                "predictions": []
-            }
-            feature = {
-                "type": "Feature",
-                "id": f"{ch.get_network_code()}.{ch.get_station_code()}",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [ch.get_longitude(), ch.get_latitude()]
+        return tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _event_dat_xml(self) -> bytes:
+        """Serialize selected channel amplitudes in their existing order."""
+        channels = self.solution.get_channels()
+
+        if not channels:
+            raise ValueError("event_dat.xml requires selected channels")
+
+        root = Element(
+            "stationlist",
+            {"xmlns": "ch.ethz.sed.shakemap.usgs.xml"},
+        )
+        native_identities = {}
+
+        for index, channel in enumerate(channels):
+            label = f"channel {index}"
+
+            if not isinstance(channel, FinderChannel):
+                raise ValueError(f"{label} must be a FinderChannel")
+
+            # Retain the supplied identities. In particular, location is not
+            # replaced with a default and artificial channels are not removed.
+            network = _text(channel.get_network_code(), f"{label} network")
+            station = _text(channel.get_station_code(), f"{label} station")
+            component = _text(channel.get_channel_code(), f"{label} component")
+            location = _text(
+                channel.get_location_code(),
+                f"{label} location",
+                empty=True,
+            )
+
+            # ShakeMap ignores location in its station/component key. Keep
+            # track of that key so the current mapping cannot quietly overwrite
+            # an amplitude when two source identities collapse to one component.
+            native_key = (network, station, component)
+            identity = f"{network}.{station}.{location}.{component}"
+
+            if native_key in native_identities:
+                raise ValueError(
+                    "event_dat.xml cannot preserve native station/component "
+                    "collision: "
+                    f"{native_identities[native_key]} and {identity}"
+                )
+
+            native_identities[native_key] = identity
+
+            pga = _number(channel.get_pga(), f"{label} PGA")
+
+            if pga <= 0:
+                raise ValueError(f"{label} PGA must be positive linear cm/s²")
+
+            # Each input channel contributes its own XML element. ShakeMap's
+            # reader later groups components by native station identity.
+            node = SubElement(
+                root,
+                "station",
+                {
+                    "code": station,
+                    "insttype": component,
+                    "lat": str(
+                        _number(channel.get_latitude(), f"{label} latitude")
+                    ),
+                    "lon": str(
+                        _number(channel.get_longitude(), f"{label} longitude")
+                    ),
+                    "source": network,
+                    "commtype": "DIG",
+                    "netid": network,
+                    "loc": location,
                 },
-                "properties": properties
-            }
-            features.append(feature)
+            )
 
-        collection = {
+            # Omit the optional station name: native ShakeMap can infer a
+            # horizontal orientation when it happens to equal a component name.
+            # Preserve the actual component, including Z or an unknown numeric
+            # code. Adding an N suffix would change its scientific meaning.
+            component_node = SubElement(node, "comp", {"name": component})
+
+            # One percent of standard gravity is 9.80665 cm/s². Explicit units
+            # avoid relying on the reader's default. Keep numerical precision
+            # so small positive amplitudes are not rounded to zero in the XML.
+            SubElement(
+                component_node,
+                "acc",
+                {
+                    "value": str(pga / 9.80665),
+                    "units": "%g",
+                    "flag": "0",
+                },
+            )
+
+        return tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _rupture_json(self) -> bytes:
+        """Express the supplied ordered rupture points as native GeoJSON."""
+        rupture = self.solution.get_rupture()
+
+        if not isinstance(rupture, FinderRupture):
+            raise ValueError("rupture.json requires a FinderRupture")
+
+        # get_points() uses zip. Check the parallel lists before reading them
+        # so an incomplete coordinate list cannot silently discard a point.
+        if not (len(rupture.lats) == len(rupture.lons) == len(rupture.depths)):
+            raise ValueError(
+                "rupture.json has incomplete latitude/longitude/depth points"
+            )
+
+        # FinDer stores latitude first; GeoJSON requires longitude first.
+        # This changes the representation only, not point order or depth.
+        coordinates = [
+            [
+                _number(lon, "rupture longitude"),
+                _number(lat, "rupture latitude"),
+                _number(depth, "rupture depth"),
+            ]
+            for lat, lon, depth in rupture.get_points()
+        ]
+
+        if not coordinates:
+            raise ValueError("rupture.json requires rupture points")
+
+        # Close a copy for the native file format, leaving FinderRupture intact.
+        # No points are reordered and no depth or thickness is manufactured to
+        # make an unsupported geometry pass the native reader.
+        if coordinates[0] != coordinates[-1]:
+            coordinates.append(coordinates[0].copy())
+
+        payload = {
             "type": "FeatureCollection",
-            "features": features,
             "metadata": {
-                "created": datetime.now().isoformat() + "Z",
-                "source": "pyfinder"
-            }
+                "reference": "Generated by FinDer during pyfinder runtime",
+            },
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"rupture type": "rupture extent"},
+                    "geometry": {
+                        "type": "MultiPolygon",
+                        "coordinates": [[coordinates]],
+                    },
+                },
+            ],
         }
 
-        path = os.path.join(self.output_dir, "stationlist.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(collection, f, indent=2)
-        return path
+        return json.dumps(payload, allow_nan=False).encode("utf-8")
 
 
-# --------------------------------------------
-# ShakeMapTrigger utility for running ShakeMap
-# --------------------------------------------
-class ShakeMapTrigger:
-    """ Utility class to trigger ShakeMap from a set of exported files. """
-    def __init__(self, event_id, event_xml, stationlist_path, rupture_path=None, 
-                 shake_cmd='shake', logger=None):
-        self.event_id = event_id
-        self.event_xml = event_xml
-        self.stationlist_path = stationlist_path
-        self.rupture_path = rupture_path
-        self.shake_cmd = shake_cmd
-        self.logger = logger or logging.getLogger("FinDerManager")
+def _number(value, label):
+    """Require a finite number without substituting missing scientific data."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{label} must be a finite number")
 
-    def _backup_default_config(self):
-        """Create backups of the default ShakeMap config files if they don't already exist."""
-        target_dir = os.path.expanduser("~/shakemap_profiles/default/install/config")
-        try:
-            files_to_backup = ["gmpe_sets.conf", "model.conf", "modules.conf", "select.conf"]
-            for conf_file in files_to_backup:
-                orig_path = os.path.join(target_dir, f"{conf_file}.orig")
-                src_path = os.path.join(target_dir, conf_file)
-                if os.path.isfile(src_path) and not os.path.isfile(orig_path):
-                    shutil.copy2(src_path, orig_path)
-                    self.logger.info(f"Created backup {orig_path}")
-        except Exception as e:
-            self.logger.exception("Error while backing up default ShakeMap configs")
+    return float(value)
 
-    def _apply_region_config(self):
-        # Ensure config repo is available
-        ensure_shakemap_config()
-        
-        # Use the region locator to determine the region based on event coordinates
-        region_locator = RegionLocator()
-        region_code = region_locator.get_region(self._get_event_lat(), self._get_event_lon())
-        config_map = pyfinderconfig["shakemap"]["region-specific-shakemap-config"]
 
-        if region_code not in config_map:
-            self.logger.warning(f"No ShakeMap config defined for region {region_code}. Using default.")
-            return None
+def _text(value, label, *, empty=False):
+    """Preserve supplied text while checking that XML 1.0 can represent it."""
+    if not isinstance(value, str) or (not empty and not value.strip()):
+        raise ValueError(
+            f"{label} must be {'a' if empty else 'a nonempty'} string"
+        )
 
-        # Ensure backups of default configs exist before overriding
-        self._backup_default_config()
+    # ElementTree escapes markup characters, but it can still emit characters
+    # forbidden by XML 1.0. Check those ranges without rewriting the identity.
+    if any(
+        not (
+            character in "\t\n\r"
+            or "\u0020" <= character <= "\ud7ff"
+            or "\ue000" <= character <= "\ufffd"
+            or "\U00010000" <= character <= "\U0010ffff"
+        )
+        for character in value
+    ):
+        raise ValueError(f"{label} contains characters unsupported by XML")
 
-        source_dir = config_map[region_code]
-        target_dir = os.path.expanduser("~/shakemap_profiles/default/install/config")
-
-        for conf_file in ["gmpe_sets.conf", "model.conf", "modules.conf", "select.conf"]:
-            src = os.path.join(source_dir, conf_file)
-            dest = os.path.join(target_dir, conf_file)
-            shutil.copy2(src, dest)
-            self.logger.info(f"Applied {conf_file} from {source_dir} for region {region_code}")
-
-        return region_code
-
-    def _restore_default_config(self):
-        """
-        Restore default ShakeMap config files from their .orig backups.
-        This logic closely follows the approach in make_rupturejson_and_allxmlinput_fromdb_call_shake.py.
-        """
-        target_dir = os.path.expanduser("~/shakemap_profiles/default/install/config")
-        try:
-            files_to_restore = ["gmpe_sets.conf", "model.conf", "modules.conf", "select.conf"]
-            for conf_file in files_to_restore:
-                orig_path = os.path.join(target_dir, f"{conf_file}.orig")
-                dest_path = os.path.join(target_dir, conf_file)
-                if os.path.isfile(orig_path):
-                    shutil.copy2(orig_path, dest_path)
-                    self.logger.info(f"Restored original {conf_file} from {orig_path}")
-                else:
-                    # If no .orig file exists, warn and leave the current config as is
-                    self.logger.warning(f"Original config not found for {conf_file}; leaving current file in place.")
-        except Exception as e:
-            self.logger.exception("Unexpected error restoring ShakeMap config; continuing with current files.")
-
-    def _get_event_lat(self):
-        try:
-            tree = ElementTree(file=self.event_xml)
-            root = tree.getroot()
-            return float(root.get("lat", 0))
-        except Exception:
-            return 0.0
-
-    def _get_event_lon(self):
-        try:
-            tree = ElementTree(file=self.event_xml)
-            root = tree.getroot()
-            return float(root.get("lon", 0))
-        except Exception:
-            return 0.0
-
-    def validate_inputs(self):
-        if not os.path.isfile(self.event_xml):
-            raise FileNotFoundError(f"Missing event file: {self.event_xml}")
-        if not os.path.isfile(self.stationlist_path):
-            raise FileNotFoundError(f"Missing stationlist file: {self.stationlist_path}")
-        if self.rupture_path and not os.path.isfile(self.rupture_path):
-            raise FileNotFoundError(f"Missing rupture file: {self.rupture_path}")
-
-    def run(self):
-        self.validate_inputs()
-        lock_file = os.path.expanduser("~/shakemap_profiles/shakemap.lock")
-
-        with FileLock(lock_file, timeout=600):  # wait up to 10 min for lock
-            use_regional_shakemap_config = pyfinderconfig["shakemap"].get(
-                "use-region-specific-shakemap-config", False)
-            
-            if use_regional_shakemap_config:
-                self._apply_region_config()
-            else:
-                self.logger.info("Region-specific ShakeMap config is disabled. Using default config.")
-            cmd = [
-                self.shake_cmd,
-                "--force",  # force overwrite of existing files
-                "-d", self.event_id,  # positional argument for event ID
-                "select", "assemble",
-                "-c", "pyFinder",
-                "model", "contour", "mapping", "stations",  "gridxml"
-            ]
-
-            self.logger.info(f"Running ShakeMap: {' '.join(cmd)}")
-            try:
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                self.logger.info("ShakeMap triggered successfully.")
-                self.logger.debug(result.stdout)
-            except subprocess.CalledProcessError as e:
-                self.logger.error(f"ShakeMap failed: {e.stderr}")
-            finally:
-                if use_regional_shakemap_config:
-                    # Only restore defaults if region-specific config was used
-                    self._restore_default_config()
-                else:
-                    self.logger.info("Region-specific ShakeMap config was not used; skipping restore.")
+    return value
