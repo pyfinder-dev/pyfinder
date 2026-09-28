@@ -758,6 +758,18 @@ class FinDerExecutable(object):
         with self._workspace_phase(augmented_event_id):
             self._materialize_inputs(amplitudes, event_data)
 
+            # Retain exact invocation inputs before this reusable workspace can
+            # be rewritten. The injected callback only copies local evidence;
+            # notification rendering and SMTP belong to the terminal workflow.
+            evidence_callback = getattr(self, "evidence_callback", None)
+            if evidence_callback is not None:
+                evidence_callback({
+                    "data_0": os.path.join(self.working_directory, "data_0"),
+                    "pyfinder_amplitudes_to_Finder.txt": os.path.join(
+                        self.working_directory, "pyfinder_amplitudes_to_Finder.txt",
+                    ),
+                })
+
             try:
                 # Execute the FinDer executable
                 self._run_finder()

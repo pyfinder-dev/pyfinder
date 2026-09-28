@@ -72,6 +72,9 @@ if [[ "${1:-}" == "container" && "${2:-}" == "inspect" ]]; then
                 "${FAKE_COMMAND:-[\"continuous\"]}" \
                 "$running"
             ;;
+        *'.Config.Env'*)
+            printf '%s' "${FAKE_SHAKEMAP_ENVIRONMENT:-}"
+            ;;
         *'.Mounts'*)
             printf '%s\n' "${FAKE_MOUNTS:-bind|/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy/runtime|/home/sysop/runtime|true}"
             ;;
@@ -137,7 +140,10 @@ class HostLauncherTests(unittest.TestCase):
         self.write_executable("docker", FAKE_DOCKER)
         self.write_executable("mkdir", FAKE_MKDIR)
 
-        self.environment = os.environ.copy()
+        self.environment = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("PYFINDER_SHAKEMAP_") and key != "PYFINDER_ALERT_CONFIG"
+        }
         self.environment.update(
             {
                 "PATH": os.pathsep.join(
@@ -148,6 +154,47 @@ class HostLauncherTests(unittest.TestCase):
                 "FAKE_IMAGE_PRESENT": "1",
             }
         )
+
+    def test_new_container_forwards_only_explicit_whitelisted_names(self):
+        result = self.run_launcher(
+            "continuous",
+            PYFINDER_SHAKEMAP_ENABLED="true",
+            PYFINDER_SHAKEMAP_URL="http://service:8080",
+            PYFINDER_SHAKEMAP_CONFIGURATION="regional",
+            PYFINDER_SHAKEMAP_SECRET="do-not-forward",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = next(row for row in self.records() if row[:2] == ["docker", "run"])
+        forwarded = [run[index + 1] for index, value in enumerate(run) if value == "--env"]
+        self.assertEqual(forwarded, [
+            "PYFINDER_SHAKEMAP_ENABLED", "PYFINDER_SHAKEMAP_URL",
+            "PYFINDER_SHAKEMAP_CONFIGURATION",
+        ])
+        self.assertNotIn("http://service:8080", run)
+        self.assertNotIn("do-not-forward", run)
+
+    def test_existing_container_refuses_changed_setting_without_printing_values(self):
+        for state in ("running", "stopped"):
+            with self.subTest(state=state):
+                result = self.run_launcher(
+                    "continuous", FAKE_CONTAINER_STATE=state,
+                    PYFINDER_SHAKEMAP_URL="http://private-host:8080",
+                    FAKE_SHAKEMAP_ENVIRONMENT="PYFINDER_SHAKEMAP_URL=http://other-host:8080",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("PYFINDER_SHAKEMAP_URL", result.stderr)
+                self.assertNotIn("private-host", result.stdout + result.stderr)
+                self.assertNotIn("other-host", result.stdout + result.stderr)
+                self.assertEqual(self.lifecycle_records(self.records()), [])
+
+    def test_existing_container_preserves_matching_explicit_environment(self):
+        result = self.run_launcher(
+            "continuous", FAKE_CONTAINER_STATE="running",
+            PYFINDER_SHAKEMAP_ENABLED="true",
+            FAKE_SHAKEMAP_ENVIRONMENT="PYFINDER_SHAKEMAP_ENABLED=true",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lifecycle_records(self.records()), [])
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -633,11 +680,12 @@ class HostLauncherTests(unittest.TestCase):
     def test_launcher_source_has_only_the_fixed_host_boundary(self):
         source = LAUNCHER.read_text(encoding="utf-8")
         lowered = source.lower()
+        # ShakeMap environment forwarding is allowed; the host still executes
+        # no application code and performs no scientific processing.
         for forbidden in (
             "python",
             "paramws",
             "finder_run",
-            "shakemap",
             "smtp",
             "$random",
             "uuid",

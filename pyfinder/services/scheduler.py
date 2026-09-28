@@ -7,6 +7,7 @@ handles the results.
 """
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import logging
 import threading
 
@@ -18,6 +19,13 @@ from pyfinder.finderconfigs import (
 from pyfinder.finderutils import FinderSolution
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.services.querypolicy import build_service_policies
+from pyfinder.services.shakemap_diagnostics import (
+    diagnostic as shakemap_diagnostic,
+    format_diagnostic,
+    regional_configuration_failure,
+    local_failure_diagnostic,
+    safe_text,
+)
 
 
 class SchedulerLifecycleError(RuntimeError):
@@ -42,6 +50,7 @@ class FollowUpScheduler:
         configuration=None,
         shakemap_workflow=None,
         shakemap_inputs=None,
+        shakemap_notifier=None,
     ):
         # Supported process composition supplies the scheduler-owned logger.
         # Direct construction retains a non-file logger for library use.
@@ -91,6 +100,8 @@ class FollowUpScheduler:
             raise ValueError("ShakeMap workflow and caller-owned inputs are required together")
         self.shakemap_workflow = shakemap_workflow
         self.shakemap_inputs = shakemap_inputs
+        self.shakemap_notifier = shakemap_notifier
+        self._shakemap_log_states = {}
         self._shakemap_phase_lock = threading.RLock()
         self._monitor_executor = None
         self._monitor_future = None
@@ -138,7 +149,7 @@ class FollowUpScheduler:
             # Thread pool with up to 10 workers
             executor = ThreadPoolExecutor(max_workers=10)
             self.executor = executor
-            if self.shakemap_workflow is not None:
+            if self.shakemap_workflow is not None or self.shakemap_notifier is not None:
                 # Native jobs wait in ShakeMap, not in the FinDer worker pool.
                 # One observer serializes local outcome application and performs
                 # finite HTTP reads; no worker loops until a native job finishes.
@@ -184,9 +195,6 @@ class FollowUpScheduler:
         
         logger.info("=========================================================")
         logger.info(" A new scheduler for event updates is being initialized. ")
-        logger.info("... Testing logger functionality ...")
-        logger.error("This is an error message for testing purposes.")
-        logger.info("This is an info message for testing purposes.")
         getattr(logger, "ok", logger.info)(
             "This is an ok message for testing purposes."
         )
@@ -223,6 +231,15 @@ class FollowUpScheduler:
     ):
         """Fail one assigned item and verify that it was still processing."""
         identity = (event_id, service, current_delay_time)
+        notifier = getattr(self, "shakemap_notifier", None)
+        if notifier is not None:
+            execution_id = self.tracker.get_execution_id(event_id, service, current_delay_time)
+            if execution_id is not None:
+                # Durable notification intent precedes the terminal transition.
+                # This does not send mail or change the scientific outcome.
+                notifier.enqueue(execution_id, local_failure_diagnostic(
+                    execution_id, event_id, service, diagnostic,
+                ))
         affected_rows = self.tracker.mark_failed(
             event_id=event_id,
             service=service,
@@ -367,6 +384,15 @@ class FollowUpScheduler:
                 "event_context": event_context,
                 "context_diagnostic": context_diagnostic,
             }
+            notifier = getattr(self, "shakemap_notifier", None)
+            if notifier is not None:
+                execution_id = self.tracker.get_execution_id(
+                    event_id=event_id, service=service,
+                    current_delay_time=current_delay_time,
+                )
+                manager_arguments["evidence_callback"] = partial(
+                    notifier.capture_finder, execution_id,
+                )
             if isinstance(event_context, EventContext):
                 decision = self.finder_config_selector.resolve(
                     latitude=event_context.get_latitude(),
@@ -429,6 +455,12 @@ class FollowUpScheduler:
             return finder_solution
 
         identity = (event_id, service, current_delay_time)
+        notifier = getattr(self, "shakemap_notifier", None)
+        if notifier is not None:
+            execution_id = self.tracker.get_execution_id(*identity)
+            value = local_failure_diagnostic(execution_id, event_id, service, "FinDer execution completed")
+            value.update(final_outcome="SUCCESS", action="Review retained FinDer input evidence")
+            notifier.enqueue(execution_id, value)
         affected_rows = self.tracker.mark_completed(
             event_id=event_id,
             service=service,
@@ -543,10 +575,13 @@ class FollowUpScheduler:
         """
         workflow = self.shakemap_workflow
         links = {
-            link["attempt_id"]: link for link in workflow.pending_scheduled_attempts()
+            workflow.submission_attempt_id(link["attempt_id"]): link
+            for link in workflow.pending_scheduled_attempts()
         }
         unresolved = workflow.unresolved()
-        active_ids = set(links) | {record["attempt_id"] for record in unresolved}
+        active_ids = {link["attempt_id"] for link in links.values()} | {
+            record["attempt_id"] for record in unresolved
+        }
         prepared = workflow.prepared_scheduled_submissions(attempt_ids=active_ids)
         prepared_ids = {item["attempt_id"] for item in prepared}
         # Also respect older standalone attempts in this same workflow database.
@@ -566,11 +601,13 @@ class FollowUpScheduler:
                     # persistence failure just as the worker callback does:
                     # finalize remaining local ownership, without incrementing
                     # retry_count again or replaying the rejected request.
+                    link = links[attempt_id]
+                    self._capture_shakemap(link, record, final=True, final_outcome="FAILED")
                     self.tracker.finish_shakemap_execution(
-                        execution_id=attempt_id, success=False,
-                        diagnostic="Local retry finalization after ShakeMap rejection was interrupted",
+                        execution_id=link["attempt_id"], success=False,
+                        diagnostic=record["last_error"] or "ShakeMap rejection finalization was interrupted",
                     )
-                    workflow.finish_scheduled_attempt(attempt_id)
+                    workflow.finish_scheduled_attempt(link["attempt_id"])
 
                 observation = record["observation"]
                 terminal = (
@@ -581,7 +618,9 @@ class FollowUpScheduler:
                         and record["last_error"] is None
                     )
                 )
-                if not terminal:
+                if not terminal or attempt_id in links or workflow.evidence_pending(attempt_id):
+                    # A saved terminal observation alone is insufficient: its
+                    # immutable evidence and final intent must also be captured.
                     blocked_ids.add(calculation_id)
                 continue
 
@@ -598,11 +637,14 @@ class FollowUpScheduler:
                 or self.tracker.get_execution_id(
                     event_id=link["event_id"], service=link["service"],
                     current_delay_time=link["current_delay_time"],
-                ) != attempt_id
+                ) != link["attempt_id"]
             ):
                 # Forced restart has already failed local processing. Observe
                 # jobs that were sent, but do not start this abandoned request.
-                workflow.finish_scheduled_attempt(attempt_id)
+                retained = workflow.get(link["attempt_id"])
+                if retained is not None:
+                    self._capture_shakemap(link, retained, final=True, final_outcome="INTERRUPTED")
+                workflow.finish_scheduled_attempt(link["attempt_id"])
                 continue
 
             if calculation_id in blocked_ids:
@@ -612,7 +654,7 @@ class FollowUpScheduler:
                 if request["base_url"] != workflow.client.base_url:
                     raise ValueError("Prepared ShakeMap request belongs to a different endpoint")
                 with self.shakemap_inputs.submission(calculation_id, request["files"]):
-                    workflow.submit(
+                    submitted = workflow.submit(
                         attempt_id,
                         calculation_id,
                         request["files"],
@@ -622,49 +664,134 @@ class FollowUpScheduler:
             except Exception as error:
                 record = workflow.get(attempt_id)
                 if record is None or record["submission_state"] == "REJECTED":
-                    self._retry_rejected_shakemap(link, error)
+                    if attempt_id != link["attempt_id"]:
+                        # A rejected global recovery ends this chain. It does not
+                        # grant a new FinDer run or another regional/global POST.
+                        retained = record or workflow.get(link["attempt_id"])
+                        self._capture_shakemap(
+                            link, retained, final=True, final_outcome="FAILED",
+                            local_error=safe_text(str(error)),
+                        )
+                        self.tracker.finish_shakemap_execution(
+                            execution_id=link["attempt_id"], success=False,
+                            diagnostic=(record or {}).get("last_error") or safe_text(str(error)),
+                        )
+                        workflow.finish_scheduled_attempt(link["attempt_id"])
+                    else:
+                        self._retry_rejected_shakemap(link, error)
                 else:
                     blocked_ids.add(calculation_id)
-                    self.logger.error(
-                        "ShakeMap attempt %s requires observation/reconciliation: %s",
-                        attempt_id, type(error).__name__,
-                    )
+                    self._log_shakemap(record)
             else:
+                self._log_shakemap(submitted)
                 blocked_ids.add(calculation_id)
 
+    def _log_shakemap(self, record):
+        """Log changed facts, not every identical polling pass or full response."""
+        value = shakemap_diagnostic(record)
+        text = format_diagnostic(value)
+        attempt_id = record["attempt_id"]
+        if self._shakemap_log_states.get(attempt_id) != text:
+            self.logger.info(text)
+            self._shakemap_log_states[attempt_id] = text
+
+    def _capture_shakemap(self, link, record, *, final, final_outcome=None, local_error=None):
+        """Freeze evidence and notification intent before any same-ID replacement."""
+        value = shakemap_diagnostic(record)
+        workflow = self.shakemap_workflow
+        chain = workflow.attempt_chain(link["attempt_id"])
+        value["attempts"] = [shakemap_diagnostic(item) for item in chain]
+        value["final_outcome"] = final_outcome or value["status"] or (
+            "FAILED" if value["submission_state"] == "REJECTED" else "UNKNOWN"
+        )
+        active = workflow.submission_attempt_id(link["attempt_id"])
+        value["fallback_submission_state"] = (
+            "NOT_REQUESTED" if active == link["attempt_id"] else
+            (workflow.get(active) or {}).get("submission_state", "NOT_SENT")
+        )
+        if final_outcome == "INTERRUPTED" and value["fallback_submission_state"] == "NOT_SENT":
+            value["fallback_submission_state"] = "ABORTED_BEFORE_SUBMISSION"
+        if len(chain) > 1 or active != link["attempt_id"]:
+            value["fallback_reason"] = shakemap_diagnostic(chain[0])["reason"]
+            value["initial_configuration"] = chain[0]["request"]["configuration"]
+        if local_error:
+            value["local_error"] = local_error
+        notifier = getattr(self, "shakemap_notifier", None)
+        if notifier is None:
+            return None
+        return notifier.capture(
+            record, value, execution_id=link["attempt_id"], final=final,
+        )
+
     def _apply_shakemap_result(self, link, record):
-        """Finalize only the execution that owns this recorded native outcome."""
+        """Keep regional recovery inside its owning scheduled execution."""
         observation = record["observation"]
         if observation is None:
             return
-
         details = observation["details"]
         if details["status"] not in {"SUCCESS", "FAILED"}:
             return
-
-        # A native failure is reported without another scientific calculation.
-        # Archived SUCCESS can lack products; that is not usable chain success.
-        success = details["status"] == "SUCCESS" and details["products_ready"]
-        diagnostic = None if success else (
-            "ShakeMap reported FAILED" if details["status"] == "FAILED"
-            else "ShakeMap completed but its products are unavailable"
+        self._log_shakemap(record)
+        workflow = self.shakemap_workflow
+        eligible = regional_configuration_failure(record)
+        metadata = self.tracker.get_event_meta(
+            event_id=link["event_id"], service=link["service"],
+            current_delay_time=link["current_delay_time"],
         )
+        owns_processing = (
+            metadata is not None and metadata[EventTracker.Field.status] == "processing"
+            and self.tracker.get_execution_id(
+                event_id=link["event_id"], service=link["service"],
+                current_delay_time=link["current_delay_time"],
+            ) == link["attempt_id"]
+        )
+        if eligible and self._accepting_work and owns_processing:
+            evidence = self._capture_shakemap(link, record, final=False)
+            if not evidence:
+                raise SchedulerLifecycleError(
+                    "Regional recovery requires immutable evidence capture before replacement"
+                )
+            workflow.prepare_global_fallback(link["attempt_id"], evidence)
+            workflow.clear_local_error(record["attempt_id"])
+            self.logger.warning(
+                "ShakeMap execution %s retained failed regional sequence %s; "
+                "preparing one explicit global submission for calculation %s",
+                link["attempt_id"], record["internal_sequence"], record["request"]["event_id"],
+            )
+            return
+
+        # Native failure and unusable archived products remain distinct. A
+        # shutdown does not start new recovery work or claim global success.
+        success = details["status"] == "SUCCESS" and details["products_ready"]
+        self._capture_shakemap(
+            link, record, final=True,
+            final_outcome=(
+                "INTERRUPTED" if eligible or not owns_processing else
+                "SUCCESS" if success else "FAILED"
+            ),
+        )
+        value = shakemap_diagnostic(record)
+        diagnostic = None if success else format_diagnostic(value)
         changed = self.tracker.finish_shakemap_execution(
             execution_id=link["attempt_id"], success=success, diagnostic=diagnostic,
         )
         if changed not in (0, 1):
             raise SchedulerLifecycleError("ShakeMap finalization changed multiple scheduled rows")
-
-        # Zero means the row was already finalized, removed, or abandoned on
-        # restart. Never reopen it or attach this result to a new registration.
-        self.shakemap_workflow.finish_scheduled_attempt(link["attempt_id"])
+        workflow.finish_scheduled_attempt(link["attempt_id"])
+        workflow.clear_local_error(record["attempt_id"])
+        self._shakemap_log_states.pop(record["attempt_id"], None)
 
     def _poll_shakemap_once(self):
         """Observe external jobs independently of discovery of new due work."""
+        if self.shakemap_workflow is None:
+            # The same finite monitor also delivers caller-only notifications;
+            # a disabled ShakeMap adapter must not strand the durable mail queue.
+            self.shakemap_notifier.drain_pending()
+            return
         with self._shakemap_phase_lock:
             workflow = self.shakemap_workflow
             links = {
-                item["attempt_id"]: item
+                workflow.submission_attempt_id(item["attempt_id"]): item
                 for item in workflow.pending_scheduled_attempts()
             }
             records = {item["attempt_id"]: item for item in workflow.unresolved()}
@@ -687,24 +814,42 @@ class FollowUpScheduler:
                         or record["last_error"] is not None
                     ):
                         record = workflow.poll(attempt_id)
+                    self._log_shakemap(record)
                     if attempt_id in links:
                         self._apply_shakemap_result(links[attempt_id], record)
+                    elif record["observation"]["details"]["status"] in {"SUCCESS", "FAILED"}:
+                        self._capture_shakemap(
+                            {"attempt_id": workflow.execution_for_attempt(attempt_id)},
+                            record, final=True, final_outcome="INTERRUPTED",
+                        )
+                        workflow.clear_local_error(attempt_id)
                 except Exception as error:
                     # A lost read or local write is not a native FAILED result.
                     # Keep evidence/association and let the next pass observe
                     # this same sequence while other jobs continue to progress.
-                    self.logger.error(
-                        "ShakeMap observation for attempt %s failed: %s",
-                        attempt_id, type(error).__name__,
-                    )
+                    retained = workflow.get(attempt_id)
+                    if retained is not None and retained.get("last_error"):
+                        self._log_shakemap(retained)
+                    else:
+                        workflow.retain_local_error(attempt_id, error)
+                        self.logger.error(
+                            "ShakeMap evidence/lifecycle handling for attempt %s failed: %s",
+                            attempt_id, type(error).__name__,
+                        )
 
             # Observation precedes replacement. Once the older result is saved,
             # a retained same-ID request can be sent during this same pass.
             self._dispatch_shakemap_submissions()
 
+        # SMTP is deliberately outside the phase lock and cannot release a
+        # calculation ID or rewrite its scientific outcome.
+        notifier = getattr(self, "shakemap_notifier", None)
+        if notifier is not None:
+            notifier.drain_pending()
+
     def _schedule_shakemap_monitor(self):
         """Keep at most one finite observation pass running in this scheduler."""
-        if getattr(self, "shakemap_workflow", None) is None:
+        if getattr(self, "_monitor_executor", None) is None:
             return
         if self._monitor_future is not None:
             if not self._monitor_future.done():
@@ -717,7 +862,7 @@ class FollowUpScheduler:
 
     def _drain_shakemap_monitor(self):
         """Stop local monitoring without waiting for remote calculations to finish."""
-        if getattr(self, "shakemap_workflow", None) is None:
+        if getattr(self, "_monitor_executor", None) is None:
             return
         self._monitor_executor.shutdown(wait=True)
         if self._monitor_future is not None:
@@ -726,11 +871,15 @@ class FollowUpScheduler:
             except Exception:
                 self.logger.exception("ShakeMap monitor failed during shutdown")
 
+        if self.shakemap_workflow is None:
+            return
+
         # Workers have already drained, so no new submission can appear here.
         # Preserve terminal evidence already recorded; otherwise explicitly fail
         # local ownership while retaining external jobs for observation on restart.
         for link in self.shakemap_workflow.pending_scheduled_attempts():
-            record = self.shakemap_workflow.get(link["attempt_id"])
+            active = self.shakemap_workflow.submission_attempt_id(link["attempt_id"])
+            record = self.shakemap_workflow.get(active)
             if (
                 record is not None
                 and record["observation"] is not None
@@ -739,6 +888,9 @@ class FollowUpScheduler:
             ):
                 self._apply_shakemap_result(link, record)
             else:
+                retained = record or self.shakemap_workflow.get(link["attempt_id"])
+                if retained is not None:
+                    self._capture_shakemap(link, retained, final=True, final_outcome="INTERRUPTED")
                 self.tracker.finish_shakemap_execution(
                     execution_id=link["attempt_id"], success=False,
                     diagnostic="Local scheduler stopped; external ShakeMap outcome remains separate",
@@ -844,6 +996,11 @@ class FollowUpScheduler:
         self.executor.shutdown(wait=True)
         self._drain_future_observations()
         self._drain_shakemap_monitor()
+        notifier = getattr(self, "shakemap_notifier", None)
+        if notifier is not None:
+            # Shutdown may just have queued an interruption. Finish one bounded
+            # delivery pass after scientific/evidence ownership has been settled.
+            notifier.drain_pending()
         self._drain_complete = True
 
     def stop_and_drain(self):
@@ -861,7 +1018,12 @@ class FollowUpScheduler:
                 if getattr(self, "shakemap_workflow", None) is not None:
                     self.shakemap_workflow.close()
             finally:
-                self.tracker.close()
+                try:
+                    notifier = getattr(self, "shakemap_notifier", None)
+                    if notifier is not None:
+                        notifier.close()
+                finally:
+                    self.tracker.close()
             self._shutdown_complete = True
             self.logger.info("FollowUpScheduler shutdown complete.")
 

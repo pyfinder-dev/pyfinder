@@ -15,6 +15,7 @@ from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.services import seismiclistener
 from pyfinder.services.querypolicy import build_service_policies
 from pyfinder.services.scheduler import FollowUpScheduler
+from pyfinder.services.shakemap_settings import continuous_shakemap_configuration
 from pyfinder.utils.customlogger import file_logger
 
 
@@ -129,6 +130,18 @@ def start_services(*, runtime_context):
     global _launcher_logger, _listener, _listener_thread, _scheduler
     global _shutdown_event
 
+    # Resolve explicit deployment settings before constructing the listener or
+    # opening its database. The packaged configuration stays unchanged.
+    application_configuration = continuous_shakemap_configuration(
+        runtime_context.isolated_configuration(pyfinderconfig)
+    )
+
+    # Keep the existing private alert config outside the scientific settings:
+    # FinDer's debug logger records those settings. Validation precedes listener
+    # and database resources; absent configuration leaves delivery disabled.
+    from pyfinder.services.alert import configured_alert_settings
+    alert_settings = configured_alert_settings()
+
     logger = file_logger(
         runtime_context.process_log_path,
         module_name="ServiceLauncher",
@@ -149,9 +162,6 @@ def start_services(*, runtime_context):
         overwrite=False,
     )
     _launcher_logger = logger
-    application_configuration = runtime_context.isolated_configuration(
-        pyfinderconfig
-    )
 
     try:
         service_policies = build_service_policies()
@@ -179,6 +189,7 @@ def start_services(*, runtime_context):
     listener_started = False
     previous_signal_handlers = {}
     listener_failures = []
+    notifier = None
     primary_error = None
     primary_traceback = None
 
@@ -197,6 +208,22 @@ def start_services(*, runtime_context):
             "shakemap_inputs": inputs,
         }
         try:
+            if workflow is not None or alert_settings is not None:
+                from pyfinder.services.alert_delivery import AlertService
+                from pyfinder.services.alert_evidence import EvidenceStore
+
+                # Canonical inputs live at shakemap/data/inputs. Evidence lives
+                # in caller-owned state and survives native same-ID overwrite.
+                service_root = (inputs.root.parent.parent if inputs is not None
+                                else runtime_context.service_root.parent / "shakemap")
+                notifier = AlertService(
+                    runtime_context.operational_database_path,
+                    EvidenceStore(runtime_context.state_directory / "alert-evidence", service_root),
+                    alert_settings,
+                    logger=scheduler_logger,
+                )
+                boundary["shakemap_notifier"] = notifier
+
             scheduler = FollowUpScheduler(
                 service_policies=service_policies,
                 finder_config_selector=finder_config_selector,
@@ -209,6 +236,8 @@ def start_services(*, runtime_context):
             # Ownership transfers to the scheduler only after construction.
             if workflow is not None:
                 workflow.close()
+            if notifier is not None:
+                notifier.close()
             raise
 
         _listener = listener

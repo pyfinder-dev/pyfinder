@@ -50,6 +50,15 @@ def build_parser():
     subparsers.add_parser(
         "continuous",
         help="Run continuous EMSC monitoring and scheduled processing.",
+        description=(
+            "Run continuous monitoring. ShakeMap remains disabled by default. "
+            "Set PYFINDER_SHAKEMAP_ENABLED=true, PYFINDER_SHAKEMAP_URL and "
+            "PYFINDER_SHAKEMAP_INPUT_DIRECTORY to enable it. Optional settings: "
+            "PYFINDER_SHAKEMAP_CONFIGURATION (global), "
+            "PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS (30), "
+            "PYFINDER_SHAKEMAP_OVERWRITE (true). Booleans use true or false. "
+            "The input directory must share underlying storage with the service."
+        ),
     )
 
     playback_parser = subparsers.add_parser(

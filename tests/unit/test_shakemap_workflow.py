@@ -324,7 +324,7 @@ class ShakeMapWorkflowTests(unittest.TestCase):
         self.assertEqual(failed_read["observation"], previous["observation"])
         self.assertEqual(failed_read["observed_at"], previous["observed_at"])
         self.assertEqual(failed_read["submission_state"], "ACCEPTED")
-        self.assertEqual(failed_read["last_error"], "ShakeMapTransportError")
+        self.assertIn("ShakeMapTransportError", failed_read["last_error"])
 
         recovered = workflow.poll("attempt-1")
         self.assertEqual(recovered["observation"]["details"]["status"], "SUCCESS")
@@ -342,7 +342,7 @@ class ShakeMapWorkflowTests(unittest.TestCase):
         record = workflow.get("attempt-1")
         self.assertEqual(record["internal_sequence"], 42)
         self.assertIsNone(record["observation"])
-        self.assertEqual(record["last_error"], "ShakeMapJobUnavailable")
+        self.assertIn("ShakeMapJobUnavailable", record["last_error"])
         self.assertEqual(len(workflow.unresolved()), 1)
 
     def test_existing_scheduler_data_and_cleanup_leave_external_record_intact(self):

@@ -42,6 +42,10 @@ class ImmediateThread:
 
 class RuntimeCompositionTests(unittest.TestCase):
     def setUp(self):
+        # Confined tests never discover a real ignored SMTP credential file.
+        mail_environment = mock.patch.dict("os.environ", {"PYFINDER_ALERT_CONFIG": ""})
+        mail_environment.start()
+        self.addCleanup(mail_environment.stop)
         self.temporary_directory = tempfile.TemporaryDirectory(
             prefix="pyfinder-runtime-composition-"
         )
@@ -156,6 +160,48 @@ class RuntimeCompositionTests(unittest.TestCase):
             shutdown_event=mock.ANY
         )
         scheduler.shutdown.assert_called_once_with()
+
+    def test_explicit_email_settings_build_owned_notifier_without_scientific_secrets(self):
+        from pyfinder.services.alert import AlertSettings
+        from pyfinder.services.alert_delivery import AlertService
+
+        settings = AlertSettings("fake.invalid", 587, "sender@example.invalid", [{
+            "name": "operations", "recipients": ["test@example.invalid"],
+            "outcomes": ["SUCCESS", "FAILED"], "required_attachments": [],
+        }], username="test-only", password="fake-only")
+        constructed = []
+
+        def construct(*args, **kwargs):
+            # The fake scheduler does not run work. Supplying a transport that
+            # raises also ensures this composition test cannot open real SMTP.
+            notifier = AlertService(*args, **kwargs, smtp_factory=mock.Mock(side_effect=AssertionError("no SMTP")))
+            constructed.append(notifier)
+            return notifier
+
+        try:
+            with mock.patch("pyfinder.services.alert.configured_alert_settings", return_value=settings), mock.patch(
+                "pyfinder.services.alert_delivery.AlertService", side_effect=construct
+            ):
+                self.test_continuous_composition_wires_exact_logs_database_and_runs_root()
+            self.assertEqual(len(constructed), 1)
+            self.assertEqual(constructed[0].evidence_store.root,
+                             (self.runtime_context.state_directory / "alert-evidence").resolve())
+            self.assertNotIn("fake-only", repr(pyfinderconfig))
+        finally:
+            for notifier in constructed:
+                notifier.close()
+
+    def test_invalid_shakemap_environment_fails_before_listener_and_database(self):
+        with mock.patch.dict(os.environ, {"PYFINDER_SHAKEMAP_ENABLED": "yes"}), \
+             mock.patch.object(start_monitoring.seismiclistener, "build_emsc_listener") as listener, \
+             mock.patch.object(start_monitoring, "FollowUpScheduler") as scheduler, \
+             mock.patch("sqlite3.connect") as database:
+            with self.assertRaises(runtime.RuntimeBootstrapError):
+                start_monitoring.start_services(runtime_context=self.runtime_context)
+
+        listener.assert_not_called()
+        scheduler.assert_not_called()
+        database.assert_not_called()
 
     def test_direct_manager_opens_no_shared_file_logger(self):
         configuration = deepcopy(pyfinderconfig)

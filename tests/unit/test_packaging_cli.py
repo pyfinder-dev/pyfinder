@@ -607,11 +607,10 @@ class RetiredStartupScriptTests(unittest.TestCase):
         self.assertIn("pyfinder playback --list", readme)
         self.assertIn("pyfinder on-demand --event-id EVENT_ID", readme)
         self.assertIn("forthcoming pyfinder container", compact)
-        self.assertIn(
-            "shakemap and email execution are currently inactive",
-            compact,
-        )
-        self.assertIn("host controller", compact)
+        self.assertIn("separate shakemap rest service", compact)
+        self.assertIn("disabled by default", compact)
+        self.assertIn("full product collection remains unfinished", compact)
+        self.assertIn("no real email delivery or continuous deployment readiness", compact)
         self.assertNotIn("./startMonitoring.sh", readme)
         self.assertNotIn("start_monitoring.py", readme)
         self.assertNotIn("python3.9", readme)
@@ -619,7 +618,8 @@ class RetiredStartupScriptTests(unittest.TestCase):
         self.assertNotIn("standalone (no docker", normalized)
         self.assertNotIn("pyfinder-docker", normalized)
         self.assertNotIn("alerts are optional", normalized)
-        self.assertNotIn(".pyfinder_alert_config", normalized)
+        self.assertIn(".pyfinder_alert_config.json", normalized)
+        self.assertIn("excluded from images and git", compact)
         self.assertNotIn("docker run", normalized)
         self.assertNotIn("$host_out", normalized)
         self.assertNotIn("pyfinder/pyfinder/output", normalized)

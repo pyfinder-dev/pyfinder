@@ -12,6 +12,19 @@ readonly SERVICE_ROOT="${RUNTIME_ROOT}/pyfinder"
 readonly CONTAINER_RUNTIME="/home/sysop/runtime"
 readonly CONTAINER_USER="1000:1000"
 
+# Forward only documented continuous settings, including the private email config path. Docker reads their values
+# from this process environment, so credentials accidentally placed in a rejected
+# URL are not copied into command arguments or launcher diagnostics.
+readonly SHAKEMAP_ENVIRONMENT=(
+    PYFINDER_SHAKEMAP_ENABLED
+    PYFINDER_SHAKEMAP_URL
+    PYFINDER_SHAKEMAP_INPUT_DIRECTORY
+    PYFINDER_SHAKEMAP_CONFIGURATION
+    PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS
+    PYFINDER_SHAKEMAP_OVERWRITE
+    PYFINDER_ALERT_CONFIG
+)
+
 usage() {
     printf '%s\n' \
         "Usage: pyfinder COMMAND [ARGUMENTS]" \
@@ -25,7 +38,16 @@ usage() {
         "  status                Report canonical container state" \
         "  logs                  Show canonical container logs" \
         "  stop                  Stop, but never remove, the canonical container" \
-        "  help, --help          Show this help"
+        "  help, --help          Show this help" \
+        "" \
+        "Continuous ShakeMap settings (environment; disabled by default):" \
+        "  PYFINDER_SHAKEMAP_ENABLED=true|false" \
+        "  PYFINDER_SHAKEMAP_URL, PYFINDER_SHAKEMAP_INPUT_DIRECTORY" \
+        "  PYFINDER_SHAKEMAP_CONFIGURATION (global)" \
+        "  PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS (30)" \
+        "  PYFINDER_SHAKEMAP_OVERWRITE=true|false (true)" \
+        "  PYFINDER_ALERT_CONFIG: optional mounted existing email JSON path; empty disables mail" \
+        "The input directory must share underlying storage with ShakeMap."
 }
 
 fail() {
@@ -166,10 +188,41 @@ create_runtime_directories() {
         "${SERVICE_ROOT}/playbacks"
 }
 
+check_requested_shakemap_environment() {
+    local variable value configured
+
+    # An existing container's environment is immutable. Compare only explicit
+    # requests; omission preserves the existing service, as ordinary startup does.
+    # Ask Docker for each allowed value without printing the complete environment.
+    for variable in "${SHAKEMAP_ENVIRONMENT[@]}"; do
+        if [[ -z "${!variable+x}" ]]; then
+            continue
+        fi
+        value="${!variable}"
+        if ! configured=$(docker container inspect --format \
+            "{{range .Config.Env}}{{if eq (index (split . \"=\") 0) \"${variable}\"}}{{println .}}{{end}}{{end}}" \
+            "$CONTAINER_NAME" 2>/dev/null); then
+            fail "could not inspect ${variable} for ${CONTAINER_NAME}"
+        fi
+        if [[ "$configured" != "${variable}=${value}" ]]; then
+            fail "${variable} differs from the existing container configuration; no setting was applied. Explicitly reconcile/recreate the container with the intended settings before starting it"
+        fi
+    done
+}
+
 run_continuous() {
+    local variable
+    local -a environment_arguments=()
+    for variable in "${SHAKEMAP_ENVIRONMENT[@]}"; do
+        if [[ -n "${!variable+x}" ]]; then
+            environment_arguments+=(--env "$variable")
+        fi
+    done
+
     query_container_presence
     if [[ "$CONTAINER_PRESENT" == "true" ]]; then
         check_container_compatibility
+        check_requested_shakemap_environment
         if [[ "$CONTAINER_RUNNING" == "true" ]]; then
             # Preserve the accepted service instance instead of silently
             # replacing it and losing its process and filesystem continuity.
@@ -191,6 +244,7 @@ run_continuous() {
         --name "$CONTAINER_NAME" \
         --user "$CONTAINER_USER" \
         --mount "type=bind,source=${RUNTIME_ROOT},target=${CONTAINER_RUNTIME}" \
+        ${environment_arguments[@]+"${environment_arguments[@]}"} \
         "$IMAGE_NAME" \
         continuous >/dev/null
     printf 'Started new container %s from %s.\n' "$CONTAINER_NAME" "$IMAGE_NAME"

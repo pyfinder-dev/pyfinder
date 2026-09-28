@@ -12,7 +12,10 @@ utility as well as a runtime library.
 import os
 import sys
 import logging
+import json
 from collections.abc import Mapping
+from copy import deepcopy
+import math
 
 from pyfinder.eventcontext import (
     EventContext,
@@ -95,7 +98,9 @@ class FinDerManager:
         entry_kind,
         event_context=None,
         context_diagnostic=None,
+        evidence_callback=None,
     ):
+        self.evidence_callback = evidence_callback
         if entry_kind not in (self.ALERT_BACKED, self.ON_DEMAND):
             raise ValueError(
                 "FinDerManager requires an explicit alert-backed or "
@@ -632,6 +637,38 @@ class FinDerManager:
         )
         return merger.merge(available_results)
 
+    def _capture_selected_solution_summary(self, solution):
+        """Retain display values from the selected solution without changing it.
+
+        FinderEvent's getters may normalize their object in place, so read a
+        private copy. Its internal origin timestamp is not earthquake time:
+        the physical origin below comes only from authoritative event metadata.
+        This optional message summary must never cause another scientific run.
+        """
+        callback = getattr(self, "evidence_callback", None)
+        if callback is None:
+            return
+        try:
+            event = deepcopy(solution.get_event())
+            summary = {
+                "source": "selected FinDer solution",
+                "physical_origin_time": self.metadata.get("origin_time"),
+            }
+            for field in ("latitude", "longitude", "depth", "magnitude"):
+                value = getattr(event, "get_" + field)() if event is not None else None
+                available = (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                )
+                summary[field] = value if available else None
+            callback({"finder-summary.json": json.dumps(summary, allow_nan=False).encode()})
+        except (OSError, ValueError, TypeError, AttributeError):
+            self.logger.error(
+                "Selected FinDer summary could not be retained for terminal notification; "
+                "scientific work will not be repeated for an optional message artifact"
+            )
+
     def process_event(self, event_id) -> FinderSolution:
         """ Process data associated with an event_id """
         # Check if the event_id is not None
@@ -800,6 +837,21 @@ class FinDerManager:
                 finder_configuration=self.finder_configuration,
                 logger=self.logger,
             )
+            # The executable invokes this local capture while its workspace
+            # lock is held; the manager never sends terminal mail itself.
+            callback = getattr(self, "evidence_callback", None)
+            if callback is not None:
+                def capture_inputs(files):
+                    # Retain only display metadata already owned by the manager.
+                    # Raw provider payloads, credentials and scientific settings
+                    # never enter the terminal message's earthquake summary.
+                    names = ("origin_time", "latitude", "longitude", "depth",
+                             "magnitude", "magnitude_type", "region", "current_delay",
+                             "minutes_until_next_update", "ESM_status", "RRSM_status")
+                    context = {name: self.metadata[name] for name in names if name in self.metadata}
+                    callback({**files, "event-context.json": json.dumps(context).encode()})
+
+                finder_executable.evidence_callback = capture_inputs
             executable = finder_executable.execute(
                 event_data=_event_data,
                 amplitudes=_amplitude_data,
@@ -831,8 +883,12 @@ class FinDerManager:
             # local execution/archive/email sequence is retained in
             # legacy/manager-downstream-reference.md for reference.
 
-            # Return the FinderSolution object
-            return executable.get_finder_solution_object()
+            # Capture the same selected solution returned to ShakeMap. Do not
+            # substitute catalogue magnitude or interpret FinDer's internal time
+            # as the earthquake origin in the notification.
+            selected_solution = executable.get_finder_solution_object()
+            self._capture_selected_solution_summary(selected_solution)
+            return selected_solution
             
     
 def run_cli(arguments, *, runtime_context):

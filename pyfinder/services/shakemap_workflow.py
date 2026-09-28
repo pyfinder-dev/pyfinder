@@ -15,10 +15,13 @@ import os
 import sqlite3
 import threading
 
+from .shakemap_diagnostics import error_diagnostic, regional_configuration_failure
+
 from .shakemap_client import (
     AcceptedJob,
     ShakeMapHTTPError,
     ShakeMapSubmissionUncertain,
+    ShakeMapProtocolError,
 )
 
 
@@ -97,6 +100,25 @@ class ShakeMapWorkflow:
                         prepared_json TEXT
                     )
                 """)
+                # One optional global child belongs to the same scheduler execution.
+                # The original submission and its retained evidence never change.
+                self._connection.execute("""
+                    CREATE TABLE IF NOT EXISTS shakemap_global_fallbacks (
+                        execution_id TEXT PRIMARY KEY NOT NULL,
+                        attempt_id TEXT UNIQUE NOT NULL,
+                        regional_sequence INTEGER NOT NULL,
+                        prepared_json TEXT NOT NULL,
+                        evidence_json TEXT NOT NULL
+                    )
+                """)
+                # Local capture/finalization failures keep terminal jobs pending
+                # without turning their stored result into another HTTP read.
+                self._connection.execute("""
+                    CREATE TABLE IF NOT EXISTS shakemap_evidence_holds (
+                        attempt_id TEXT PRIMARY KEY NOT NULL,
+                        error TEXT NOT NULL
+                    )
+                """)
                 columns = {
                     row[1] for row in self._connection.execute(
                         "PRAGMA table_info(shakemap_scheduled_attempts)"
@@ -149,6 +171,10 @@ class ShakeMapWorkflow:
                 "SELECT * FROM shakemap_submissions ORDER BY created_at, attempt_id"
             ).fetchall()
 
+            held = {row[0] for row in self._connection.execute(
+                "SELECT attempt_id FROM shakemap_evidence_holds"
+            )}
+
         records = [self._decode(row) for row in rows]
         return [
             record for record in records
@@ -157,6 +183,7 @@ class ShakeMapWorkflow:
                 record["observation"] is None
                 or record["observation"]["details"]["status"] not in {"SUCCESS", "FAILED"}
                 or record["last_error"] is not None
+                or record["attempt_id"] in held
             )
         ]
 
@@ -309,8 +336,14 @@ class ShakeMapWorkflow:
 
         requests = []
         for row in rows:
-            prepared = json.loads(row["prepared_json"])
-            prepared["attempt_id"] = row["attempt_id"]
+            execution_id = row["attempt_id"]
+            with self._lock:
+                fallback = self._connection.execute(
+                    "SELECT attempt_id, prepared_json FROM shakemap_global_fallbacks WHERE execution_id = ?",
+                    (execution_id,),
+                ).fetchone()
+            prepared = json.loads(row["prepared_json"] if fallback is None else fallback["prepared_json"])
+            prepared["attempt_id"] = execution_id if fallback is None else fallback["attempt_id"]
             prepared["files"] = {
                 name: b64decode(content, validate=True)
                 for name, content in prepared["files"].items()
@@ -318,6 +351,66 @@ class ShakeMapWorkflow:
             requests.append(prepared)
 
         return requests
+
+    def submission_attempt_id(self, execution_id):
+        """Return the active native attempt without changing scheduler ownership."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT attempt_id FROM shakemap_global_fallbacks WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            return execution_id if row is None else row[0]
+
+    def execution_for_attempt(self, attempt_id):
+        """Keep a global child's scheduler identity available after local cleanup."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT execution_id FROM shakemap_global_fallbacks WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            return attempt_id if row is None else row[0]
+
+    def attempt_chain(self, execution_id):
+        """Read both native outcomes for one execution, preserving submission order."""
+        identities = [execution_id]
+        active = self.submission_attempt_id(execution_id)
+        if active != execution_id:
+            identities.append(active)
+        return [record for identity in identities if (record := self.get(identity)) is not None]
+
+    def prepare_global_fallback(self, execution_id, evidence):
+        """Reserve one explicit global request only after regional evidence capture.
+
+        The retained original input bytes and overwrite choice are reused. This
+        transaction does not POST; the ordinary intent barrier still owns that.
+        """
+        if not evidence:
+            raise ValueError("Regional evidence must be retained before global recovery")
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            if self.submission_attempt_id(execution_id) != execution_id:
+                return self.submission_attempt_id(execution_id)
+            regional = self.get(execution_id)
+            if regional is None or not regional_configuration_failure(regional):
+                raise ValueError("Regional recovery requires confirmed configuration failure")
+            row = self._connection.execute(
+                "SELECT prepared_json FROM shakemap_scheduled_attempts WHERE attempt_id = ?",
+                (execution_id,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise ValueError("Regional recovery requires retained prepared inputs")
+            prepared = json.loads(row[0])
+            prepared["configuration"] = "global"
+            attempt_id = execution_id + ":global"
+            if self.get(attempt_id) is not None:
+                raise ValueError("Global recovery identity already belongs to another submission")
+            self._connection.execute("""
+                INSERT INTO shakemap_global_fallbacks
+                    (execution_id, attempt_id, regional_sequence, prepared_json, evidence_json)
+                VALUES (?, ?, ?, ?, ?)
+            """, (execution_id, attempt_id, regional["internal_sequence"],
+                  json.dumps(prepared, sort_keys=True), json.dumps(evidence, sort_keys=True)))
+            return attempt_id
 
     def submit(
         self,
@@ -412,7 +505,31 @@ class ShakeMapWorkflow:
                 UPDATE shakemap_submissions
                 SET submission_state = ?, last_error = ?, updated_at = ?
                 WHERE attempt_id = ?
-            ''', (state, type(error).__name__, _now(), attempt_id))
+            ''', (state, error_diagnostic(error, operation="submission"), _now(), attempt_id))
+
+    def retain_local_error(self, attempt_id, error):
+        """Hold replacement until immutable capture and local finalization succeed."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO shakemap_evidence_holds VALUES (?, ?)",
+                (attempt_id, error_diagnostic(error, operation="evidence")),
+            )
+
+    def evidence_pending(self, attempt_id):
+        """A local evidence failure cannot release the public calculation ID."""
+        with self._lock:
+            return self._connection.execute(
+                "SELECT 1 FROM shakemap_evidence_holds WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone() is not None
+
+    def clear_local_error(self, attempt_id):
+        """Release only the local hold after successful capture/finalization."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM shakemap_evidence_holds WHERE attempt_id = ?",
+                (attempt_id,),
+            )
 
     def poll(self, attempt_id):
         """Persist one observation of the accepted sequence, with no wait loop.
@@ -435,6 +552,18 @@ class ShakeMapWorkflow:
             )
             try:
                 status = self.client.poll(job)
+                details = status.details
+                observed = (details.get("configuration") or {}).get("selected")
+                provenance = details.get("provenance")
+                if provenance is not None:
+                    if (provenance.get("event_id") != job.event_id
+                            or provenance.get("internal_sequence") != job.internal_sequence):
+                        raise ShakeMapProtocolError("Provenance belongs to another calculation")
+                    selected = (provenance.get("configuration") or {}).get("selected")
+                    if selected is not None and selected != record["request"]["configuration"]:
+                        raise ShakeMapProtocolError("Provenance configuration differs from the request")
+                if observed is not None and observed != record["request"]["configuration"]:
+                    raise ShakeMapProtocolError("Observed configuration differs from the request")
             except Exception as error:
                 # A timeout, missing retained job, or malformed response is a
                 # monitoring error; it is not evidence of a FAILED calculation.
@@ -442,7 +571,7 @@ class ShakeMapWorkflow:
                     self._connection.execute('''
                         UPDATE shakemap_submissions
                         SET last_error = ?, updated_at = ? WHERE attempt_id = ?
-                    ''', (type(error).__name__, _now(), attempt_id))
+                    ''', (error_diagnostic(error, operation="observation"), _now(), attempt_id))
                 raise
 
             observation = {"scope": status.scope, "details": status.details}

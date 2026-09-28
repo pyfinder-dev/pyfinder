@@ -4,7 +4,10 @@ This adapter prepares native inputs and communicates with the separate ShakeMap
 service. The manager and scheduler now have an explicit continuous-operation
 handoff, durable submission queue, and exact-job monitoring. It is disabled by
 default until the service endpoint and caller-owned canonical input mount are
-configured. Product copying and notifications remain separate unfinished work.
+configured. Continuous operation now retains immutable attempt evidence and
+queues notifications through a separate delivery ledger. These changes have
+host-side tests; rebuilt-image, running-service fallback and real email delivery
+verification remain separate gates. General product distribution is not implied.
 
 ## Preparing inputs
 
@@ -76,7 +79,8 @@ The client exposes operational health, effective configuration, configuration
 names, event/queue views, submission, one status observation, current-product
 information, and log-path references. Configuration names do not imply scientific
 usability. The caller selects the configuration explicitly; the default is
-`global`, and the client does not choose another configuration after failure.
+`global`. The transport client does not choose another configuration. Caller
+workflow recovery, described below, is a separate explicit submission.
 
 `submit(calculation_id, files, configuration="global", overwrite=True)` returns
 an `AcceptedJob` and the complete acknowledgement. Retain the event ID and
@@ -225,8 +229,16 @@ no events are due. Native execution does not occupy the FinDer worker pool while
 waiting for its result. Read errors retain the accepted sequence and are retried
 as observations, without rerunning FinDer or POST. Explicit pre-acceptance rejection
 uses the existing three-attempt/ten-second execution retry policy. Native `FAILED`
-is recorded as terminal without another scientific calculation, following the
-approved integration direction. Native `SUCCESS` requires `products_ready` before
+is retained as the outcome of that exact attempt. The narrowly authorized
+exception is a confirmed unavailable or misconfigured selected region: after
+retaining its failure evidence, the caller may submit `global` once with the
+same public calculation ID, a new service sequence and unchanged overwrite
+setting. It must submit the region first, serialize both attempts and retain
+both outcomes before replacement can discard the preceding service tree.
+Generic native failure, uncertain acceptance and observation errors do not
+qualify; global failure does not recurse. The final alert and logs disclose
+requested region, actual global recovery, reason and outcome. This does not
+settle SMTP delivery policy. Native `SUCCESS` requires `products_ready` before
 local completion; an unavailable archive is not usable chain success. These
 outcomes do not imply copied products or delivered notifications.
 
@@ -244,24 +256,55 @@ external records. It does not wait for native calculations to finish.
 
 ## Continuous configuration and input ownership
 
-Only `start_monitoring` composes the external workflow. Configure the existing
-`shakemap` settings explicitly:
+Only continuous startup reads these environment variables. They override a
+private copy of the packaged settings; no package file needs editing. Playback
+and on-demand ignore them, and supplying an endpoint alone does not enable work.
 
-```python
-"service-enabled": True,
-"service-url": "http://<reachable-shakemap-host>:<port>",
-"request-timeout-seconds": 30.0,
-"input-directory": "/absolute/resolved/caller-visible/data/inputs",
-"configuration": "global",  # Or an explicitly selected service configuration name.
-"overwrite": True,
-```
+| Environment variable | Default | Requirement |
+| --- | --- | --- |
+| `PYFINDER_SHAKEMAP_ENABLED` | `false` | Exactly `true` or `false` |
+| `PYFINDER_SHAKEMAP_URL` | unset | Required when enabled; absolute HTTP(S) URL without credentials, query, or fragment |
+| `PYFINDER_SHAKEMAP_INPUT_DIRECTORY` | unset | Required when enabled; existing absolute resolved caller-visible input directory |
+| `PYFINDER_SHAKEMAP_CONFIGURATION` | `global` | Initial explicit service configuration; bounded caller recovery only |
+| `PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS` | `30` | Positive finite number of seconds per request |
+| `PYFINDER_SHAKEMAP_OVERWRITE` | `true` | Exactly `true` or `false`; false archives the preceding calculation |
 
-The input directory must be the same canonical storage the service uses and be
-readable/writable by both processes. It must already exist as an absolute,
-resolved directory. Do not point it at products or an unrelated operator folder.
-This code does not establish deployment mounts, network routing, credentials,
-regional data suitability, or host/container path equivalence. Operators must
-provide those deployment resources before enabling the feature.
+For an already prepared deployment, export the required variables in the shell
+that invokes the host launcher, then run `scripts/pyfinder continuous`. The same
+variables are read by the installed `pyfinder continuous` process inside the
+container. The host launcher passes only these six named variables to a newly
+created container. Invalid explicitly supplied values fail at process startup,
+even when disabled; required endpoint and input-directory checks apply when
+enabled. Validation occurs before listener or persistence resources are opened.
+
+A running or stopped container retains the environment with which it was created.
+If an explicitly supplied variable differs, the host launcher refuses to start or
+preserve it under a misleading new configuration. It reports the variable name
+without printing either value. It never recreates a container automatically.
+Omitted variables preserve the existing container's settings. Deliberate changes
+require an operator-controlled container replacement that preserves runtime data.
+
+The input directory must reference the **same underlying storage** the ShakeMap
+service uses, readable/writable by both processes. Equal container path strings
+are insufficient. On 2026-09-26, the former separate development roots were
+consolidated at `/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy/runtime`.
+Both supported container configurations use that same parent at `/home/sysop/runtime`;
+the old `shakemap-docker/runtime` source directory is absent. The existing
+single PyFinder runtime bind therefore exposes canonical ShakeMap inputs without
+an extra bind. Shared visibility does not grant either component ownership of the
+other's files. The caller image was subsequently rebuilt and passed isolated
+image checks and a finite installed-client check of current module hashes, shared
+input access under UID/GID 1000:1000, and `http://host.docker.internal:9010` connectivity.
+Evidence is `/private/tmp/pyfinder-caller-boundary-20260926/summary.json`.
+The transient caller was removed, so canonical `pyfinder-docker` is absent and
+integration remains disabled. No production listener or complete scheduled chain
+was run; configuration listing does not establish regional scientific readiness.
+
+Do not point the input setting at products or an unrelated operator folder.
+These settings neither create directories nor prove mount equivalence, network
+routing, permissions, credentials, regional data suitability, or service readiness.
+Check the actual service mount and data selection before enabling production work.
+Container image and caller-network verification remain separate from host adapter testing.
 
 `PreparedShakeMapInputs` requires exclusive caller ownership of these event
 inputs. It holds a per-event PyFinder advisory lock across preparation and POST,
@@ -274,8 +317,9 @@ entries are refused untouched. Products, service state, and datasets are not
 modified by this helper. All callers that write these inputs must respect this
 ownership; unrelated REST writers do not participate in the PyFinder lock.
 
-The service configuration is explicitly caller-selected, defaults to `global`,
-and has no fallback. Legacy local regional paths and the FinDer profile name
+Each service request has an explicit caller-selected configuration, defaulting
+to `global`. The service has no fallback; the caller recovery described above
+uses a distinct API submission. Legacy local regional paths and the FinDer profile name
 are not silently translated into ShakeMap configuration selections. Existing
 legacy modules remain retained; removed commented call sequences are preserved
 in `legacy/manager-downstream-reference.md`.
@@ -305,6 +349,47 @@ container `/tmp` storage, and leaves the mounted runtime untouched. It neither
 starts/stops containers nor submits a model calculation. These checks establish
 adapter and parser behavior, not continuous-operation or deployment readiness.
 
+The separate live service test is skipped by default. It requires an existing
+reachable ShakeMap service, its actual host-visible canonical input directory,
+a fresh explicitly owned test calculation ID, and a fresh evidence directory
+outside the service runtime. Inspect the endpoint and underlying mount before
+running; a matching path spelling in another container is insufficient.
+
+After the 2026-09-26 consolidation, the host endpoint is `http://127.0.0.1:9010`
+and the canonical host input root is
+`/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy/runtime/shakemap/data/inputs`.
+Earlier test evidence may retain the former source-runtime path as historical
+provenance; use the consolidated path for new runs. Reconfirm endpoint and mount
+against the service being tested. Replace `<fresh-label>`
+in both destinations below with a new value for each run; do not reuse an earlier
+calculation ID or evidence directory:
+
+```sh
+source /Users/savas/my-codes/eew/pyfinder-dev/.venv/bin/activate
+PYTHONDONTWRITEBYTECODE=1 \
+PYFINDER_RUN_SHAKEMAP_SERVICE=1 \
+PYFINDER_SHAKEMAP_TEST_URL="http://127.0.0.1:9010" \
+PYFINDER_SHAKEMAP_TEST_INPUT_ROOT="/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy/runtime/shakemap/data/inputs" \
+PYFINDER_SHAKEMAP_TEST_EVENT_ID="pyfinder-live-<fresh-label>_t00000" \
+PYFINDER_SHAKEMAP_TEST_EVIDENCE="/private/tmp/pyfinder-live-<fresh-label>-evidence" \
+python -m unittest tests.integration.test_shakemap_service_workflow -v
+```
+
+This test deliberately submits three native global calculations under its one
+new public ID: a finite rupture, a point replacement with `overwrite=True`, and
+another point calculation with `overwrite=False`. It captures each accepted
+sequence and checks completion, core products, manifest hashes, provenance, and
+logs before replacing the preceding result. Each calculation has a bounded
+monitoring deadline; an uncertain POST is not automatically retried.
+
+The test retains its inputs, current calculation, archive, and separate evidence
+(including its own SQLite database) for review. It does not delete test records,
+start or replace containers, run a production listener, query providers, invoke
+FinDer, or open the operational scheduler database. It exercises the host manager
+preparation/exporter and client/workflow boundary. A passing result does not
+establish deployed PyFinder mount/routing correctness, the running scheduler,
+regional configuration readiness, or scientific accuracy.
+
 ## Retained legacy code
 
 The former exporter, local runner, profile mutation, and product ZIP collection
@@ -313,3 +398,7 @@ are historical reference, excluded from installed packages and Docker builds,
 and are not used as a fallback. The removed manager/scheduler call sequences and
 notification construction remain in `legacy/manager-downstream-reference.md`.
 Related old helper modules remain present.
+
+Regional files, data ownership, current Italy/Switzerland prerequisites and
+operator corrective actions are documented in the
+[configuration runbook](../../shakemap-docker/docs/configuration.md).

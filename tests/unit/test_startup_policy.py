@@ -48,6 +48,10 @@ class PolicyStartupTests(unittest.TestCase):
         )
 
     def setUp(self):
+        # Confined tests never discover a real ignored SMTP credential file.
+        mail_environment = mock.patch.dict("os.environ", {"PYFINDER_ALERT_CONFIG": ""})
+        mail_environment.start()
+        self.addCleanup(mail_environment.stop)
         start_monitoring._listener_thread = None
         start_monitoring._scheduler = None
 

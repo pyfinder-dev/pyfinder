@@ -302,10 +302,11 @@ class SchedulerShakeMapTests(unittest.TestCase):
         ):
             scheduler.run_once()
         self.assertEqual(self.meta(scheduler)["status"], "processing")
-        self.assertEqual(scheduler.shakemap_workflow.unresolved(), [])
+        self.assertEqual(len(scheduler.shakemap_workflow.unresolved()), 1)
 
         scheduler.run_once()
         self.assertEqual(self.meta(scheduler)["status"], "completed")
+        self.assertEqual(scheduler.shakemap_workflow.unresolved(), [])
         self.assertEqual([call[0] for call in transport.calls], ["POST", "GET"])
 
     def test_restart_observes_external_result_without_reopening_failed_row(self):

@@ -16,3 +16,6 @@ original locations. They have not been deleted or silently replaced.
 `manager-downstream-reference.md` preserves the removed commented call sequences
 from the manager and scheduler, including local configuration setup and email
 construction. It complements the unchanged module without duplicating it.
+
+`alert.py` preserves the former SMTP sender unchanged. It is historical source,
+not an active fallback; continuous terminal alerts use `services/alert.py`.
