@@ -4,18 +4,42 @@ Python wrapper for the FinDer executable and its library.
 
 ## Overview
 
-`pyfinder` provides the internal application workflows around the FinDer
-seismic event detection software. FinDer-backed execution belongs inside the
-forthcoming PyFinder container.
----
+PyFinder acquires seismic observations, runs FinDer, and can submit its selected
+solution to a separate ShakeMap service. Continuous operation schedules event
+updates and reports their terminal outcomes by email when configured.
+FinDer-backed workflows run inside the PyFinder application container.
 
+- [Installation and runtime](#installation-and-runtime)
 - [Quick Start](#quick-start)
 - [Current execution boundaries](#current-execution-boundaries)
 - [Sequence Diagram](#sequence-diagram)
+- [Terminal email alerts](#terminal-email-alerts)
+
+## Installation and runtime
+
+Use the [deployment guide](../pyfinder-deploy/README.md) to build the application
+image, prepare shared storage and configure the separate ShakeMap service. Keep
+`pyfinder` and `pyfinder-deploy` as sibling checkouts. The component host launcher
+resolves its own checkout, including symlink invocation, and uses the sibling
+`pyfinder-deploy/runtime` directory regardless of the shell's working directory.
+It does not build images or choose another runtime from an environment variable.
+
+The application runs as UID/GID `1000:1000`. Its mandatory shared runtime mount
+is `/home/sysop/runtime`, with PyFinder state, logs, runs and playbacks under
+`/home/sysop/runtime/pyfinder`. These are container paths, not host checkout
+locations. The host directories must be writable by that runtime account.
 
 ## Quick Start
 
-The current internal workflow commands are:
+From the **PyFinder checkout**, inspect the host launcher without starting work:
+
+```bash
+scripts/pyfinder --help
+scripts/pyfinder status
+```
+
+The host launcher manages the canonical `pyfinder-docker` container. Inside the
+configured application container, the installed workflow commands are:
 
 ```bash
 pyfinder continuous
@@ -24,8 +48,11 @@ pyfinder playback --event-id EVENT_ID
 pyfinder on-demand --event-id EVENT_ID
 ```
 
-Each command expects the configured runtime directories and dependencies to be
-available. These are internal application interfaces.
+These workflow commands require the runtime and dependencies prepared by the
+deployment guide. Playback selects predefined events; on-demand processes the
+specified event. Both keep their experimental state separate from the continuous
+scheduler database. Use the host launcher's corresponding commands to invoke
+these modes in an existing application container.
 
 ---
 
@@ -37,10 +64,11 @@ an explicit endpoint and shared caller-owned input directory, supplied through
 the documented `PYFINDER_SHAKEMAP_*` environment variables. See the
 [adapter configuration and limitations](docs/shakemap-adapter.md).
 
-Full product collection remains unfinished; terminal email delivery uses the
-existing private configuration. Playback and
-on-demand do not activate this external workflow. Host unit tests do not establish
-live service integration or deployment readiness.
+General product distribution is not provided by the adapter. Terminal email
+uses retained input and diagnostic evidence, configured separately below.
+Playback and on-demand do not activate the continuous ShakeMap workflow.
+Enabling the adapter does not validate regional data, establish network access
+or confirm delivery to an SMTP server.
 
 ---
 
@@ -112,21 +140,22 @@ sequenceDiagram
 ```
 
 
-### Terminal email alerts
+## Terminal email alerts
 
-Continuous operation retains the existing private email configuration. The
-search order remains `pyfinder/services/.pyfinder_alert_config.json`, then
+Continuous operation reads the private email configuration. The search order is `pyfinder/services/.pyfinder_alert_config.json`, then
 `pyfinder/.pyfinder_alert_config.json`; those files are excluded from images and
-Git. An optional `PYFINDER_ALERT_CONFIG` selects an absolute path to the same
+Git. The [configuration template](pyfinder/.pyfinder_alert_config_template.json)
+shows the supported existing fields; provide your own account and recipients.
+An optional `PYFINDER_ALERT_CONFIG` selects an absolute path to the same
 JSON format, for example an operator-owned file under the existing shared
 runtime mount. An empty value explicitly disables mail. No configuration means
 no delivery. The launcher forwards this variable by name and refuses an explicit
 mismatch with an existing container; it does not recreate containers or copy
 credentials. Keep the file readable only by the intended runtime account.
 
-Existing `smtp_server`, `smtp_port`, `from`, `to`, `password` and `subject`
-continue to work. As before, SMTP authentication uses `from`; the historical
-`address` field is accepted but unused. Delivery now respects `smtp_server`.
+The configuration uses `smtp_server`, `smtp_port`, `from`, `to`, `password` and
+`subject`. SMTP authentication uses `from`; the historical `address` field is
+accepted but unused. Delivery connects to `smtp_server`.
 `security` defaults to `starttls` (or explicitly `tls`); `timeout` defaults to 30
 seconds and must be positive and at most 300. Recipients remain hidden from each
 other in message headers. Settings are kept outside scientific configuration
@@ -144,9 +173,10 @@ Missing required evidence holds delivery as BLOCKED. Native requirements apply
 to the final attempt, not an earlier failed regional run.
 
 Messages identify the public calculation, private attempt, native sequence and
-selected configuration through the shared diagnostic projection. When PyFinder
-explicitly recovers from a regional configuration failure using global, the
-report retains both attempts and reports global as the actual calculation.
+selected configuration. Service selection and materialization are reported
+separately from evidence that native execution occurred. When PyFinder requests
+global after a confirmed regional configuration failure, the report retains
+both attempts, the fallback reason and the final outcome.
 Where FinDer input was prepared, the manager also retains its authoritative
 earthquake and provider display metadata for the readable email summary.
 Observation time is labelled separately from earthquake origin. The selected
@@ -167,18 +197,27 @@ automatically; exactly-once SMTP is not promised. A changed audience configurati
 blocks already queued mail rather than silently changing its recipients.
 SMTP runs outside the scheduler's ShakeMap phase lock.
 
-Inspect the safe delivery state, including missing required artifacts, with:
+Inside the application container, inspect delivery state and missing required
+artifacts without sending mail:
 
 ```sh
-python -m pyfinder.services.alert_delivery --database /path/to/workflow.sqlite list
+python3.12 -m pyfinder.services.alert_delivery \
+  --database /home/sysop/runtime/pyfinder/state/scheduled_queries.sqlite3 list
 ```
 
 A definite FAILED delivery can be explicitly requeued with `retry-failed
 <execution-id> <audience>` in place of `list`. This command sends nothing;
 the running continuous owner drains the queued item. UNKNOWN/PARTIAL cannot be
 requeued through it. The command never reads credentials or prints message
-bodies/recipient lists. For host commands use the project-local Python environment.
+bodies or recipient lists. If running the inspection command on the host,
+activate the project's Python environment and supply the corresponding absolute
+host database path. Do not point experimental tests at this operational database.
 
-Implementation tests use fake SMTP, temporary SQLite and temporary files only.
-No real email delivery or continuous deployment readiness is established by
-those tests. The former sender is retained unchanged under `legacy/alert.py`.
+Missing configuration suppresses delivery. Invalid configuration stops continuous
+startup; connection or authentication failure records a delivery failure without
+repeating scientific work. Validate the intended server and recipients before
+enabling operational mail. See [verification](docs/shakemap-adapter.md#verification)
+for the distinction between offline tests and deployed checks.
+
+The former sender is retained as historical reference in
+[legacy/alert.py](legacy/alert.py); it is not an active fallback.

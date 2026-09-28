@@ -6,7 +6,22 @@ set -euo pipefail
 # cannot redirect an operator command to another container or deployment tree.
 readonly CONTAINER_NAME="pyfinder-docker"
 readonly IMAGE_NAME="pyfinder:dev"
-readonly DEPLOYMENT_ROOT="/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy"
+# Resolve the installed launcher back to its source checkout. Relative symlinks
+# are relative to the link's own directory; the caller's current directory must
+# not select a different deployment tree. Physical directory resolution also
+# handles a checkout reached through a symlinked parent directory.
+launcher_source="${BASH_SOURCE[0]}"
+while [[ -L "$launcher_source" ]]; do
+    launcher_directory="$(cd -P -- "$(dirname -- "$launcher_source")" && pwd)"
+    launcher_target="$(readlink "$launcher_source")"
+    if [[ "$launcher_target" == /* ]]; then
+        launcher_source="$launcher_target"
+    else
+        launcher_source="${launcher_directory}/${launcher_target}"
+    fi
+done
+readonly PROJECT_ROOT="$(cd -P -- "$(dirname -- "$launcher_source")/.." && pwd)"
+readonly DEPLOYMENT_ROOT="$(dirname -- "$PROJECT_ROOT")/pyfinder-deploy"
 readonly RUNTIME_ROOT="${DEPLOYMENT_ROOT}/runtime"
 readonly SERVICE_ROOT="${RUNTIME_ROOT}/pyfinder"
 readonly CONTAINER_RUNTIME="/home/sysop/runtime"
@@ -29,7 +44,7 @@ usage() {
     printf '%s\n' \
         "Usage: pyfinder COMMAND [ARGUMENTS]" \
         "" \
-        "Manage the fixed local PyFinder development container." \
+        "Manage the canonical PyFinder container using the sibling deployment runtime." \
         "" \
         "Commands:" \
         "  continuous            Start or preserve continuous operation" \

@@ -14,9 +14,7 @@ ZSH_COMPLETION = PROJECT_ROOT / "scripts/completion/_pyfinder"
 
 CONTAINER_NAME = "pyfinder-docker"
 IMAGE_NAME = "pyfinder:dev"
-DEPLOYMENT_ROOT = Path(
-    "/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy"
-)
+DEPLOYMENT_ROOT = PROJECT_ROOT.parent / "pyfinder-deploy"
 RUNTIME_ROOT = DEPLOYMENT_ROOT / "runtime"
 SERVICE_ROOT = RUNTIME_ROOT / "pyfinder"
 CONTAINER_RUNTIME = "/home/sysop/runtime"
@@ -76,7 +74,7 @@ if [[ "${1:-}" == "container" && "${2:-}" == "inspect" ]]; then
             printf '%s' "${FAKE_SHAKEMAP_ENVIRONMENT:-}"
             ;;
         *'.Mounts'*)
-            printf '%s\n' "${FAKE_MOUNTS:-bind|/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy/runtime|/home/sysop/runtime|true}"
+            printf '%s\n' "${FAKE_MOUNTS:-${FAKE_EXPECTED_MOUNT}}"
             ;;
         '{{.State.Running}}')
             if [[ "${FAKE_CONTAINER_STATE}" == "running" ]]; then
@@ -152,6 +150,7 @@ class HostLauncherTests(unittest.TestCase):
                 "FAKE_RECORD_FILE": str(self.record_file),
                 "FAKE_CONTAINER_STATE": "missing",
                 "FAKE_IMAGE_PRESENT": "1",
+                "FAKE_EXPECTED_MOUNT": EXPECTED_MOUNT,
             }
         )
 
@@ -676,6 +675,43 @@ class HostLauncherTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("does not exist", result.stderr)
                 self.assert_no_mutation()
+
+    def test_relocated_checkout_with_spaces_and_symlinks_keeps_sibling_runtime(self):
+        workspace = self.temporary_root.resolve() / "relocated checkout with spaces"
+        launcher = workspace / "pyfinder/scripts/pyfinder"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text(LAUNCHER.read_text(encoding="utf-8"), encoding="utf-8")
+        launcher.chmod(0o755)
+        expected_runtime = workspace / "pyfinder-deploy/runtime"
+
+        # Exercise a relative symlink followed by an absolute symlink, as well
+        # as direct and PATH invocation from an unrelated working directory.
+        entrypoints = self.temporary_root.resolve() / "entry points"
+        entrypoints.mkdir()
+        relative_link = entrypoints / "relative launcher"
+        relative_link.symlink_to(os.path.relpath(launcher, entrypoints))
+        command_link = entrypoints / "pyfinder"
+        command_link.symlink_to(relative_link)
+        environment = self.environment | {
+            "PATH": str(entrypoints) + os.pathsep + self.environment["PATH"],
+            "DEPLOYMENT_ROOT": str(workspace / "must-not-select-this"),
+        }
+        for command in (str(launcher), str(relative_link), str(command_link), "pyfinder"):
+            with self.subTest(command=command):
+                self.record_file.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [command, "continuous"], cwd=self.outside_directory,
+                    env=environment, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runs = [row for row in self.records() if row[:2] == ["docker", "run"]]
+                self.assertEqual(len(runs), 1)
+                self.assertIn(
+                    "type=bind,source=" + str(expected_runtime) + ",target=/home/sysop/runtime",
+                    runs[0],
+                )
+                self.assertFalse(expected_runtime.exists(), "fake mkdir must leave runtime untouched")
+                self.assertNotIn("must-not-select-this", " ".join(runs[0]))
 
     def test_launcher_source_has_only_the_fixed_host_boundary(self):
         source = LAUNCHER.read_text(encoding="utf-8")
