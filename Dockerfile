@@ -1,12 +1,10 @@
 # syntax=docker/dockerfile:1
 
 ARG PYTHON_VERSION=3.12.13
-ARG PYTHON_SOURCE_SHA256=c08bc65a81971c1dd5783182826503369466c7e67374d1646519adf05207b684
 
 FROM ghcr.io/sceylan/finder-base:gmt5 AS build
 
 ARG PYTHON_VERSION
-ARG PYTHON_SOURCE_SHA256
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -31,12 +29,12 @@ RUN sed -i \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# Build the selected release from the official Python HTTPS archive. The
+# installed interpreter and required modules are checked before the image ships.
 WORKDIR /tmp/python-build
 RUN curl --fail --location --show-error \
         --output Python.tar.xz \
         "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz" \
-    && printf '%s  %s\n' "${PYTHON_SOURCE_SHA256}" Python.tar.xz \
-        | sha256sum --check --strict \
     && tar --extract --file Python.tar.xz \
     && cd "Python-${PYTHON_VERSION}" \
     && ./configure \

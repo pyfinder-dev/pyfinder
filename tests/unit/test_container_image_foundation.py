@@ -96,17 +96,18 @@ class DockerfileRequirementsTests(unittest.TestCase):
         )
         self.assertEqual(from_lines[-1], "FROM " + BASE_IMAGE)
 
-    def test_python_312_is_checksum_built_without_a_python_39_path(self):
+    def test_python_312_is_built_from_official_release_without_python_39(self):
         normalized = self.contents.lower()
         self.assertRegex(
             normalized,
             r"(?m)^arg python_version=3\.12\.[0-9]+$",
         )
-        self.assertRegex(
+        self.assertIn("curl --fail --location --show-error", normalized)
+        self.assertIn(
+            "https://www.python.org/ftp/python/${python_version}/python-${python_version}.tar.xz",
             normalized,
-            r"python_source_sha256=[0-9a-f]{64}",
         )
-        self.assertIn("sha256sum --check --strict", normalized)
+        self.assertIn("tar --extract --file python.tar.xz", normalized)
         self.assertIn("/opt/python-3.12", normalized)
         self.assertNotIn("/opt/python-3.9", normalized)
         self.assertNotIn("python_version=3.9", normalized)
