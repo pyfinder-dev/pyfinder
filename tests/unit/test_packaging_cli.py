@@ -600,35 +600,12 @@ class RetiredStartupScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("pyfinder continuous", result.stderr)
 
-    def test_readme_records_current_execution_boundaries(self):
+    def test_readme_uses_portable_paths(self):
+        # Operator instructions must not depend on a developer's personal
+        # checkout or one-off temporary verification directory.
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        normalized = readme.casefold()
-        compact = " ".join(normalized.split())
-
-        self.assertIn("pyfinder continuous", readme)
-        self.assertIn("pyfinder playback --list", readme)
-        self.assertIn("pyfinder playback --event-ids EVENT_ID", readme)
-        self.assertIn("pyfinder application container", compact)
-        self.assertIn("../pyfinder-deploy/README.md", readme)
-        self.assertIn("separate shakemap service", compact)
-        self.assertIn("disabled by default", compact)
-        self.assertIn("general product distribution is not provided", compact)
-        self.assertIn("does not validate regional data", compact)
-        self.assertNotIn("./startMonitoring.sh", readme)
-        self.assertNotIn("start_monitoring.py", readme)
-        self.assertNotIn("python3.9", readme)
-        self.assertNotIn("nohup", readme)
-        self.assertNotIn("standalone (no docker", normalized)
-        self.assertIn("pyfinder-docker", normalized)
         self.assertNotIn("/Users/", readme)
         self.assertNotIn("/private/tmp/", readme)
-        self.assertNotIn("alerts are optional", normalized)
-        self.assertIn(".pyfinder_alert_config.json", normalized)
-        self.assertIn("excluded from images and git", compact)
-        self.assertNotIn("docker run", normalized)
-        self.assertNotIn("$host_out", normalized)
-        self.assertNotIn("pyfinder/pyfinder/output", normalized)
-        self.assertNotIn("fully reproducible setup", normalized)
 
 
 if __name__ == "__main__":

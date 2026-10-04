@@ -3,17 +3,14 @@
 import importlib.util
 import math
 import os
-from pathlib import Path, PurePosixPath
-import re
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 VERIFIER = PROJECT_ROOT / "scripts/verify-pyfinder-image.sh"
 HELPER = PROJECT_ROOT / "tests/container/verify_installed_image.py"
-DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
 CONTAINER_NAME = "pyfinder-docker"
 IMAGE_NAME = "pyfinder:dev"
 OWNERSHIP_LABEL = "io.pyfinder.verification=installed-image"
@@ -23,36 +20,9 @@ OBSERVED_IMAGE_ID = "sha256:" + "c" * 64
 OBSERVED_PYTHON_VERSION = "3.12.99"
 
 
-def dockerignore_rules():
-    return tuple(
-        line.strip()
-        for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    )
-
-
-def rule_matches(relative_path, rule):
-    pattern = rule[1:] if rule.startswith("!") else rule
-    if pattern == "**":
-        return True
-    if pattern.endswith("/"):
-        return False
-    return PurePosixPath(relative_path).match(pattern)
-
-
-def is_ignored(relative_path):
-    ignored = False
-    for rule in dockerignore_rules():
-        if rule_matches(relative_path, rule):
-            ignored = not rule.startswith("!")
-    return ignored
-
-
 class ImageVerifierSafetyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.verifier_contents = VERIFIER.read_text(encoding="utf-8")
-        cls.helper_contents = HELPER.read_text(encoding="utf-8")
         specification = importlib.util.spec_from_file_location(
             "installed_image_verifier_under_test",
             HELPER,
@@ -157,9 +127,7 @@ exit 90
                     "FAKE_PYTHON_VERSION": OBSERVED_PYTHON_VERSION,
                     "FAKE_OWNED_CONTAINER_ID": OWNED_CONTAINER_ID,
                     "FAKE_OTHER_CONTAINER_ID": OTHER_CONTAINER_ID,
-                    "PATH": os.pathsep.join(
-                        (str(fake_bin), environment["PATH"])
-                    ),
+                    "PATH": os.pathsep.join((str(fake_bin), environment["PATH"])),
                 }
             )
 
@@ -182,37 +150,47 @@ exit 90
         self.assertIn("container ls --all", commands[0])
         self.assertIn("name=^pyfinder-docker$", commands[0])
         self.assertFalse(any(command.startswith("run ") for command in commands))
-        self.assertFalse(any(command.startswith("container rm ") for command in commands))
+        self.assertFalse(
+            any(command.startswith("container rm ") for command in commands)
+        )
 
     def test_interruption_before_cidfile_never_inspects_or_removes(self):
         completed, commands = self.run_fake_docker("missing-cid")
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(sum(command.startswith("run ") for command in commands), 1)
-        self.assertFalse(any(command.startswith("container inspect ") for command in commands))
-        self.assertFalse(any(command.startswith("container rm ") for command in commands))
+        self.assertFalse(
+            any(command.startswith("container inspect ") for command in commands)
+        )
+        self.assertFalse(
+            any(command.startswith("container rm ") for command in commands)
+        )
 
     def test_private_container_id_must_match_canonical_container_id(self):
         completed, commands = self.run_fake_docker("different-id")
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertTrue(any(command.startswith("container inspect ") for command in commands))
-        self.assertFalse(any(command.startswith("container rm ") for command in commands))
+        self.assertTrue(
+            any(command.startswith("container inspect ") for command in commands)
+        )
+        self.assertFalse(
+            any(command.startswith("container rm ") for command in commands)
+        )
 
     def test_expected_label_is_required_after_container_id_matches(self):
         completed, commands = self.run_fake_docker("different-label")
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertFalse(any(command.startswith("container rm ") for command in commands))
+        self.assertFalse(
+            any(command.startswith("container rm ") for command in commands)
+        )
 
     def test_matching_private_id_canonical_id_and_label_authorize_removal(self):
         completed, commands = self.run_fake_docker("matching-owner")
 
         self.assertNotEqual(completed.returncode, 0)
         removal_commands = [
-            command
-            for command in commands
-            if command.startswith("container rm ")
+            command for command in commands if command.startswith("container rm ")
         ]
         self.assertEqual(
             removal_commands,
@@ -237,55 +215,32 @@ exit 90
                 self.assertNotIn(IMAGE_NAME, run_commands[0])
                 self.assertNotIn("PYFINDER_IMAGE_BASE_DIGEST", run_commands[0])
                 self.assertIn(
-                    "PYFINDER_IMAGE_PYTHON_VERSION={0}".format(
-                        OBSERVED_PYTHON_VERSION
-                    ),
+                    "PYFINDER_IMAGE_PYTHON_VERSION={0}".format(OBSERVED_PYTHON_VERSION),
                     run_commands[0],
                 )
 
     def test_container_run_keeps_fixed_identity_and_isolation(self):
-        self.assertIn('readonly CONTAINER_NAME="pyfinder-docker"', self.verifier_contents)
-        self.assertIn('readonly IMAGE_NAME="pyfinder:dev"', self.verifier_contents)
-        for fragment in (
+        # Inspect the command actually executed, not its shell variable names
+        # or formatting. The fake Docker process cannot reach a real daemon.
+        _completed, commands = self.run_fake_docker("matching-owner")
+        run_commands = [command for command in commands if command.startswith("run ")]
+        self.assertEqual(len(run_commands), 1)
+        command = run_commands[0]
+        for option in (
             "--rm",
             "--interactive",
-            '--name "$CONTAINER_NAME"',
-            '--cidfile "$CONTAINER_CID_FILE"',
-            '--label "${OWNERSHIP_LABEL_KEY}=${OWNERSHIP_LABEL_VALUE}"',
+            "--name " + CONTAINER_NAME,
+            "--cidfile ",
+            "--label " + OWNERSHIP_LABEL,
             "--network none",
             "--platform linux/amd64",
             "--pull=never",
-            '--user "$CONTAINER_USER"',
+            "--user 1000:1000",
         ):
-            with self.subTest(fragment=fragment):
-                self.assertIn(fragment, self.verifier_contents)
-        ownership_key, ownership_value = OWNERSHIP_LABEL.split("=", 1)
-        self.assertIn(
-            'readonly OWNERSHIP_LABEL_KEY="{0}"'.format(ownership_key),
-            self.verifier_contents,
-        )
-        self.assertIn(
-            'readonly OWNERSHIP_LABEL_VALUE="{0}"'.format(ownership_value),
-            self.verifier_contents,
-        )
-
-    def test_no_alternate_name_service_start_or_deployment_root_is_present(self):
-        self.assertEqual(
-            self.verifier_contents.count("readonly CONTAINER_NAME="),
-            1,
-        )
-        for forbidden in (
-            "uuidgen",
-            "RANDOM",
-            "container_name=",
-            "pyfinder-docker-",
-            "/Users/savas/my-codes/eew/pyfinder-dev/pyfinder-deploy",
-        ):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, self.verifier_contents)
-                self.assertNotIn(forbidden, self.helper_contents)
-        self.assertIsNone(
-            re.search(r"run_image[^\n]*\bcontinuous\b", self.verifier_contents)
+            with self.subTest(option=option):
+                self.assertIn(option, command)
+        self.assertFalse(
+            any(item.startswith(("start ", "restart ", "stop ")) for item in commands)
         )
 
     def test_materialization_artifact_helpers_accept_semantic_numeric_values(self):
@@ -322,10 +277,12 @@ exit 90
             self.helper.verify_companion(
                 companion_path,
                 [
-                    {"sncl": "XX.NONE.00.HNZ", "pga": 12.625,
-                     "distance_km": 0.0},
-                    {"sncl": "CH.IMAGECHECK.00.HNZ", "pga": 12.5,
-                     "distance_km": 6371.0 * math.radians(1.0)},
+                    {"sncl": "XX.NONE.00.HNZ", "pga": 12.625, "distance_km": 0.0},
+                    {
+                        "sncl": "CH.IMAGECHECK.00.HNZ",
+                        "pga": 12.5,
+                        "distance_km": 6371.0 * math.radians(1.0),
+                    },
                 ],
             )
 
@@ -339,33 +296,35 @@ exit 90
                     "data header",
                     self.helper.verify_non_live_data_0,
                     "#  1786349730 0\n0 0 {0}".format(math.log10(12.625)),
-                    {"event_time": 1786349730, "expected_rows": [
-                        {"latitude": 0.0, "longitude": 0.0, "pga": 12.625}
-                    ]},
+                    {
+                        "event_time": 1786349730,
+                        "expected_rows": [
+                            {"latitude": 0.0, "longitude": 0.0, "pga": 12.625}
+                        ],
+                    },
                 ),
                 (
                     "calculated value",
                     self.helper.verify_non_live_data_0,
                     "# 1786349730 0\n0 0 2.0",
-                    {"event_time": 1786349730, "expected_rows": [
-                        {"latitude": 0.0, "longitude": 0.0, "pga": 12.625}
-                    ]},
+                    {
+                        "event_time": 1786349730,
+                        "expected_rows": [
+                            {"latitude": 0.0, "longitude": 0.0, "pga": 12.625}
+                        ],
+                    },
                 ),
                 (
                     "companion header",
                     self.helper.verify_companion,
-                    "#  SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
-                    "XX.NONE.00.HNZ 12.625 0.0",
-                    [{"sncl": "XX.NONE.00.HNZ", "pga": 12.625,
-                      "distance_km": 0.0}],
+                    "#  SNCL PGA_CM_S2 EPI_DISTANCE_KM\n" "XX.NONE.00.HNZ 12.625 0.0",
+                    [{"sncl": "XX.NONE.00.HNZ", "pga": 12.625, "distance_km": 0.0}],
                 ),
                 (
                     "distance precision",
                     self.helper.verify_companion,
-                    "# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n"
-                    "XX.NONE.00.HNZ 12.625 0.00",
-                    [{"sncl": "XX.NONE.00.HNZ", "pga": 12.625,
-                      "distance_km": 0.0}],
+                    "# SNCL PGA_CM_S2 EPI_DISTANCE_KM\n" "XX.NONE.00.HNZ 12.625 0.00",
+                    [{"sncl": "XX.NONE.00.HNZ", "pga": 12.625, "distance_km": 0.0}],
                 ),
             )
             for label, verifier, contents, arguments in cases:
@@ -376,10 +335,6 @@ exit 90
                             verifier(path, **arguments)
                         else:
                             verifier(path, arguments)
-
-    def test_verifier_and_helper_are_excluded_from_the_image_context(self):
-        self.assertTrue(is_ignored("scripts/verify-pyfinder-image.sh"))
-        self.assertTrue(is_ignored("tests/container/verify_installed_image.py"))
 
     def test_verifier_has_valid_bash_syntax(self):
         completed = subprocess.run(

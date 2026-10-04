@@ -1,6 +1,7 @@
 """Offline tests for FinDerManager's normalized observation handoff."""
 
 import atexit
+import smtplib
 from contextlib import ExitStack
 import os
 from pathlib import Path
@@ -119,6 +120,17 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             rrsm_provider.set_event_data(rrsm_event)
 
         with ExitStack() as stack:
+            # The workflow owner sends terminal notifications. Processing an
+            # event in the manager must not contact a mail server, including
+            # when acquisition or the handoff fails.
+            smtp = stack.enter_context(patch.object(
+                smtplib, "SMTP",
+                side_effect=AssertionError("manager attempted SMTP"),
+            ))
+            smtp_ssl = stack.enter_context(patch.object(
+                smtplib, "SMTP_SSL",
+                side_effect=AssertionError("manager attempted SMTP_SSL"),
+            ))
             rrsm_type = stack.enter_context(patch.object(
                 findermanager, "RRSMPeakMotionClient"))
             esm_type = stack.enter_context(patch.object(
@@ -174,6 +186,9 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
                 result = None
             else:
                 result = manager.process_event(self.event_id)
+
+            smtp.assert_not_called()
+            smtp_ssl.assert_not_called()
 
         return {
             "manager": manager,
