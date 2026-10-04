@@ -102,8 +102,10 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
     def _exercise(self, *, rrsm_event, esm_event, rrsm_provider,
                   esm_provider, rrsm_records, esm_records, merged_records,
                   expect_execution=True, enabled=None, rrsm_code=200,
-                  esm_code=200, entry_kind=None, event_context=None):
+                  esm_code=200, entry_kind=None, event_context=None, scheduled_delay=None):
         manager = self._manager()
+        if scheduled_delay is not None:
+            manager.metadata["current_delay"] = scheduled_delay
         if enabled is not None:
             manager.configuration["general"]["services-enabled"] = enabled
         if entry_kind is not None:
@@ -529,11 +531,24 @@ class FinDerManagerNormalizedHandoffTests(unittest.TestCase):
             available_results,
         )
 
+    def test_provider_backed_followup_preserves_nominal_workspace_identity(self):
+        rrsm_provider, esm_provider = self._provider_models()
+        observed = self._exercise(
+            rrsm_event=_EventModel("rrsm"), esm_event=_EventModel("esm"),
+            rrsm_provider=rrsm_provider, esm_provider=esm_provider,
+            rrsm_records=[{"source": "RRSM"}], esm_records=[{"source": "ESM"}],
+            merged_records=[{"source": "ESM"}], scheduled_delay=60,
+            entry_kind=findermanager.FinDerManager.ON_DEMAND,
+        )
+        self.assertEqual(
+            observed["executable"].execute.call_args.kwargs["augmented_event_id"],
+            "handoff-event_t00060",
+        )
+
     def test_alert_and_on_demand_entries_use_the_same_mapping_handoff(self):
         for source_kind, entry_kind in (
             ("continuous", findermanager.FinDerManager.ALERT_BACKED),
-            ("playback", findermanager.FinDerManager.ALERT_BACKED),
-            ("on-demand", findermanager.FinDerManager.ON_DEMAND),
+            ("playback", findermanager.FinDerManager.ON_DEMAND),
         ):
             with self.subTest(source_kind=source_kind):
                 rrsm_provider, esm_provider = self._provider_models()

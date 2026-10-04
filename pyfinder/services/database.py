@@ -142,6 +142,13 @@ class ThreadSafeDB:
             ),
         )
 
+    def status_counts(self):
+        """Return retained lifecycle counts, including future pending items."""
+        with self._lock:
+            return dict(self.conn.execute(
+                "SELECT status, COUNT(*) FROM event_tracker GROUP BY status"
+            ).fetchall())
+
     def fetch_due_events(self, service=None):
         """Fetch events that are due for querying, optionally filtered by service."""
         now = datetime.now(timezone.utc).isoformat(timespec='seconds')

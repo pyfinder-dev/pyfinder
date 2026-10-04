@@ -114,7 +114,9 @@ The path must name a persistent filesystem database; empty paths, in-memory
 names, and SQLite URI names are rejected. The helper shares the scheduler database
 but leaves scheduled lifecycle changes to the scheduler/EventTracker boundary. External
 records survive scheduled-row cleanup. Opening this helper creates its table;
-use a separate temporary database for experiments and verification.
+use a separate database for experiments and verification. Playback owns retained
+state separately from the operational scheduler database; do not discard it while
+submission acceptance, external execution, or delivery remains unresolved.
 
 ```python
 from pyfinder.services.shakemap_client import ShakeMapClient
@@ -258,11 +260,13 @@ started after their local execution was abandoned. Orderly shutdown drains
 finite in-flight operations, finalizes remaining local ownership, and retains
 external records. It does not wait for native calculations to finish.
 
-## Continuous configuration and input ownership
+## Workflow configuration and input ownership
 
-Only continuous startup reads these environment variables. They override a
-private copy of the packaged settings; no package file needs editing. Playback
-and on-demand ignore them, and supplying an endpoint alone does not enable work.
+Continuous and playback startup read these environment variables. They override
+a private copy of the packaged settings; no package file needs editing. Supplying
+an endpoint alone does not enable work. Playback requires the adapter to be
+enabled because every selected schedule runs the full chain; a missing prerequisite
+is a startup error, not permission to stop after FinDer.
 
 | Environment variable | Default | Requirement |
 | --- | --- | --- |
@@ -275,14 +279,19 @@ and on-demand ignore them, and supplying an endpoint alone does not enable work.
 
 For a prepared deployment, export the required variables in the shell and run
 `scripts/pyfinder continuous` from the **PyFinder checkout**. The same
-variables are read by the installed `pyfinder continuous` process inside the
-container. The host launcher forwards these six named variables, plus the optional
-`PYFINDER_ALERT_CONFIG` path, to a newly created container. Invalid explicitly supplied values fail at process startup,
+variables are read by the installed workflow process inside the container. The
+host launcher forwards these six named variables, plus the optional
+`PYFINDER_ALERT_CONFIG` path, to a newly created container. For a playback
+invocation it forwards explicitly supplied values to that command inside the
+existing container, allowing `PYFINDER_ALERT_CONFIG=''` to suppress mail for
+that playback without changing continuous operation. Invalid explicitly supplied
+values fail at process startup,
 even when disabled; required endpoint and input-directory checks apply when
-enabled. Validation occurs before listener or persistence resources are opened.
+enabled. Validate these settings before starting calculation work.
 
-A running or stopped container retains the environment with which it was created.
-If an explicitly supplied variable differs, the host launcher refuses to start or
+For continuous startup, a running or stopped container retains the environment
+with which it was created. If an explicitly supplied variable differs, the host
+launcher refuses to start or
 preserve it under a misleading new configuration. It reports the variable name
 without printing either value. It never recreates a container automatically.
 Omitted variables preserve the existing container's settings. Deliberate changes
@@ -328,9 +337,24 @@ are not silently translated into ShakeMap configuration selections. Existing
 legacy modules remain retained; removed commented call sequences are preserved
 in [the legacy manager reference](../legacy/manager-downstream-reference.md).
 
-Playback and on-demand are not automatically enabled by these settings. They
-retain their existing isolation and do not use the operational scheduler database.
-Experimental external execution and its retention policy remain separate work.
+Playback composes the same submission, bounded regional-to-global recovery,
+monitoring, evidence capture, and notification services as continuous operation.
+It uses its own retained database and evidence, never the operational scheduler
+database. A completed local schedule requires the configured calculation chain
+to finish; an uncertain acceptance or interrupted calculation is not success.
+Retained unknown or interrupted work is not automatically resubmitted by a new
+playback invocation. A new deliberate invocation recalculates the selected
+public IDs using the normal overwrite policy once earlier caller ownership has
+been released. Shared caller ownership protects each calculation through final
+evidence capture, including across independent playback and continuous databases.
+A conflicting owner is a visible failure before POST; it does not trigger another
+FinDer attempt. Uncertain acceptance or interrupted ownership retains its marker
+and names the owning database for inspection. Do not delete an ownership marker
+or its lock file to force replacement while external work remains unresolved.
+
+`--full-schedule --fast` changes each event's due-time spacing to two minutes.
+It does not change nominal calculation IDs, service polling, retries, or provider
+scientific behavior. See [playback commands](../README.md#playback).
 
 ## Verification
 

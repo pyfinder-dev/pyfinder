@@ -63,6 +63,7 @@ class ShakeMapWorkflow:
         ):
             raise ValueError("db_path must name a persistent filesystem database")
 
+        self.database_path = os.path.abspath(database_path)
         self.client = client
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(database_path, check_same_thread=False)

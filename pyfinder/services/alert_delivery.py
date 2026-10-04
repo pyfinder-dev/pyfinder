@@ -179,6 +179,13 @@ class AlertService:
                     )
                 self.logger.info("Terminal alert execution=%s state=%s", row["execution_id"], result["state"])
 
+    def delivery_states(self):
+        """Expose delivery outcomes without leaking recipients or message bodies."""
+        with self._lock:
+            return [row[0] for row in self._connection.execute(
+                "SELECT state FROM alert_deliveries ORDER BY rowid"
+            )]
+
     def retry_failed(self, execution_id, audience):
         """Explicitly retry only definite failure, never UNKNOWN or PARTIAL."""
         with self._lock, self._connection:

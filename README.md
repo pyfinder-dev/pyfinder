@@ -6,7 +6,8 @@ Python wrapper for the FinDer executable and its library.
 
 PyFinder acquires seismic observations, runs FinDer, and can submit its selected
 solution to a separate ShakeMap service. Continuous operation schedules event
-updates and reports their terminal outcomes by email when configured.
+updates and reports their terminal outcomes by email when configured. Playback
+runs selected event IDs through the same calculation and notification services.
 FinDer-backed workflows run inside the PyFinder application container.
 
 - [Installation and runtime](#installation-and-runtime)
@@ -44,29 +45,80 @@ configured application container, the installed workflow commands are:
 ```bash
 pyfinder continuous
 pyfinder playback --list
-pyfinder playback --event-id EVENT_ID
-pyfinder on-demand --event-id EVENT_ID
+pyfinder playback --event-ids EVENT_ID
+pyfinder playback --event-ids EVENT_ID_1 EVENT_ID_2 --full-schedule --fast
 ```
 
 These workflow commands require the runtime and dependencies prepared by the
-deployment guide. Playback selects predefined events; on-demand processes the
-specified event. Both keep their experimental state separate from the continuous
-scheduler database. Use the host launcher's corresponding commands to invoke
-these modes in an existing application container.
+deployment guide. Use the host launcher's corresponding commands to invoke
+playback in the existing application container; playback does not start a second
+container. It keeps its state separate from the continuous scheduler database.
+
+### Playback
+
+`pyfinder playback` uses the maintained list of event IDs. Supply one or more
+IDs with `--event-ids` to select other events; `--list` displays the maintained
+list without running calculations. Each attempt queries the configured providers
+and uses their priority-selected earthquake context, including for maintained
+events. It does not recreate historical observation availability.
+
+By default, each event gets one immediate execution of the full chain:
+acquisition, FinDer, ShakeMap, and configured terminal notification handling.
+`--full-schedule` adds the configured follow-ups, currently at 5, 15, 60, 180,
+360, 1440, and 2880 minutes after registration. `--fast` makes those follow-ups
+due two minutes apart, so the complete schedule is due at 0, 2, 4, 6, 8, 10,
+12, and 14 minutes for each event. It has no effect on a single-step schedule.
+
+Fast timing applies within each event; different events may be due together.
+It controls when work becomes eligible, not when FinDer finishes or the
+ShakeMap HTTP request is sent. Existing queueing, retry timing, and same-ID
+serialization still apply. Calculation IDs retain their nominal schedule step;
+logs distinguish that step from the actual due and execution times.
+
+Playback requires the ShakeMap configuration described below. It reports a
+missing prerequisite rather than treating FinDer-only execution as a completed
+full chain. Email follows the existing alert configuration. To run a manual
+calculation without sending email, explicitly disable alert configuration for
+that command, for example from the PyFinder checkout:
+
+```bash
+PYFINDER_ALERT_CONFIG='' scripts/pyfinder playback --event-ids EVENT_ID
+```
+
+Playback prints the path to its retained database:
+`runtime/pyfinder/state/playbacks/<command-trigger-UTC>/scheduled_queries.sqlite3`.
+Its captured alert evidence is stored in `alert-evidence/` beside that database.
+Use this invocation's database, rather than the continuous database, when
+inspecting playback delivery records with the command below.
+
+The command waits for the selected schedules and accepted ShakeMap jobs to settle.
+It returns zero for successful calculation chains with successful or deliberately
+suppressed email handling. Calculation failures, uncertain submissions, observation
+or evidence errors, and failed, blocked, unknown, or partial delivery produce a
+nonzero result; Ctrl+C returns 130. State is retained for inspection. A later
+playback invocation starts new work and does not resume or automatically replay
+previous uncertain submissions or messages. If another invocation still owns the
+same public calculation ID, playback reports that conflict before submitting it.
+An uncertain or interrupted owner can retain that protection after exit; inspect
+the named owner database rather than deleting the marker to force replacement.
+
+The public `on-demand`, singular `--event-id`, and `--test` options are removed.
+Use `playback --event-ids` for a specific event. `--verbosity` controls application
+logging; it does not change calculation behavior.
 
 ---
 
 ## Current execution boundaries
 
-Continuous operation can submit to the separate ShakeMap REST service and
-monitor its accepted jobs. This integration is disabled by default; it requires
+Continuous operation and playback use the same ShakeMap REST adapter to submit
+and monitor jobs. Continuous operation leaves it disabled by default; playback
+requires it for the full chain. Enabling the adapter requires
 an explicit endpoint and shared caller-owned input directory, supplied through
 the documented `PYFINDER_SHAKEMAP_*` environment variables. See the
 [adapter configuration and limitations](docs/shakemap-adapter.md).
 
 General product distribution is not provided by the adapter. Terminal email
 uses retained input and diagnostic evidence, configured separately below.
-Playback and on-demand do not activate the continuous ShakeMap workflow.
 Enabling the adapter does not validate regional data, establish network access
 or confirm delivery to an SMTP server.
 
@@ -213,7 +265,7 @@ bodies or recipient lists. If running the inspection command on the host,
 activate the project's Python environment and supply the corresponding absolute
 host database path. Do not point experimental tests at this operational database.
 
-Missing configuration suppresses delivery. Invalid configuration stops continuous
+Missing configuration suppresses delivery. Invalid configuration stops workflow
 startup; connection or authentication failure records a delivery failure without
 repeating scientific work. Validate the intended server and recipients before
 enabling operational mail. See [verification](docs/shakemap-adapter.md#verification)

@@ -155,7 +155,7 @@ class RuntimeContextTests(unittest.TestCase):
         )
 
     def test_experimental_modes_share_one_captured_trigger_directory(self):
-        for workflow in ("playback", "on-demand"):
+        for workflow in ("playback",):
             with self.subTest(workflow=workflow):
                 context = self.context(workflow)
                 root = context.service_root
@@ -180,7 +180,7 @@ class RuntimeContextTests(unittest.TestCase):
                     expected_directory / "paramws.log",
                 )
                 self.assertIsNone(context.listener_log_path)
-                self.assertIsNone(context.operational_database_path)
+                self.assertEqual(context.operational_database_path, root / "state/playbacks/20320405T060708.901234Z/scheduled_queries.sqlite3")
                 self.assertEqual(context.work_root, root / "playbacks")
 
     def test_log_destination_validation_matches_each_workflow(self):
@@ -194,10 +194,6 @@ class RuntimeContextTests(unittest.TestCase):
             "playback": (
                 "process_log_path",
                 "scheduler_log_path",
-                "paramws_log_path",
-            ),
-            "on-demand": (
-                "process_log_path",
                 "paramws_log_path",
             ),
         }
@@ -229,7 +225,7 @@ class RuntimeContextTests(unittest.TestCase):
     def test_separate_experimental_commands_get_separate_trigger_directories(self):
         first = self.context("playback", name="shared")
         second = self.context(
-            "on-demand",
+            "playback",
             name="shared",
             clock_time=self.clock_time + timedelta(microseconds=1),
         )
@@ -246,7 +242,7 @@ class RuntimeContextTests(unittest.TestCase):
         later_time = self.clock_time + timedelta(microseconds=1)
         clock_values = iter((self.clock_time, later_time))
         second = runtime.build_runtime_context(
-            "on-demand",
+            "playback",
             service_root=first.service_root,
             clock=lambda: next(clock_values),
         )
@@ -270,7 +266,7 @@ class RuntimeContextTests(unittest.TestCase):
         continuous = self.context("continuous").isolated_configuration(
             configuration
         )
-        on_demand = self.context("on-demand").isolated_configuration(
+        on_demand = self.context("playback").isolated_configuration(
             configuration
         )
 
@@ -283,14 +279,14 @@ class RuntimeContextTests(unittest.TestCase):
         )
         self.assertEqual(
             on_demand["finder-executable"]["output-root-folder"],
-            str(self.temporary_root / "on-demand/playbacks"),
+            str(self.temporary_root / "playback/playbacks"),
         )
         self.assertEqual(
             continuous["general"],
             configuration["general"],
         )
 
-    def test_playback_databases_are_independent_external_and_self_cleaning(self):
+    def test_playback_databases_are_independent_and_retained(self):
         first = self.context("playback", name="first")
         second = self.context("playback", name="second")
 
@@ -305,14 +301,12 @@ class RuntimeContextTests(unittest.TestCase):
                     (first, first_path),
                     (second, second_path),
                 ):
-                    with self.assertRaises(ValueError):
-                        database_path.resolve().relative_to(
-                            context.service_root.resolve()
-                        )
-            self.assertFalse(second_directory.exists())
+                    self.assertTrue(database_path.resolve().is_relative_to(context.state_directory.resolve()))
+                    self.assertNotEqual(database_path, context.state_directory / "scheduled_queries.sqlite3")
+            self.assertTrue(second_directory.exists())
             self.assertTrue(first_path.exists())
 
-        self.assertFalse(first_directory.exists())
+        self.assertTrue(first_directory.exists())
 
     def test_missing_or_unusable_runtime_fails_before_workflow_import(self):
         cases = []
@@ -530,13 +524,13 @@ class RuntimeContextTests(unittest.TestCase):
     def test_bootstrap_replaces_conflicting_environment_before_import(self):
         service_root = self.service_root("ordered")
         arguments = cli.build_parser().parse_args(
-            ["on-demand", "--event-id", "EVENT"]
+            ["playback", "--event-ids", "EVENT"]
         )
         workflow_callable = mock.Mock(return_value=19)
         module = SimpleNamespace(run_cli=workflow_callable)
 
         def importer(module_name):
-            self.assertEqual(module_name, "pyfinder.findermanager")
+            self.assertEqual(module_name, "pyfinder.playback")
             self.assertEqual(
                 os.environ["PARAMWS_LOG_FILE"],
                 str(observed_context[0].paramws_log_path),
@@ -603,7 +597,7 @@ print(json.dumps({
         outside_directory.mkdir()
 
         for index, workflow in enumerate(
-            ("continuous", "playback", "on-demand")
+            ("continuous", "playback", "playback")
         ):
             with self.subTest(workflow=workflow):
                 service_root = self.service_root(

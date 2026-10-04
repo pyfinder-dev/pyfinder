@@ -1,7 +1,7 @@
 """Apply the small continuous-process ShakeMap environment interface.
 
-These are deployment settings for the existing REST adapter. They do not select
-scientific profiles by geography or alter playback and on-demand execution.
+These are deployment settings for the existing REST adapter in continuous and
+playback operation. They do not select scientific profiles by geography.
 """
 
 from copy import deepcopy

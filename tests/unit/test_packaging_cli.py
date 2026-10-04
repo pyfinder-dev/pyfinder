@@ -296,7 +296,6 @@ threading.Thread.start = reject_operation
             ("--help",),
             ("continuous", "--help"),
             ("playback", "--help"),
-            ("on-demand", "--help"),
         ):
             with self.subTest(arguments=arguments):
                 result = subprocess.run(
@@ -321,22 +320,11 @@ threading.Thread.start = reject_operation
                 "required runtime directory does not exist: "
                 "/home/sysop/runtime/pyfinder",
             ),
-            (("on-demand",), "one of the arguments"),
-            (
-                ("on-demand", "--event-id", "EVENT", "--test"),
-                "not allowed with argument",
-            ),
-            (("on-demand", "--log-file", "anything"), "one of the arguments"),
-            (
-                (
-                    "on-demand",
-                    "--event-id",
-                    "EVENT",
-                    "--log-file",
-                    "anything",
-                ),
-                "unrecognized arguments: --log-file anything",
-            ),
+            (("on-demand",), "invalid choice"),
+            (("playback", "--test"), "unrecognized arguments: --test"),
+            (("playback", "--event-id", "EVENT"), "unrecognized arguments"),
+            (("playback", "--event-ids"), "expected at least one argument"),
+            (("playback", "--log-file", "anything"), "unrecognized arguments"),
         )
 
         for arguments, diagnostic in cases:
@@ -356,8 +344,8 @@ threading.Thread.start = reject_operation
         help_result = subprocess.run(
             [
                 os.fspath(script_path),
-                "on-demand",
-                "--event-id",
+                "playback",
+                "--event-ids",
                 "EVENT",
                 "--help",
             ],
@@ -408,7 +396,6 @@ with mock.patch("builtins.open", side_effect=guarded_open), \
         ["--help"],
         ["continuous", "--help"],
         ["playback", "--help"],
-        ["on-demand", "--help"],
     ):
         try:
             cli.main(arguments)
@@ -457,18 +444,39 @@ assert tuple(outside_directory.iterdir()) == ()
 
 
 class CommandDispatchTests(unittest.TestCase):
-    def test_invalid_on_demand_grammar_stops_before_bootstrap(self):
+    def test_playback_defaults_and_explicit_options_reach_workflow_unchanged(self):
+        parser = cli.build_parser()
+        defaults = parser.parse_args(["playback"])
+        self.assertIsNone(defaults.event_ids)
+        self.assertFalse(defaults.full_schedule)
+        self.assertFalse(defaults.fast)
+        self.assertFalse(defaults.list_events)
+        self.assertEqual(defaults.verbosity, "INFO")
+
+        selected = parser.parse_args([
+            "playback", "--event-ids", "one", "two", "--full-schedule",
+            "--fast", "--verbosity", "debug",
+        ])
+        self.assertEqual(selected.event_ids, ["one", "two"])
+        self.assertTrue(selected.full_schedule)
+        self.assertTrue(selected.fast)
+        self.assertEqual(selected.verbosity, "DEBUG")
+
+        workflow = mock.Mock(return_value=0)
+        cli.dispatch(
+            selected,
+            bootstrap=lambda _workflow: "runtime",
+            importer=lambda _module: SimpleNamespace(run_cli=workflow),
+        )
+        workflow.assert_called_once_with(selected, runtime_context="runtime")
+
+    def test_invalid_playback_and_retired_grammar_stop_before_bootstrap(self):
         cases = (
             ["on-demand"],
-            ["on-demand", "--event-id", "EVENT", "--test"],
-            ["on-demand", "--log-file", "anything"],
-            [
-                "on-demand",
-                "--event-id",
-                "EVENT",
-                "--log-file",
-                "anything",
-            ],
+            ["playback", "--test"],
+            ["playback", "--event-id", "EVENT"],
+            ["playback", "--event-ids"],
+            ["playback", "--log-file", "anything"],
         )
         for arguments in cases:
             with self.subTest(arguments=arguments), mock.patch.object(
@@ -487,7 +495,7 @@ class CommandDispatchTests(unittest.TestCase):
                 bootstrap.assert_not_called()
                 importer.assert_not_called()
 
-    def test_on_demand_help_succeeds_before_bootstrap(self):
+    def test_playback_help_succeeds_before_bootstrap(self):
         with mock.patch.object(
             cli,
             "bootstrap_runtime",
@@ -495,7 +503,7 @@ class CommandDispatchTests(unittest.TestCase):
             io.StringIO()
         ):
             with self.assertRaises(SystemExit) as raised:
-                cli.main(["on-demand", "--event-id", "EVENT", "--help"])
+                cli.main(["playback", "--event-ids", "EVENT", "--help"])
 
         self.assertEqual(raised.exception.code, 0)
         bootstrap.assert_not_called()
@@ -521,12 +529,6 @@ class CommandDispatchTests(unittest.TestCase):
                 "playback",
                 ["playback"],
                 "pyfinder.playback",
-                "run_cli",
-            ),
-            (
-                "on-demand",
-                ["on-demand", "--event-id", "EVENT"],
-                "pyfinder.findermanager",
                 "run_cli",
             ),
         )
@@ -605,10 +607,10 @@ class RetiredStartupScriptTests(unittest.TestCase):
 
         self.assertIn("pyfinder continuous", readme)
         self.assertIn("pyfinder playback --list", readme)
-        self.assertIn("pyfinder on-demand --event-id EVENT_ID", readme)
+        self.assertIn("pyfinder playback --event-ids EVENT_ID", readme)
         self.assertIn("pyfinder application container", compact)
         self.assertIn("../pyfinder-deploy/README.md", readme)
-        self.assertIn("separate shakemap rest service", compact)
+        self.assertIn("separate shakemap service", compact)
         self.assertIn("disabled by default", compact)
         self.assertIn("general product distribution is not provided", compact)
         self.assertIn("does not validate regional data", compact)

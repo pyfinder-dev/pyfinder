@@ -362,7 +362,6 @@ class HostLauncherTests(unittest.TestCase):
         commands = (
             ("continuous",),
             ("playback", "--list"),
-            ("on-demand", "--test"),
             ("status",),
             ("logs",),
             ("stop",),
@@ -532,15 +531,15 @@ class HostLauncherTests(unittest.TestCase):
             ],
         )
 
-    def test_playback_and_on_demand_forward_arguments_through_one_exec(self):
+    def test_playback_forwards_arguments_through_one_exec(self):
         cases = (
             (
                 "playback",
-                ("--event-id", "event-one", "event-two", "--list"),
+                ("--event-ids", "event-one", "event-two", "--list"),
             ),
             (
-                "on-demand",
-                ("--event-id", "event-three", "--verbosity", "DEBUG"),
+                "playback",
+                ("--event-ids", "event-three", "--full-schedule", "--fast", "--verbosity", "DEBUG"),
             ),
         )
         for workflow, forwarded in cases:
@@ -566,10 +565,35 @@ class HostLauncherTests(unittest.TestCase):
                     any(record[0] == "mkdir" for record in self.records())
                 )
 
-    def test_on_demand_preserves_exact_docker_exec_failure_status(self):
+    def test_retired_on_demand_is_rejected_without_docker_access(self):
+        result = self.run_launcher("on-demand", "--event-id", "event-one")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsupported command: on-demand", result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_playback_forwards_only_explicit_allowed_environment_names(self):
         result = self.run_launcher(
-            "on-demand",
-            "--event-id",
+            "playback", "--event-ids", "event-one",
+            FAKE_CONTAINER_STATE="running",
+            PYFINDER_SHAKEMAP_ENABLED="true",
+            PYFINDER_SHAKEMAP_URL="http://service:8080",
+            PYFINDER_ALERT_CONFIG="",
+            PYFINDER_SHAKEMAP_SECRET="never-forward-this-value",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lifecycle_records(self.records()), [[
+            "docker", "exec",
+            "--env", "PYFINDER_SHAKEMAP_ENABLED",
+            "--env", "PYFINDER_SHAKEMAP_URL",
+            "--env", "PYFINDER_ALERT_CONFIG",
+            CONTAINER_NAME, "pyfinder", "playback", "--event-ids", "event-one",
+        ]])
+        self.assertNotIn("never-forward-this-value", str(self.records()))
+
+    def test_playback_preserves_exact_docker_exec_failure_status(self):
+        result = self.run_launcher(
+            "playback",
+            "--event-ids",
             "event-failure",
             "--verbosity",
             "DEBUG",
@@ -585,8 +609,8 @@ class HostLauncherTests(unittest.TestCase):
                 "exec",
                 CONTAINER_NAME,
                 "pyfinder",
-                "on-demand",
-                "--event-id",
+                "playback",
+                "--event-ids",
                 "event-failure",
                 "--verbosity",
                 "DEBUG",
@@ -612,12 +636,12 @@ class HostLauncherTests(unittest.TestCase):
                 },
             ),
         )
-        for workflow in ("playback", "on-demand"):
+        for workflow in ("playback",):
             for label, overrides in cases:
                 with self.subTest(workflow=workflow, state=label):
                     result = self.run_launcher(
                         workflow,
-                        "--event-id",
+                        "--event-ids",
                         "event-one",
                         **overrides,
                     )
@@ -772,11 +796,7 @@ COMP_WORDS=(pyfinder playback "")
 COMP_CWORD=2
 _pyfinder_completion
 printf '%s\n' "${COMPREPLY[@]}"
-COMP_WORDS=(pyfinder on-demand "")
-COMP_CWORD=2
-_pyfinder_completion
-printf '%s\n' "${COMPREPLY[@]}"
-COMP_WORDS=(pyfinder on-demand --verbosity "")
+COMP_WORDS=(pyfinder playback --verbosity "")
 COMP_CWORD=3
 _pyfinder_completion
 printf '%s\n' "${COMPREPLY[@]}"
@@ -796,15 +816,15 @@ printf '%s\n' "${COMPREPLY[@]}"
             {
                 "continuous",
                 "playback",
-                "on-demand",
                 "status",
                 "logs",
                 "stop",
                 "help",
                 "--help",
-                "--event-id",
+                "--event-ids",
                 "--list",
-                "--test",
+                "--full-schedule",
+                "--fast",
                 "--verbosity",
                 "DEBUG",
                 "INFO",
@@ -813,6 +833,7 @@ printf '%s\n' "${COMPREPLY[@]}"
                 "CRITICAL",
             }.issubset(candidates)
         )
+        self.assertTrue({"on-demand", "--event-id", "--test"}.isdisjoint(candidates))
         self.assertEqual(self.records(), [])
 
     def test_zsh_completion_loads_and_exposes_commands_and_options(self):
@@ -831,10 +852,7 @@ _pyfinder
 words=(pyfinder playback "")
 CURRENT=3
 _pyfinder
-words=(pyfinder on-demand "")
-CURRENT=3
-_pyfinder
-words=(pyfinder on-demand --verbosity "")
+words=(pyfinder playback --verbosity "")
 CURRENT=4
 _pyfinder
 '''
@@ -853,15 +871,15 @@ _pyfinder
             {
                 "continuous",
                 "playback",
-                "on-demand",
                 "status",
                 "logs",
                 "stop",
                 "help",
                 "--help",
-                "--event-id",
+                "--event-ids",
                 "--list",
-                "--test",
+                "--full-schedule",
+                "--fast",
                 "--verbosity",
                 "DEBUG",
                 "INFO",
@@ -870,6 +888,7 @@ _pyfinder
                 "CRITICAL",
             }.issubset(candidates)
         )
+        self.assertTrue({"on-demand", "--event-id", "--test"}.isdisjoint(candidates))
         self.assertEqual(self.records(), [])
 
 

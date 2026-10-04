@@ -98,8 +98,8 @@ class ShakeMapSettingsTests(unittest.TestCase):
         with self.assertRaises(RuntimeBootstrapError):
             continuous_shakemap_configuration(pyfinderconfig, environment=environment)
 
-    def test_other_workflow_dispatch_does_not_read_continuous_settings(self):
-        for command in (["playback", "--list"], ["on-demand", "--event-id", "test"]):
+    def test_dispatch_leaves_settings_validation_to_workflow_composition(self):
+        for command in (["playback", "--list"], ["playback", "--event-ids", "test"]):
             target = mock.Mock(return_value=0)
             module = mock.Mock(run_cli=target)
             with mock.patch.dict("os.environ", {"PYFINDER_SHAKEMAP_ENABLED": "invalid"}):

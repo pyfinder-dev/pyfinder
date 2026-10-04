@@ -31,11 +31,6 @@ _WORKFLOW_TARGETS = {
         "run_cli",
         True,
     ),
-    "on-demand": _WorkflowTarget(
-        "pyfinder.findermanager",
-        "run_cli",
-        True,
-    ),
 }
 
 
@@ -63,35 +58,44 @@ def build_parser():
 
     playback_parser = subparsers.add_parser(
         "playback",
-        help="Replay one or more predefined EMSC alerts.",
+        help="Run selected or predefined events through the full workflow.",
+        description=(
+            "Run one immediate calculation per event through FinDer, ShakeMap, "
+            "and configured notification handling. Omit --event-ids to use "
+            "the predefined event list. --full-schedule includes all follow-ups. "
+            "Provider requests use data available at execution time."
+        ),
+        # Reject the retired singular option instead of accepting it as an
+        # abbreviation of --event-ids. The installed help is the public grammar.
+        allow_abbrev=False,
     )
     playback_parser.add_argument(
-        "--event-id",
+        "--event-ids",
         nargs="+",
-        help="Replay only the specified predefined event identifiers.",
+        metavar="ID",
+        help="Provider event identifiers to process (default: predefined list).",
+    )
+    playback_parser.add_argument(
+        "--full-schedule",
+        action="store_true",
+        help="Run all configured follow-ups instead of one immediate calculation.",
+    )
+    playback_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Make each event's follow-ups due two minutes apart while retaining "
+            "their nominal schedule identities; no timing effect without "
+            "--full-schedule. Execution limits still apply."
+        ),
     )
     playback_parser.add_argument(
         "--list",
         action="store_true",
         dest="list_events",
-        help="List the predefined playback events and exit.",
+        help="List the predefined playback events and exit without calculations.",
     )
-
-    on_demand_parser = subparsers.add_parser(
-        "on-demand",
-        help="Process one event identifier on demand.",
-    )
-    event_source = on_demand_parser.add_mutually_exclusive_group(required=True)
-    event_source.add_argument(
-        "--event-id",
-        help="Event identifier to query and process.",
-    )
-    event_source.add_argument(
-        "--test",
-        action="store_true",
-        help="Use the configured test event identifier.",
-    )
-    on_demand_parser.add_argument(
+    playback_parser.add_argument(
         "--verbosity",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
         default="INFO",

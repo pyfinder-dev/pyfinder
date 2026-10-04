@@ -63,11 +63,11 @@ class ManagerShakeMapHandoffTests(unittest.TestCase):
         with self.assertRaises(EventContextError):
             manager.prepare_shakemap(make_solution())
 
-    def test_on_demand_retains_existing_zero_delay_identity(self):
+    def test_provider_backed_schedule_keeps_nominal_delay_identity(self):
         manager = self.manager()
         manager.entry_kind = FinDerManager.ON_DEMAND
         identity, _ = manager.prepare_shakemap(make_solution())
-        self.assertEqual(identity, "earthquake_t00000")
+        self.assertEqual(identity, "earthquake_t00005")
 
 
 class PreparedShakeMapInputsTests(unittest.TestCase):

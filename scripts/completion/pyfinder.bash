@@ -8,20 +8,17 @@ _pyfinder_completion() {
     fi
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "continuous playback on-demand status logs stop help --help" -- "$current_word") )
+        COMPREPLY=( $(compgen -W "continuous playback status logs stop help --help" -- "$current_word") )
         return
     fi
 
     workflow="${COMP_WORDS[1]}"
     case "$workflow" in
         playback)
-            COMPREPLY=( $(compgen -W "--event-id --list" -- "$current_word") )
-            ;;
-        on-demand)
             if [[ "$previous_word" == "--verbosity" ]]; then
                 COMPREPLY=( $(compgen -W "DEBUG INFO WARNING ERROR CRITICAL" -- "$current_word") )
             else
-                COMPREPLY=( $(compgen -W "--event-id --test --verbosity" -- "$current_word") )
+                COMPREPLY=( $(compgen -W "--event-ids --full-schedule --fast --list --verbosity" -- "$current_word") )
             fi
             ;;
         *)

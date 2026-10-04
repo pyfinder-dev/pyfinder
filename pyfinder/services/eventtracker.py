@@ -74,6 +74,10 @@ class EventTracker:
         self.logger = logger
         logger.info("EventTracker logger set successfully.")
 
+    def status_counts(self):
+        """Expose invocation progress without deleting terminal evidence."""
+        return self._db.status_counts()
+
     def get_due_events(self, service):
         """Fetch events that are due for querying for a given service."""
         return self._db.fetch_due_events(service=service)

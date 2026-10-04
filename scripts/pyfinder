@@ -27,8 +27,9 @@ readonly SERVICE_ROOT="${RUNTIME_ROOT}/pyfinder"
 readonly CONTAINER_RUNTIME="/home/sysop/runtime"
 readonly CONTAINER_USER="1000:1000"
 
-# Forward only documented continuous settings, including the private email config path. Docker reads their values
-# from this process environment, so credentials accidentally placed in a rejected
+# Forward only documented workflow settings, including the private email
+# config path. Docker reads their values from this process environment, so
+# credentials accidentally placed in a rejected
 # URL are not copied into command arguments or launcher diagnostics.
 readonly SHAKEMAP_ENVIRONMENT=(
     PYFINDER_SHAKEMAP_ENABLED
@@ -49,13 +50,12 @@ usage() {
         "Commands:" \
         "  continuous            Start or preserve continuous operation" \
         "  playback [ARGS...]    Run playback in the existing container" \
-        "  on-demand [ARGS...]   Run an on-demand calculation in the container" \
         "  status                Report canonical container state" \
         "  logs                  Show canonical container logs" \
         "  stop                  Stop, but never remove, the canonical container" \
         "  help, --help          Show this help" \
         "" \
-        "Continuous ShakeMap settings (environment; disabled by default):" \
+        "Workflow ShakeMap settings (environment; continuous disabled by default):" \
         "  PYFINDER_SHAKEMAP_ENABLED=true|false" \
         "  PYFINDER_SHAKEMAP_URL, PYFINDER_SHAKEMAP_INPUT_DIRECTORY" \
         "  PYFINDER_SHAKEMAP_CONFIGURATION (global)" \
@@ -269,7 +269,7 @@ run_additional_process() {
     local workflow="$1"
     shift
 
-    # Playback and on-demand run inside the continuous container so they cannot
+    # Playback runs inside the continuous container so it cannot
     # accidentally create another service instance.
     query_container_presence
     if [[ "$CONTAINER_PRESENT" != "true" ]]; then
@@ -279,7 +279,21 @@ run_additional_process() {
     if [[ "$CONTAINER_RUNNING" != "true" ]]; then
         fail "${CONTAINER_NAME} is stopped; start continuous operation first"
     fi
-    exec docker exec "$CONTAINER_NAME" pyfinder "$workflow" "$@"
+
+    # Explicit playback overrides belong to this additional process only. This
+    # lets verification disable email without recreating the continuous service.
+    # Omitted settings inherit the container environment; empty values remain
+    # explicit overrides. Pass names only, so secrets never appear in argv.
+    local variable
+    local -a environment_arguments=()
+    for variable in "${SHAKEMAP_ENVIRONMENT[@]}"; do
+        if [[ -n "${!variable+x}" ]]; then
+            environment_arguments+=(--env "$variable")
+        fi
+    done
+    exec docker exec \
+        ${environment_arguments[@]+"${environment_arguments[@]}"} \
+        "$CONTAINER_NAME" pyfinder "$workflow" "$@"
 }
 
 report_status() {
@@ -348,7 +362,7 @@ case "$command_name" in
         require_docker
         run_continuous
         ;;
-    playback|on-demand)
+    playback)
         require_docker
         run_additional_process "$command_name" "$@"
         ;;

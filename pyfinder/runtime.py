@@ -11,7 +11,7 @@ import tempfile
 
 
 SERVICE_ROOT = Path("/home/sysop/runtime/pyfinder")
-_WORKFLOWS = frozenset(("continuous", "playback", "on-demand"))
+_WORKFLOWS = frozenset(("continuous", "playback"))
 
 
 class RuntimeBootstrapError(RuntimeError):
@@ -104,33 +104,15 @@ class RuntimeContext:
 
     @contextmanager
     def playback_database(self):
-        """Own one playback-only SQLite location outside mounted state."""
-        if self.workflow != "playback":
-            raise RuntimeBootstrapError(
-                "only playback processes may allocate a synthetic database"
-            )
+        """Retain this invocation's schedules, remote acceptance and mail state.
 
-        temporary_directory = tempfile.TemporaryDirectory(
-            prefix="pyfinder-playback-"
-        )
-        try:
-            database_path = (
-                Path(temporary_directory.name) / "scheduled_queries.sqlite3"
-            )
-            try:
-                database_path.resolve().relative_to(
-                    self.service_root.resolve()
-                )
-            except ValueError:
-                pass
-            else:
-                raise RuntimeBootstrapError(
-                    "playback database must remain outside the mounted "
-                    "service root: {0}".format(database_path)
-                )
-            yield database_path
-        finally:
-            temporary_directory.cleanup()
+        A later playback gets a different directory and never reopens this
+        database. Unknown submissions therefore remain inspectable without
+        becoming an implicit request to replay them.
+        """
+        if self.workflow != "playback":
+            raise RuntimeBootstrapError("only playback may open a playback database")
+        yield self.operational_database_path
 
 
 def build_runtime_context(
@@ -214,7 +196,9 @@ def build_runtime_context(
                 )
             process_log_path = process_log_directory / "playback.log"
             listener_log_path = None
-            operational_database_path = None
+            playback_state = state_directory / "playbacks" / _trigger_component(trigger_time)
+            playback_state.mkdir(parents=True, exist_ok=False)
+            operational_database_path = playback_state / "scheduled_queries.sqlite3"
             work_root = playbacks_directory
     except OSError as error:
         raise RuntimeBootstrapError(

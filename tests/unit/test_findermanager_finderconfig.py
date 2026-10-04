@@ -352,7 +352,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         logger.critical.assert_called_once()
         self.assertIs(logger.critical.call_args.kwargs["exc_info"], True)
 
-    def exercise_executable_boundary(self, manager):
+    def exercise_executable_boundary(self, manager, expected_calculation_id="event-1_t00000"):
         provider_event = ProviderEventDouble()
         peak_motion = mock.Mock(name="peak_motion")
         peak_motion.get_event_data.return_value = provider_event
@@ -409,7 +409,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
         executable_instance.execute.assert_called_once_with(
             event_data=manager.event_context,
             amplitudes=merged_amplitudes,
-            augmented_event_id="event-1_t00000",
+            augmented_event_id=expected_calculation_id,
         )
         self.assertIsNot(manager.event_context, provider_event)
         return executable_type
@@ -456,7 +456,7 @@ class FinDerManagerFinderConfigTests(unittest.TestCase):
             "build_default_selector",
             return_value=selector,
         ):
-            self.exercise_executable_boundary(manager)
+            self.exercise_executable_boundary(manager, expected_calculation_id="event-1_t00099")
 
         selector.resolve.assert_called_once_with(latitude=-35.0, longitude=120.0)
 

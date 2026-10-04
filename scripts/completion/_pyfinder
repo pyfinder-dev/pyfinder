@@ -6,7 +6,7 @@ _pyfinder() {
     local -a candidates
 
     if (( CURRENT == 2 )); then
-        candidates=(continuous playback on-demand status logs stop help --help)
+        candidates=(continuous playback status logs stop help --help)
         compadd -- "${candidates[@]}"
         return
     fi
@@ -15,13 +15,10 @@ _pyfinder() {
     previous_word="${words[CURRENT-1]}"
     case "$workflow" in
         playback)
-            candidates=(--event-id --list)
-            ;;
-        on-demand)
             if [[ "$previous_word" == "--verbosity" ]]; then
                 candidates=(DEBUG INFO WARNING ERROR CRITICAL)
             else
-                candidates=(--event-id --test --verbosity)
+                candidates=(--event-ids --full-schedule --fast --list --verbosity)
             fi
             ;;
         *)

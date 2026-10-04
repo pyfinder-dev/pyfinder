@@ -50,9 +50,9 @@ pyfinderconfig = {
     },
 
     "shakemap": {
-        # External execution is enabled only by continuous-process composition.
-        # Set the real service URL and the caller-owned data/inputs mount before
-        # enabling it. Playback/on-demand retain their separate runtime policy.
+        # Continuous and playback use this separate ShakeMap service. Set the
+        # real service URL and caller-owned data/inputs mount before enabling
+        # it. Playback requires it because every execution runs the full chain.
         "service-enabled": False,
         "service-url": None,
         "request-timeout-seconds": 30.0,

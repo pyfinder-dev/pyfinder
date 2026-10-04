@@ -7,6 +7,7 @@ handles the results.
 """
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from functools import partial
 import logging
 import threading
@@ -18,6 +19,7 @@ from pyfinder.finderconfigs import (
 )
 from pyfinder.finderutils import FinderSolution
 from pyfinder.services.eventtracker import EventTracker
+from pyfinder.services.shakemap_inputs import ShakeMapCalculationBusy
 from pyfinder.services.querypolicy import build_service_policies
 from pyfinder.services.shakemap_diagnostics import (
     diagnostic as shakemap_diagnostic,
@@ -51,6 +53,8 @@ class FollowUpScheduler:
         shakemap_workflow=None,
         shakemap_inputs=None,
         shakemap_notifier=None,
+        provider_backed=False,
+        finder_options=None,
     ):
         # Supported process composition supplies the scheduler-owned logger.
         # Direct construction retains a non-file logger for library use.
@@ -92,10 +96,12 @@ class FollowUpScheduler:
 
             configuration = pyfinderconfig
         self.configuration = configuration
+        self.provider_backed = provider_backed
+        self.finder_options = dict(finder_options or {})
 
         # Only explicit process composition enables the external workflow.
-        # Playback uses this scheduler too, but its temporary database must not
-        # silently become the owner of jobs that outlive that process.
+        # Both continuous and playback owners retain their own database when
+        # accepted remote calculations outlive the local process.
         if (shakemap_workflow is None) != (shakemap_inputs is None):
             raise ValueError("ShakeMap workflow and caller-owned inputs are required together")
         self.shakemap_workflow = shakemap_workflow
@@ -347,6 +353,7 @@ class FollowUpScheduler:
             "test": False,
             "use_library": False,
         }
+        finder_options.update(getattr(self, "finder_options", {}))
         # The combined command line is retained only for the manager's current
         # logging boundary; the manager is still constructed with structured
         # options below.
@@ -365,6 +372,27 @@ class FollowUpScheduler:
             "current_delay": current_delay_time,
             "region": event_meta.get(EventTracker.Field.region),
         }
+
+        if getattr(self, "provider_backed", False):
+            # A fast schedule retains nominal delay names. Do not describe its
+            # next nominal stage as a wall-clock wait in downstream evidence.
+            solution_metadata.pop("minutes_until_next_update")
+            solution_metadata["nominal_next_delay"] = next_delay
+            solution_metadata["scheduled_for_utc"] = event_meta.get(
+                EventTracker.Field.next_query_time
+            )
+            # Assignment can precede worker start when the executor is busy.
+            # Record actual handler entry, rather than relabeling queue time.
+            solution_metadata["execution_started_at_utc"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            self.logger.info(
+                "Playback event=%s nominal_delay_minutes=%s due_at_utc=%s "
+                "execution_started_at_utc=%s",
+                event_id, current_delay_time,
+                solution_metadata["scheduled_for_utc"],
+                solution_metadata["execution_started_at_utc"],
+            )
 
         self.logger.info(
             "FinderManager will run for the scheduled delay for %s: %s minutes.",
@@ -403,11 +431,19 @@ class FollowUpScheduler:
                     finder_configuration=decision.configuration,
                 )
 
-            finder_manager = (
-                self._finder_manager_class.for_alert_context(
+            if getattr(self, "provider_backed", False):
+                # Playback deliberately starts with an event ID. Acquisition
+                # selects authoritative provider context inside this attempt;
+                # absent continuous alert context never enables this branch.
+                manager_arguments.pop("event_context")
+                manager_arguments.pop("context_diagnostic")
+                finder_manager = self._finder_manager_class.for_on_demand(
                     **manager_arguments
                 )
-            )
+            else:
+                finder_manager = self._finder_manager_class.for_alert_context(
+                    **manager_arguments
+                )
             finder_solution = finder_manager.run(event_id=event_id)
         except Exception as error:
             diagnostic = self._failure_diagnostic(
@@ -653,6 +689,13 @@ class FollowUpScheduler:
             try:
                 if request["base_url"] != workflow.client.base_url:
                     raise ValueError("Prepared ShakeMap request belongs to a different endpoint")
+                # This marker coordinates independent invocation databases,
+                # not just workers sharing this scheduler. Keep it through both
+                # a regional failure and its global recovery, until evidence is
+                # immutable. Unknown acceptance must retain it across exit.
+                self.shakemap_inputs.claim(
+                    calculation_id, link["attempt_id"], workflow.database_path,
+                )
                 with self.shakemap_inputs.submission(calculation_id, request["files"]):
                     submitted = workflow.submit(
                         attempt_id,
@@ -661,6 +704,14 @@ class FollowUpScheduler:
                         configuration=request["configuration"],
                         overwrite=request["overwrite"],
                     )
+            except ShakeMapCalculationBusy as error:
+                # A conflict is not failed acquisition and must not rerun
+                # FinDer. Its owning database remains the recovery authority.
+                self._terminally_fail_assigned_item(
+                    link["event_id"], link["service"], link["current_delay_time"],
+                    str(error),
+                )
+                workflow.finish_scheduled_attempt(link["attempt_id"])
             except Exception as error:
                 record = workflow.get(attempt_id)
                 if record is None or record["submission_state"] == "REJECTED":
@@ -679,6 +730,9 @@ class FollowUpScheduler:
                         workflow.finish_scheduled_attempt(link["attempt_id"])
                     else:
                         self._retry_rejected_shakemap(link, error)
+                    # No request was accepted. A definite rejection or a local
+                    # pre-submission failure cannot leave an active native job.
+                    self.shakemap_inputs.release(calculation_id, link["attempt_id"])
                 else:
                     blocked_ids.add(calculation_id)
                     self._log_shakemap(record)
@@ -780,6 +834,7 @@ class FollowUpScheduler:
         workflow.finish_scheduled_attempt(link["attempt_id"])
         workflow.clear_local_error(record["attempt_id"])
         self._shakemap_log_states.pop(record["attempt_id"], None)
+        self.shakemap_inputs.release(record["request"]["event_id"], link["attempt_id"])
 
     def _poll_shakemap_once(self):
         """Observe external jobs independently of discovery of new due work."""
@@ -823,6 +878,9 @@ class FollowUpScheduler:
                             record, final=True, final_outcome="INTERRUPTED",
                         )
                         workflow.clear_local_error(attempt_id)
+                        self.shakemap_inputs.release(
+                            record["request"]["event_id"], workflow.execution_for_attempt(attempt_id),
+                        )
                 except Exception as error:
                     # A lost read or local write is not a native FAILED result.
                     # Keep evidence/association and let the next pass observe
@@ -1195,6 +1253,78 @@ class FollowUpScheduler:
                         raise
                     continue
                 self._retain_future(future=future, identity=identity)
+
+    def run_until_complete(self, *, shutdown_event, interval_seconds=1):
+        """Finish selected playback work without discarding unresolved outcomes.
+
+        This loop deliberately includes future pending rows. A quiet worker
+        pool alone is not completion while later steps or native jobs remain.
+        Observation failures and ambiguous acceptance stop this invocation with
+        retained evidence; they never authorize another scientific submission.
+        Continuous operation keeps its existing run_forever behavior.
+        """
+        while not shutdown_event.is_set():
+            self.run_once()
+
+            # One monitor pass has bounded HTTP/SMTP operations. Observe it
+            # before checking final evidence and delivery state, so completion
+            # cannot race a terminal mail enqueue or native result capture.
+            monitor = self._monitor_future
+            if monitor is not None:
+                try:
+                    monitor.result()
+                except Exception:
+                    self.logger.exception("Playback downstream observation failed; state retained")
+                    return 1
+
+            with self._future_condition:
+                workers_active = bool(
+                    self._submitted_futures or self._futures_being_observed
+                )
+            if workers_active:
+                shutdown_event.wait(interval_seconds)
+                continue
+
+            workflow = self.shakemap_workflow
+            unresolved = workflow.unresolved() if workflow is not None else []
+            requires_attention = any(
+                record["submission_state"] != "ACCEPTED" or record["last_error"]
+                for record in unresolved
+            )
+            if requires_attention:
+                self.logger.error(
+                    "Playback requires attention: remote acceptance, observation or "
+                    "evidence remains unresolved. State is retained; no automatic replay."
+                )
+                return 1
+
+            counts = self.tracker.status_counts()
+            links = workflow.pending_scheduled_attempts() if workflow is not None else []
+            if counts.get("pending", 0) or unresolved or links:
+                shutdown_event.wait(interval_seconds)
+                continue
+
+            # A processing row with no worker or remote association indicates
+            # incomplete lifecycle persistence, never a successful empty queue.
+            states = []
+            if self.shakemap_notifier is not None:
+                states = self.shakemap_notifier.delivery_states()
+            if any(state in {"PENDING", "SENDING"} for state in states):
+                # A local worker may enqueue mail just after the observation
+                # pass drained it. Let the next bounded pass handle that intent
+                # before deciding the command outcome.
+                shutdown_event.wait(interval_seconds)
+                continue
+
+            success = (
+                bool(counts) and set(counts) == {"completed"}
+                and all(state in {"SENT", "SUPPRESSED"} for state in states)
+            )
+            self.logger.info("Playback calculation counts=%s; delivery states=%s", counts, states)
+            return 0 if success else 1
+
+        self.logger.warning("Playback interrupted; remaining schedules and remote state are retained")
+        return 130
 
     def run_forever(self, interval_seconds=10, shutdown_event=None):
         """ 

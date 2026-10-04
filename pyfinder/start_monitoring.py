@@ -93,36 +93,11 @@ def _cleanup_continuous_services(
     return failures
 
 
-def _build_shakemap_boundary(configuration, database_path):
-    """Build external resources only for explicitly enabled continuous operation."""
-    settings = configuration.get("shakemap", {})
-    enabled = settings.get("service-enabled", False)
-    if type(enabled) is not bool:
-        raise ValueError("shakemap.service-enabled must be a boolean")
-    if not enabled:
-        return None, None
-
-    from pyfinder.services.shakemap_client import ShakeMapClient
-    from pyfinder.services.shakemap_inputs import PreparedShakeMapInputs
-    from pyfinder.services.shakemap_workflow import ShakeMapWorkflow
-
-    client = ShakeMapClient(
-        settings.get("service-url"),
-        timeout=settings.get("request-timeout-seconds", 30.0),
-    )
-
-    # Validate settings before the listener is started or a scheduled item is
-    # assigned. Configuration is a service name, never a legacy local path or
-    # a FinDer profile inferred to be suitable for ShakeMap.
-    client.validate_submission(
-        "configuration-check", {},
-        configuration=settings.get("configuration", "global"),
-        overwrite=settings.get("overwrite", True),
-    )
-
-    inputs = PreparedShakeMapInputs(settings.get("input-directory"))
-    workflow = ShakeMapWorkflow(database_path, client)
-    return workflow, inputs
+# Keep this local name for callers that customize continuous startup in tests.
+from pyfinder.services.workflow_resources import (
+    build_shakemap_boundary as _build_shakemap_boundary,
+    build_notifier,
+)
 
 
 def start_services(*, runtime_context):
@@ -209,18 +184,9 @@ def start_services(*, runtime_context):
         }
         try:
             if workflow is not None or alert_settings is not None:
-                from pyfinder.services.alert_delivery import AlertService
-                from pyfinder.services.alert_evidence import EvidenceStore
-
-                # Canonical inputs live at shakemap/data/inputs. Evidence lives
-                # in caller-owned state and survives native same-ID overwrite.
-                service_root = (inputs.root.parent.parent if inputs is not None
-                                else runtime_context.service_root.parent / "shakemap")
-                notifier = AlertService(
-                    runtime_context.operational_database_path,
-                    EvidenceStore(runtime_context.state_directory / "alert-evidence", service_root),
-                    alert_settings,
-                    logger=scheduler_logger,
+                notifier = build_notifier(
+                    runtime_context, runtime_context.operational_database_path,
+                    inputs, alert_settings, scheduler_logger,
                 )
                 boundary["shakemap_notifier"] = notifier
 

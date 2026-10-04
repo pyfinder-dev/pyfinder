@@ -53,7 +53,7 @@ def installed_root(distribution_name, module):
 
 def assert_cli_help(pyfinder_command):
     """Exercise installed CLI help without dispatching a workflow."""
-    commands = ((), ("continuous",), ("playback",), ("on-demand",))
+    commands = ((), ("continuous",), ("playback",))
     for command in commands:
         completed = subprocess.run(
             [pyfinder_command, *command, "--help"],
@@ -64,6 +64,21 @@ def assert_cli_help(pyfinder_command):
         )
         require(completed.returncode == 0, completed.stderr)
         require("usage:" in completed.stdout.lower(), "CLI help was not rendered")
+
+        if command == ("playback",):
+            for option in ("--event-ids", "--full-schedule", "--fast", "--verbosity"):
+                require(option in completed.stdout, "missing playback option: " + option)
+
+    # A removed command must fail during parsing, before runtime bootstrap or
+    # provider construction. This probe never dispatches a scientific workflow.
+    rejected = subprocess.run(
+        [pyfinder_command, "on-demand", "--help"],
+        cwd="/home/sysop",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    require(rejected.returncode == 2, "retired on-demand command remains accepted")
 
 
 class ControlledEvent:
@@ -225,7 +240,8 @@ def main():
     import tornado
 
     import pyfinder
-    from pyfinder import cli, finderexec, findermanager
+    from pyfinder import cli, finderexec, findermanager, playback
+    from pyfinder.services import workflow_resources
     from pyfinder.finderconfigs import profiles
     from pyfinder.pyfinderconfig import pyfinderconfig
     from pyfinder.utils import customlogger
@@ -240,6 +256,8 @@ def main():
                 cli,
                 finderexec,
                 findermanager,
+                playback,
+                workflow_resources,
                 runtime,
                 EMSCFeltReportClient,
                 ESMShakeMapClient,
