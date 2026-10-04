@@ -100,3 +100,91 @@ def continuous_shakemap_configuration(configuration, *, environment=None):
         )
 
     return configured
+
+
+def check_configuration(configuration, *, environment=None, input_directory=None):
+    """Describe caller configuration without starting its operational runtime.
+
+    Deployment can supply the host path corresponding to its known shared
+    input mount. This substitutes only the location inspected by the existing
+    validator; it does not change submitted configuration or application state.
+    No service, provider, database, logger or SMTP connection is constructed.
+    """
+    from pyfinder.services.shakemap_diagnostics import regional_fallback_policy
+
+    checked_environment = dict(os.environ if environment is None else environment)
+    if input_directory is not None:
+        checked_environment["PYFINDER_SHAKEMAP_INPUT_DIRECTORY"] = str(input_directory)
+
+    report = {
+        "status": "blocked",
+        "scope": "caller configuration; no installed-image or native proof",
+        "checks": [],
+        "settings": {},
+        "fallback": regional_fallback_policy(),
+    }
+    try:
+        configured = continuous_shakemap_configuration(
+            configuration, environment=checked_environment,
+        )
+    except RuntimeBootstrapError as error:
+        # Validation errors identify documented setting names and requirements,
+        # never supplied URLs, credentials or arbitrary configuration contents.
+        report["checks"].append({
+            "name": "caller_settings",
+            "status": "blocked",
+            "reason": str(error),
+        })
+        return report
+
+    settings = configured["shakemap"]
+    report["settings"] = {
+        "enabled": settings.get("service-enabled", False),
+        "selected_configuration": settings.get("configuration", "global"),
+        "overwrite": settings.get("overwrite", True),
+        "input_directory": settings.get("input-directory"),
+        "request_timeout_seconds": settings.get("request-timeout-seconds", 30.0),
+    }
+    enabled = report["settings"]["enabled"]
+    report["status"] = "ready" if enabled else "blocked"
+    report["checks"].append({
+        "name": "caller_settings",
+        "status": report["status"],
+        "reason": (
+            "Caller settings pass static validation; native execution is unverified"
+            if enabled else
+            "ShakeMap integration is disabled; the required full chain is unavailable"
+        ),
+    })
+    return report
+
+
+def main(argv=None):
+    """Print read-only caller facts for deployment aggregation or direct use."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Inspect caller settings without bootstrap, Docker, network, "
+            "database writes, native calculations or email."
+        ),
+    )
+    parser.add_argument("--check", action="store_true", required=True)
+    parser.add_argument(
+        "--input-directory",
+        help="Host path for the deployment's known shared input mount",
+    )
+    arguments = parser.parse_args(argv)
+
+    from pyfinder.pyfinderconfig import pyfinderconfig
+
+    report = check_configuration(
+        pyfinderconfig, input_directory=arguments.input_directory,
+    )
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report["status"] == "ready" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

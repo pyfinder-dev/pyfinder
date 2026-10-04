@@ -2,6 +2,31 @@
 
 set -euo pipefail
 
+usage() {
+    cat <<'HELP'
+Usage: verify-pyfinder-image.sh [--help]
+
+Actively verify the installed pyfinder:dev image using the canonical
+pyfinder-docker container with network disabled and temporary runtime data.
+The canonical container must be absent. This command creates and removes its
+owned verification container and temporary files; it is not a read-only check.
+It does not run real provider requests, native FinDer/ShakeMap or SMTP delivery.
+
+Use the deployment repository's make check for read-only readiness diagnostics.
+HELP
+}
+
+# Resolve help and argument mistakes before inspecting Docker, creating
+# temporary files or installing cleanup traps that own operational resources.
+if [[ $# -eq 1 && ( "$1" == "--help" || "$1" == "-h" ) ]]; then
+    usage
+    exit 0
+fi
+if [[ $# -ne 0 ]]; then
+    printf 'verify-pyfinder-image: unexpected argument; use --help\n' >&2
+    exit 2
+fi
+
 # Keep interrupted-cleanup diagnostics visible when the active container check
 # has redirected its normal output to a temporary result file.
 exec 3>&2

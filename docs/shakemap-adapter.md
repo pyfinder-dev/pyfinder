@@ -431,3 +431,33 @@ Related old helper modules remain present.
 Regional files, data ownership, current Italy/Switzerland prerequisites and
 operator corrective actions are documented in the
 [configuration runbook](../../shakemap-docker/docs/configuration.md).
+
+
+### Read-only caller checks
+
+The deployment repository's `make check` reports caller settings alongside
+service and profile diagnostics. Its caller settings check can also be run
+from this checkout using the project's Python environment:
+
+```bash
+python -B -m pyfinder.services.shakemap_settings --check
+```
+
+When inspecting deployment settings from the host, pass `--input-directory`
+with the host path corresponding to the configured shared input mount. This
+changes only the path inspected by the check. It does not modify application
+configuration, create files, initialize the runtime, contact providers, invoke
+native software or send email. The JSON report is suitable for deployment
+aggregation. A blocked result exits with code 1; a static settings pass exits 0.
+A pass is not proof of the installed image or a successful native calculation.
+
+The report keeps the selected profile explicit. A diagnosed missing or invalid
+region never changes the submitted profile: PyFinder submits that region first
+and attempts `global` only after the exact accepted calculation confirms an
+eligible regional configuration failure. Service health, name discovery and a
+static settings check do not guarantee global fallback success.
+
+`scripts/verify-pyfinder-image.sh --help` describes the separate active image
+verification. Running that helper without arguments creates and removes an
+owned canonical verification container and temporary runtime, with its network
+disabled. Help and invalid arguments perform no Docker or temporary-file work.

@@ -7,6 +7,37 @@ log messages itself, or choose scientific profiles from an earthquake location.
 import re
 
 
+REGIONAL_MATERIALIZATION_FAILURE = "configuration_materialization_failed"
+NATIVE_CONFIGURATION_FAILURE = "native_configuration_failed"
+NATIVE_CONFIGURATION_ORIGINS = frozenset({
+    "native_config_validation", "native_model_reference", "native_configured_module",
+})
+
+
+def regional_fallback_policy():
+    """Expose policy for diagnostics without predicting a native outcome.
+
+    The runtime decision below still requires exact accepted sequence and
+    provenance evidence. Listing a missing profile never authorizes skipping
+    its first submission or guarantees that a later global calculation works.
+    """
+    return {
+        "requested_configuration_first": True,
+        "requires_confirmed_regional_failure": True,
+        "eligible_failure_codes": [
+            REGIONAL_MATERIALIZATION_FAILURE, NATIVE_CONFIGURATION_FAILURE,
+        ],
+        "requires_matching_accepted_sequence_and_configuration": True,
+        "global_success": "unverified",
+        "explanation": (
+            "The requested region is submitted first. Only its confirmed eligible "
+            "configuration failure permits one explicit global submission. "
+            "Transport errors, uncertain acceptance, observation errors and "
+            "unrelated native failures do not permit fallback."
+        ),
+    }
+
+
 def safe_text(value, limit=600):
     """Bound external text and remove credentials, controls and private paths."""
     if not isinstance(value, str):
@@ -119,16 +150,14 @@ def regional_configuration_failure(record):
     # file is missing/unreadable. Copy/space errors and generic native exits do
     # not prove a regional configuration fault and cannot authorize replacement.
     native_configuration_error = failure.get("configuration_error")
-    if (failure.get("code") == "native_configuration_failed"
+    if (failure.get("code") == NATIVE_CONFIGURATION_FAILURE
             and isinstance(native_configuration_error, dict)
-            and native_configuration_error.get("origin") in {
-                "native_config_validation", "native_model_reference", "native_configured_module",
-            }
+            and native_configuration_error.get("origin") in NATIVE_CONFIGURATION_ORIGINS
             and isinstance(native_configuration_error.get("reference"), str)
             and native_configuration_error.get("exception_type")):
         return True
     return (
-        failure.get("code") == "configuration_materialization_failed"
+        failure.get("code") == REGIONAL_MATERIALIZATION_FAILURE
         and materialization.get("materialized") is False
         and profile_failure.get("type") == "NativeProfileError"
         and profile_failure.get("stage") == "regional_sources"
