@@ -105,10 +105,18 @@ def start_services(*, runtime_context):
     global _launcher_logger, _listener, _listener_thread, _scheduler
     global _shutdown_event
 
-    # Resolve explicit deployment settings before constructing the listener or
-    # opening its database. The packaged configuration stays unchanged.
+    # Create the owned process log before interpreting settings, so migration
+    # warnings remain visible after startup. Listener/database construction still
+    # waits for validation; the packaged configuration stays unchanged.
+    logger = file_logger(
+        runtime_context.process_log_path,
+        module_name="ServiceLauncher",
+        rotate=True,
+        overwrite=False,
+    )
     application_configuration = continuous_shakemap_configuration(
-        runtime_context.isolated_configuration(pyfinderconfig)
+        runtime_context.isolated_configuration(pyfinderconfig),
+        warning_handler=logger.warning,
     )
 
     # Keep the existing private alert config outside the scientific settings:
@@ -117,12 +125,6 @@ def start_services(*, runtime_context):
     from pyfinder.services.alert import configured_alert_settings
     alert_settings = configured_alert_settings()
 
-    logger = file_logger(
-        runtime_context.process_log_path,
-        module_name="ServiceLauncher",
-        rotate=True,
-        overwrite=False,
-    )
     listener_logger = file_logger(
         runtime_context.listener_log_path,
         module_name="SeismicListener",

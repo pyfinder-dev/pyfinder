@@ -159,7 +159,6 @@ class HostLauncherTests(unittest.TestCase):
             "continuous",
             PYFINDER_SHAKEMAP_ENABLED="true",
             PYFINDER_SHAKEMAP_URL="http://service:8080",
-            PYFINDER_SHAKEMAP_CONFIGURATION="regional",
             PYFINDER_SHAKEMAP_SECRET="do-not-forward",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -167,10 +166,48 @@ class HostLauncherTests(unittest.TestCase):
         forwarded = [run[index + 1] for index, value in enumerate(run) if value == "--env"]
         self.assertEqual(forwarded, [
             "PYFINDER_SHAKEMAP_ENABLED", "PYFINDER_SHAKEMAP_URL",
-            "PYFINDER_SHAKEMAP_CONFIGURATION",
         ])
         self.assertNotIn("http://service:8080", run)
         self.assertNotIn("do-not-forward", run)
+
+    def test_obsolete_profile_override_warns_and_does_not_block_or_forward(self):
+        for command in ("continuous", "playback"):
+            with self.subTest(command=command):
+                self.record_file.unlink(missing_ok=True)
+                result = self.run_launcher(
+                    command,
+                    PYFINDER_SHAKEMAP_CONFIGURATION="private-obsolete-value",
+                    FAKE_CONTAINER_STATE="running" if command == "playback" else "missing",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(
+                    "PYFINDER_SHAKEMAP_CONFIGURATION is obsolete and ignored",
+                    result.stderr,
+                )
+                self.assertNotIn("private-obsolete-value", result.stdout + result.stderr)
+                operation = "run" if command == "continuous" else "exec"
+                dispatch = next(row for row in self.records() if row[:2] == ["docker", operation])
+                self.assertNotIn("PYFINDER_SHAKEMAP_CONFIGURATION", dispatch)
+
+    def test_retired_override_keeps_help_and_container_management_available(self):
+        for command in ("--help", "status", "logs", "stop"):
+            with self.subTest(command=command):
+                self.record_file.unlink(missing_ok=True)
+                result = self.run_launcher(
+                    command,
+                    PYFINDER_SHAKEMAP_CONFIGURATION="italy",
+                    FAKE_CONTAINER_STATE="running",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if command == "--help":
+                    self.assertIn("Usage:", result.stdout)
+                    self.assertEqual(self.records(), [])
+                elif command in {"logs", "stop"}:
+                    self.assertTrue(
+                        any(row[:2] == ["docker", command] for row in self.records())
+                    )
+                else:
+                    self.assertIn("pyfinder-docker", result.stdout)
 
     def test_existing_container_refuses_changed_setting_without_printing_values(self):
         for state in ("running", "stopped"):

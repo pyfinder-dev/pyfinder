@@ -109,6 +109,33 @@ logging; it does not change calculation behavior.
 
 ---
 
+## Regional ShakeMap selection
+
+PyFinder selects a ShakeMap service profile for each calculation from the selected
+FinDer solution's location. Configure `shakemap["regional-configurations"]` in
+`pyfinder/pyfinderconfig.py` with country codes and service profile names. The
+catalog is independent of FinDer computational configurations; several FinDer
+profiles may use one ShakeMap profile, and countries may share a service name.
+
+A unique country polygon match uses its mapped profile. Unmapped countries,
+offshore locations, unidentified countries and ambiguous shared borders use
+`global`. Invalid coordinates or missing/broken packaged country data fail the
+preparation instead of silently selecting global. A mapped unavailable regional
+profile is attempted first; only a confirmed eligible configuration failure
+allows one explicit global recovery. Both outcomes remain visible.
+
+The process-wide `PYFINDER_SHAKEMAP_CONFIGURATION` override and old local-profile
+settings are obsolete: PyFinder warns and ignores them without interrupting
+startup. Remove them when convenient; they no longer select a profile. Runtime
+warnings are retained in the owning continuous or playback process log, and the
+source settings check includes them as separate warning metadata. Invalid
+supported settings still fail validation. The service's per-request configuration field
+and manual `shake-in-docker` selection remain supported. See the
+[adapter guide](docs/shakemap-adapter.md) and
+[deployment migration instructions](../pyfinder-deploy/README.md#upgrade-the-caller)
+for coordinated settings/image updates. Existing prepared requests retain their
+selected profile and inputs across restart; this change requires no queue reset.
+
 ## Observation providers and USGS event association
 
 ESM ShakeMap and RRSM Peak Motion remain enabled by default. To include USGS

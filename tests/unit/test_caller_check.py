@@ -27,7 +27,6 @@ class CallerCheckTests(unittest.TestCase):
             "PYFINDER_SHAKEMAP_ENABLED": "true",
             "PYFINDER_SHAKEMAP_URL": "http://service.invalid:8080",
             "PYFINDER_SHAKEMAP_INPUT_DIRECTORY": "/container/mount/inputs",
-            "PYFINDER_SHAKEMAP_CONFIGURATION": "switzerland",
         }
 
     def test_host_mount_mapping_preserves_requested_profile_without_runtime_writes(self):
@@ -43,7 +42,7 @@ class CallerCheckTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["settings"]["selected_configuration"], "switzerland")
+        self.assertEqual(result["settings"]["regional_configurations"]["ch"], "switzerland")
         self.assertEqual(result["settings"]["input_directory"], str(self.inputs))
         self.assertEqual(configuration, before)
         self.assertEqual(list(self.inputs.iterdir()), [])
@@ -56,6 +55,21 @@ class CallerCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertFalse(result["settings"]["enabled"])
         self.assertIn("disabled", result["checks"][0]["reason"])
+
+    def test_obsolete_settings_are_nonblocking_warning_metadata(self):
+        configured = deepcopy(pyfinderconfig)
+        configured["shakemap"]["configuration"] = "private-obsolete-value"
+        environment = self.environment | {
+            "PYFINDER_SHAKEMAP_CONFIGURATION": "private-obsolete-value",
+        }
+        result = check_configuration(
+            configured,
+            environment=environment,
+            input_directory=self.inputs,
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(len(result["warnings"]), 2)
+        self.assertNotIn("private-obsolete-value", json.dumps(result))
 
     def test_invalid_endpoint_never_echoes_credentials(self):
         environment = {
@@ -92,6 +106,7 @@ class CallerCheckTests(unittest.TestCase):
     def test_component_cli_returns_json_without_creating_runtime(self):
         environment = dict(os.environ)
         environment.update(self.environment)
+        environment["PYFINDER_SHAKEMAP_CONFIGURATION"] = "private-obsolete-value"
         completed = subprocess.run(
             [sys.executable, "-B", "-m", "pyfinder.services.shakemap_settings",
              "--check", "--input-directory", str(self.inputs)],
@@ -100,7 +115,9 @@ class CallerCheckTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
-        self.assertEqual(result["settings"]["selected_configuration"], "switzerland")
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertNotIn("private-obsolete-value", completed.stdout + completed.stderr)
+        self.assertEqual(result["settings"]["regional_configurations"]["ch"], "switzerland")
         self.assertEqual(list(self.inputs.iterdir()), [])
 
 

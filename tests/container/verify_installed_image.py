@@ -379,6 +379,27 @@ def main():
         "ParamWS created a log outside its mounted process directory",
     )
 
+    # Exercise real packaged geography outside a source checkout. This verifies
+    # installed resources and regional routing, not native country-model science.
+    from pyfinder.utils.regionlocator import RegionLocator
+    from pyfinder.findermanager import FinDerManager
+    from pyfinder.finderutils import FinderEvent, FinderSolution
+    from pyfinder.services.shakemap_settings import validate_regional_configurations
+
+    validate_regional_configurations(pyfinderconfig["shakemap"])
+    locator = RegionLocator()
+    require(locator.get_region(48.8, 2.3) == "fr", "France country identifier failed")
+    require(locator.get_region(0, -140) is None, "offshore location did not use global coverage")
+    manager = object.__new__(FinDerManager)
+    manager.configuration = deepcopy(pyfinderconfig)
+    manager.logger = logging.getLogger("installed-regional-selection")
+    for latitude, longitude, expected in ((46.8, 8.2, "switzerland"), (42, 13, "italy")):
+        solution = FinderSolution(event=FinderEvent(latitude=latitude, longitude=longitude))
+        for finder_name in ("independent-model-a", "independent-model-b"):
+            manager.finder_configuration_name = finder_name
+            require(manager.select_shakemap_configuration(solution) == expected,
+                    "installed ShakeMap selection followed the wrong regional catalog")
+
     event_data = ControlledEvent()
     observations = [
         {

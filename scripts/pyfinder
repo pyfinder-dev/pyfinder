@@ -35,7 +35,6 @@ readonly SHAKEMAP_ENVIRONMENT=(
     PYFINDER_SHAKEMAP_ENABLED
     PYFINDER_SHAKEMAP_URL
     PYFINDER_SHAKEMAP_INPUT_DIRECTORY
-    PYFINDER_SHAKEMAP_CONFIGURATION
     PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS
     PYFINDER_SHAKEMAP_OVERWRITE
     PYFINDER_ALERT_CONFIG
@@ -58,7 +57,6 @@ usage() {
         "Workflow ShakeMap settings (environment; continuous disabled by default):" \
         "  PYFINDER_SHAKEMAP_ENABLED=true|false" \
         "  PYFINDER_SHAKEMAP_URL, PYFINDER_SHAKEMAP_INPUT_DIRECTORY" \
-        "  PYFINDER_SHAKEMAP_CONFIGURATION (global)" \
         "  PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS (30)" \
         "  PYFINDER_SHAKEMAP_OVERWRITE=true|false (true)" \
         "  PYFINDER_ALERT_CONFIG: optional mounted existing email JSON path; empty disables mail" \
@@ -351,6 +349,14 @@ fi
 
 command_name="$1"
 shift
+
+# Warn when starting workflow work, but never apply the obsolete override.
+# Its name is absent from the forwarding whitelist above. Management and help
+# remain available without migration prerequisites.
+if [[ ( "$command_name" == continuous || "$command_name" == playback ) &&
+      "${PYFINDER_SHAKEMAP_CONFIGURATION+x}" == x ]]; then
+    printf '%s\n' 'pyfinder: warning: PYFINDER_SHAKEMAP_CONFIGURATION is obsolete and ignored; remove it and configure regional-configurations in PyFinder' >&2
+fi
 
 case "$command_name" in
     help|--help)

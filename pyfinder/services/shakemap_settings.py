@@ -5,7 +5,10 @@ playback operation. They do not select scientific profiles by geography.
 """
 
 from copy import deepcopy
+from collections.abc import Mapping
+import logging
 import os
+import re
 
 from pyfinder.runtime import RuntimeBootstrapError
 from pyfinder.services.shakemap_client import ShakeMapClient
@@ -18,25 +21,87 @@ ENVIRONMENT_SETTINGS = {
     "PYFINDER_SHAKEMAP_ENABLED": "service-enabled",
     "PYFINDER_SHAKEMAP_URL": "service-url",
     "PYFINDER_SHAKEMAP_INPUT_DIRECTORY": "input-directory",
-    "PYFINDER_SHAKEMAP_CONFIGURATION": "configuration",
     "PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS": "request-timeout-seconds",
     "PYFINDER_SHAKEMAP_OVERWRITE": "overwrite",
 }
 
 
-def continuous_shakemap_configuration(configuration, *, environment=None):
+def validate_regional_configurations(settings):
+    """Validate routing syntax without importing geography or contacting a service."""
+    # Check the catalog itself before examining entries. This keeps an absent
+    # routing policy distinct from a malformed country code or service name.
+    catalog = settings.get("regional-configurations")
+    if not isinstance(catalog, Mapping) or not catalog:
+        raise ValueError(
+            "shakemap.regional-configurations must be a nonempty "
+            "country-to-service-profile mapping"
+        )
+
+    if type(settings.get("overwrite", True)) is not bool:
+        raise ValueError("PYFINDER_SHAKEMAP_OVERWRITE must be a boolean")
+
+    for country, profile in catalog.items():
+        if (
+            not isinstance(country, str)
+            or re.fullmatch(r"[a-z]{2}", country) is None
+        ):
+            raise ValueError(
+                "shakemap.regional-configurations requires lowercase "
+                "two-letter country codes"
+            )
+
+        ShakeMapClient.validate_submission(
+            "configuration-check",
+            {},
+            configuration=profile,
+            overwrite=settings.get("overwrite", True),
+        )
+
+    return catalog
+
+
+def continuous_shakemap_configuration(
+    configuration,
+    *,
+    environment=None,
+    warning_handler=None,
+):
     """Copy, override and validate settings without persistence or HTTP calls.
 
-    Absent variables preserve packaged defaults. Explicit mistakes are rejected
-    even while disabled; missing endpoint and input root are required only when
-    enabled. Never include supplied values in startup errors, since a malformed
+    Absent variables preserve packaged defaults. Recognized obsolete settings
+    warn and are ignored; invalid supported settings remain errors even while
+    disabled. An endpoint and input root are required only when enabled. Never
+    include supplied values in warnings or startup errors, since a malformed
     URL may contain credentials that the adapter will refuse.
     """
     if environment is None:
         environment = os.environ
 
+    # Runtime owners pass their process logger; the source check collects the
+    # same messages as metadata. Obsolete values are never applied or displayed.
+    warn = warning_handler or logging.getLogger(__name__).warning
+    if "PYFINDER_SHAKEMAP_CONFIGURATION" in environment:
+        warn(
+            "PYFINDER_SHAKEMAP_CONFIGURATION is obsolete and ignored; "
+            "remove it and use shakemap.regional-configurations"
+        )
+
     configured = deepcopy(configuration)
     settings = configured.setdefault("shakemap", {})
+
+    for key in (
+        "configuration",
+        "use-region-specific-shakemap-config",
+        "region-specific-shakemap-config",
+        "country-borders-shapefile",
+    ):
+        if key in settings:
+            settings.pop(key)
+            warn(
+                f"shakemap.{key} is obsolete and ignored; remove it and use "
+                "shakemap.regional-configurations"
+            )
+
     for variable, key in ENVIRONMENT_SETTINGS.items():
         if variable not in environment:
             continue
@@ -77,21 +142,19 @@ def continuous_shakemap_configuration(configuration, *, environment=None):
         ),
         "supply a positive finite number of seconds",
     )
-    validate(
-        "PYFINDER_SHAKEMAP_CONFIGURATION / PYFINDER_SHAKEMAP_OVERWRITE",
-        lambda: ShakeMapClient.validate_submission(
-            "configuration-check", {},
-            configuration=settings.get("configuration", "global"),
-            overwrite=settings.get("overwrite", True),
-        ),
-        "supply a safe configuration name and boolean overwrite setting",
-    )
+
+    try:
+        validate_regional_configurations(settings)
+    except (TypeError, ValueError) as error:
+        raise RuntimeBootstrapError(str(error)) from error
+
     if enabled or "PYFINDER_SHAKEMAP_URL" in environment:
         validate(
             "PYFINDER_SHAKEMAP_URL",
             lambda: ShakeMapClient(settings.get("service-url")),
             "supply an absolute HTTP(S) URL without credentials, query or fragment",
         )
+
     if enabled or "PYFINDER_SHAKEMAP_INPUT_DIRECTORY" in environment:
         validate(
             "PYFINDER_SHAKEMAP_INPUT_DIRECTORY",
@@ -121,11 +184,14 @@ def check_configuration(configuration, *, environment=None, input_directory=None
         "scope": "caller configuration; no installed-image or native proof",
         "checks": [],
         "settings": {},
+        "warnings": [],
         "fallback": regional_fallback_policy(),
     }
     try:
         configured = continuous_shakemap_configuration(
-            configuration, environment=checked_environment,
+            configuration,
+            environment=checked_environment,
+            warning_handler=report["warnings"].append,
         )
     except RuntimeBootstrapError as error:
         # Validation errors identify documented setting names and requirements,
@@ -140,7 +206,9 @@ def check_configuration(configuration, *, environment=None, input_directory=None
     settings = configured["shakemap"]
     report["settings"] = {
         "enabled": settings.get("service-enabled", False),
-        "selected_configuration": settings.get("configuration", "global"),
+        "regional_configurations": dict(settings["regional-configurations"]),
+        "default_configuration": "global",
+        "coordinate_source": "selected_finder_solution",
         "overwrite": settings.get("overwrite", True),
         "input_directory": settings.get("input-directory"),
         "request_timeout_seconds": settings.get("request-timeout-seconds", 30.0),

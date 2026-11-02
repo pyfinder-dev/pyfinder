@@ -51,6 +51,8 @@ class Manager(FinDerManager):
         self.solution = make_solution()
 
     def for_alert_context(self, **arguments):
+        self.configuration = arguments["configuration"]
+        self.logger = arguments["logger"]
         self.event_context = arguments["event_context"]
         self.metadata = arguments["metadata"]
         return self
@@ -84,7 +86,7 @@ class SchedulerShakeMapTests(unittest.TestCase):
             tracker=tracker,
             service_policies={"RRSM": RRSMQueryPolicy()},
             finder_config_selector=SelectorDouble(),
-            configuration={"shakemap": {"configuration": "global", "overwrite": True}},
+            configuration={"shakemap": {"regional-configurations": {"ch": "global"}, "overwrite": True}},
             logger=logging.getLogger("test.scheduler.shakemap"),
             shakemap_workflow=workflow,
             shakemap_inputs=PreparedShakeMapInputs(self.inputs),
@@ -114,6 +116,24 @@ class SchedulerShakeMapTests(unittest.TestCase):
 
     def response(self, status="SUCCESS", sequence=42):
         return 200, detail(row(sequence=sequence, status=status), event_id=CALCULATION_ID)
+
+    def test_prepared_before_post_keeps_profile_and_bytes_after_catalog_change(self):
+        scheduler, _transport = self.scheduler()
+        self.seed(scheduler)
+        with patch.object(scheduler, "_dispatch_shakemap_submissions"):
+            scheduler.run_once()
+        token = scheduler.tracker.get_execution_id("event-1", "RRSM", 5)
+        before = scheduler.shakemap_workflow.prepared_scheduled_submissions(attempt_ids=[token])
+        self.assertEqual(before[0]["configuration"], "global")
+        self.assertIsNone(scheduler.shakemap_workflow.get(token))
+        scheduler.configuration["shakemap"]["regional-configurations"]["ch"] = "switzerland"
+        manager = scheduler._finder_manager_class
+        with patch.object(manager, "select_shakemap_configuration", side_effect=AssertionError("must retain preparation")), \
+             patch.object(manager, "prepare_shakemap", side_effect=AssertionError("must retain bytes")), \
+             patch.object(scheduler, "_dispatch_shakemap_submissions"):
+            scheduler._submit_shakemap(manager, manager.solution, "event-1", "RRSM", 5,
+                                       self.meta(scheduler), scheduler.service_policies["RRSM"])
+        self.assertEqual(scheduler.shakemap_workflow.prepared_scheduled_submissions(attempt_ids=[token]), before)
 
     def test_success_waits_for_matching_job_even_when_no_work_is_due(self):
         scheduler, transport = self.scheduler(
@@ -346,14 +366,14 @@ class SchedulerShakeMapTests(unittest.TestCase):
         self.assertEqual(_build_shakemap_boundary({}, None), (None, None))
         settings = {
             "service-enabled": True, "service-url": "http://fake:8000",
-            "input-directory": str(self.inputs), "configuration": "italy",
+            "input-directory": str(self.inputs), "regional-configurations": {"ch": "italy"},
         }
         workflow, inputs = _build_shakemap_boundary({"shakemap": settings}, self.path)
         self.addCleanup(workflow.close)
         self.assertIsInstance(inputs, PreparedShakeMapInputs)
         self.assertEqual(workflow.unresolved(), [])
         with self.assertRaises(ValueError):
-            _build_shakemap_boundary({"shakemap": {**settings, "configuration": "old/path"}}, self.path)
+            _build_shakemap_boundary({"shakemap": {**settings, "regional-configurations": {"ch": "old/path"}}}, self.path)
 
 
 if __name__ == "__main__":

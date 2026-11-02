@@ -2,10 +2,12 @@
 
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
+from copy import deepcopy
 import logging
 from pathlib import Path
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -14,6 +16,7 @@ from pyfinder.eventcontext import EventContext
 from pyfinder.services.eventtracker import EventTracker
 from pyfinder.services.querypolicy import RRSMQueryPolicy
 from pyfinder.services.scheduler import FollowUpScheduler
+from pyfinder.runtime import RuntimeBootstrapError
 from tests.unit import test_scheduler_shakemap as fixtures
 from tests.unit.test_shakemap_client import acknowledgement, detail, row
 
@@ -25,6 +28,29 @@ class PlaybackScheduleTests(unittest.TestCase):
         self.tracker = EventTracker(str(Path(self.directory.name) / "playback.sqlite"))
         self.addCleanup(self.tracker.close)
         self.now = datetime(2032, 1, 2, 3, 4, tzinfo=timezone.utc)
+
+    def test_obsolete_warning_is_retained_in_playback_process_log(self):
+        root = Path(self.directory.name)
+        context = SimpleNamespace(
+            process_log_path=root / "playback.log",
+            scheduler_log_path=root / "scheduler.log",
+            isolated_configuration=deepcopy,
+        )
+        arguments = SimpleNamespace(
+            list_events=False,
+            event_ids=["example"],
+            verbosity="INFO",
+        )
+        with mock.patch.dict("os.environ", {
+            "PYFINDER_SHAKEMAP_CONFIGURATION": "private-obsolete-value",
+            "PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS": "invalid",
+        }):
+            with self.assertRaisesRegex(RuntimeBootstrapError, "TIMEOUT_SECONDS"):
+                playback.run_cli(arguments, runtime_context=context)
+
+        text = context.process_log_path.read_text()
+        self.assertIn("PYFINDER_SHAKEMAP_CONFIGURATION is obsolete and ignored", text)
+        self.assertNotIn("private-obsolete-value", text)
 
     def rows(self):
         return self.tracker._db.conn.execute(
@@ -187,6 +213,8 @@ class PlaybackProviderSchedulerTests(unittest.TestCase):
 
         class ProviderManager(fixtures.Manager):
             def for_on_demand(self, **arguments):
+                self.configuration = arguments["configuration"]
+                self.logger = arguments["logger"]
                 self.metadata = arguments["metadata"]
                 self.event_context = EventContext(
                     "event-1", 46, 7, 5.5, 8, "2026-08-06T09:55:00Z",

@@ -541,15 +541,22 @@ class FollowUpScheduler:
                 if workflow.get(attempt_id) is not None:
                     return
 
-                calculation_id, files = manager.prepare_shakemap(solution)
-                settings = self.configuration.get("shakemap", {})
-                workflow.prepare_scheduled_submission(
-                    attempt_id,
-                    calculation_id,
-                    files,
-                    configuration=settings.get("configuration", "global"),
-                    overwrite=settings.get("overwrite", True),
-                )
+                # Preparation may have been committed just before interruption,
+                # without a POST record yet. Its exact profile and bytes remain
+                # authoritative even if today's regional catalog has changed.
+                if not workflow.prepared_scheduled_submissions(
+                    attempt_ids=[attempt_id],
+                ):
+                    calculation_id, files = manager.prepare_shakemap(solution)
+                    settings = self.configuration.get("shakemap", {})
+
+                    workflow.prepare_scheduled_submission(
+                        attempt_id,
+                        calculation_id,
+                        files,
+                        configuration=manager.select_shakemap_configuration(solution),
+                        overwrite=settings.get("overwrite", True),
+                    )
             except Exception as error:
                 self._record_failed_attempt(
                     event_id=event_id,
@@ -557,7 +564,9 @@ class FollowUpScheduler:
                     current_delay_time=delay,
                     event_meta=event_meta,
                     policy=policy,
-                    diagnostic=self._failure_diagnostic("ShakeMap preparation failed", error),
+                    diagnostic=self._failure_diagnostic(
+                        "ShakeMap preparation failed", error,
+                    ),
                 )
                 workflow.finish_scheduled_attempt(attempt_id)
                 return

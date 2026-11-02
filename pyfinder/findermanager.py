@@ -14,7 +14,7 @@ import sys
 import logging
 import json
 from collections.abc import Mapping
-from copy import deepcopy
+from copy import copy, deepcopy
 import math
 
 from pyfinder.eventcontext import (
@@ -255,6 +255,34 @@ class FinDerManager:
             return self.process_file(file_path)
         else:
             raise ValueError("An event_id or file_path must be provided")
+
+    def select_shakemap_configuration(self, solution):
+        """Select a service profile from the location actually sent to ShakeMap."""
+        from pyfinder.utils.regionlocator import RegionLocator
+
+        if not isinstance(solution, FinderSolution):
+            raise ValueError(
+                "ShakeMap configuration selection requires a FinderSolution"
+            )
+
+        # Getter normalization must not mutate the selected scientific result.
+        # Its location, rather than an upstream alert or FinDer profile name,
+        # is also the location written into the exported event.xml.
+        event = copy(solution.get_event())
+        country = RegionLocator(logger=self.logger).get_region(
+            event.get_latitude(),
+            event.get_longitude(),
+        )
+
+        selected = self.configuration["shakemap"]["regional-configurations"].get(
+            country, "global"
+        )
+        self.logger.info(
+            "ShakeMap selected-solution country=%s configuration=%s",
+            country or "unmatched",
+            selected,
+        )
+        return selected
 
     def prepare_shakemap(self, solution):
         """Prepare the selected result for an explicit scheduler submission.

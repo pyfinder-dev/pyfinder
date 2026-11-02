@@ -81,7 +81,7 @@ class RegionalRecoveryTests(unittest.TestCase):
             (202, acknowledgement(event_id=CALCULATION_ID, requested_configuration="italy", overwrite=overwrite)),
             *responses,
         )
-        scheduler.configuration["shakemap"].update(configuration="italy", overwrite=overwrite)
+        scheduler.configuration["shakemap"].update(**{"regional-configurations": {"ch": "italy"}, "overwrite": overwrite})
         notifier = EvidenceDouble()
         notifier.scheduler = scheduler
         scheduler.shakemap_notifier = notifier

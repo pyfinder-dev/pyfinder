@@ -273,14 +273,21 @@ is a startup error, not permission to stop after FinDer.
 | `PYFINDER_SHAKEMAP_ENABLED` | `false` | Exactly `true` or `false` |
 | `PYFINDER_SHAKEMAP_URL` | unset | Required when enabled; absolute HTTP(S) URL without credentials, query, or fragment |
 | `PYFINDER_SHAKEMAP_INPUT_DIRECTORY` | unset | Required when enabled; existing absolute resolved caller-visible input directory |
-| `PYFINDER_SHAKEMAP_CONFIGURATION` | `global` | Initial explicit service configuration; bounded caller recovery only |
 | `PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS` | `30` | Positive finite number of seconds per request |
 | `PYFINDER_SHAKEMAP_OVERWRITE` | `true` | Exactly `true` or `false`; false archives the preceding calculation |
+
+`PYFINDER_SHAKEMAP_CONFIGURATION` and recognized old local-profile application
+settings are obsolete and ignored with a warning. They are not aliases for new
+settings, and their values never affect routing. Removing them is recommended;
+their presence alone does not interrupt startup. Continuous and playback warnings
+are written into their owned process logs. Source-check JSON carries warnings
+separately from required validation findings, without printing obsolete values.
+Supported fields and the required routing catalog still undergo normal validation.
 
 For a prepared deployment, export the required variables in the shell and run
 `scripts/pyfinder continuous` from the **PyFinder checkout**. The same
 variables are read by the installed workflow process inside the container. The
-host launcher forwards these six named variables, plus the optional
+host launcher forwards these five named variables, plus the optional
 `PYFINDER_ALERT_CONFIG` path, to a newly created container. For a playback
 invocation it forwards explicitly supplied values to that command inside the
 existing container, allowing `PYFINDER_ALERT_CONFIG=''` to suppress mail for
@@ -330,10 +337,21 @@ entries are refused untouched. Products, service state, and datasets are not
 modified by this helper. All callers that write these inputs must respect this
 ownership; unrelated REST writers do not participate in the PyFinder lock.
 
-Each service request has an explicit caller-selected configuration, defaulting
-to `global`. The service has no fallback; the caller recovery described above
-uses a distinct API submission. Legacy local regional paths and the FinDer profile name
-are not silently translated into ShakeMap configuration selections. Existing
+Each automatic request selects a service profile from the selected FinDer
+solution's location, matching the coordinates exported in `event.xml`.
+`shakemap.regional-configurations` maps country codes to service profile names.
+FinDer computational profiles remain independent: Swiss Alpine and Foreland may
+both use `switzerland`, and mapping values need not be unique. The packaged
+country polygons use boundary-inclusive coverage. Offshore/unmatched locations,
+unknown country identifiers and ambiguous shared-country borders use `global`;
+invalid coordinates or broken country resources fail rather than silently
+selecting a model. A nonempty catalog is required.
+
+The service executes exactly that requested profile. It has no fallback; caller
+recovery uses a distinct API submission. A missing service profile is still
+requested regionally first; discovery never substitutes `global`.
+Prepared requests retain their original profile and bytes after restart, even
+if the current routing catalog changes. Existing
 legacy modules remain retained; removed commented call sequences are preserved
 in [the legacy manager reference](../legacy/manager-downstream-reference.md).
 
@@ -451,8 +469,10 @@ native software or send email. The JSON report is suitable for deployment
 aggregation. A blocked result exits with code 1; a static settings pass exits 0.
 A pass is not proof of the installed image or a successful native calculation.
 
-The report keeps the selected profile explicit. A diagnosed missing or invalid
-region never changes the submitted profile: PyFinder submits that region first
+The report exposes the regional routing catalog, fixed global default and
+selected-solution coordinate source. It does not claim an event has selected a
+profile before a calculation exists. A diagnosed missing or invalid region never
+changes the submitted profile: PyFinder submits that region first
 and attempts `global` only after the exact accepted calculation confirms an
 eligible regional configuration failure. Service health, name discovery and a
 static settings check do not guarantee global fallback success.

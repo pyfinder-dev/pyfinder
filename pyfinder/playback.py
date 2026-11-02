@@ -122,7 +122,8 @@ def run_cli(arguments, *, runtime_context):
         overwrite=False,
     )
     configuration = continuous_shakemap_configuration(
-        runtime_context.isolated_configuration(pyfinderconfig)
+        runtime_context.isolated_configuration(pyfinderconfig),
+        warning_handler=process_logger.warning,
     )
     if not configuration.get("shakemap", {}).get("service-enabled", False):
         raise RuntimeBootstrapError(

@@ -64,7 +64,6 @@ pyfinderconfig = {
         "service-url": None,
         "request-timeout-seconds": 30.0,
         "input-directory": None,
-        "configuration": "global",
         "overwrite": True,
 
         # Use amplitude from FinDer output, or use the original amplitudes
@@ -72,25 +71,31 @@ pyfinderconfig = {
         # web services are used.
         "use-amplitude-from-finder-output": False,
 
-        # Retained settings for the legacy local ShakeMap utilities. Continuous
-        # REST execution does not download these profiles or use this mapping;
-        # its caller-selected service configuration is named above.
-        "use-region-specific-shakemap-config": False,
-        "region-specific-shakemap-config": {          
-            "al": "extern/shakemap-conf-eu/config/albania",
-            "hr": "extern/shakemap-conf-eu/config/croatia",
-            "gr": "extern/shakemap-conf-eu/config/greece",
-            "ro": "extern/shakemap-conf-eu/config/romania",
-            "ch": "extern/shakemap-conf-eu/config/switzerland",
-            "be": "extern/shakemap-conf-eu/config/belgium",
-            "fr": "extern/shakemap-conf-eu/config/france",
-            "it": "extern/shakemap-conf-eu/config/italy",
-            "si": "extern/shakemap-conf-eu/config/slovenia"
+        # Map a location-lookup code (key) to a ShakeMap service profile (value).
+        # The current locator returns lowercase two-letter codes from the
+        # packaged country polygons, such as "ch", "it" and "de". Keys are not
+        # arbitrary region labels: they must match a code returned by that
+        # lookup. Validation checks the two-letter format, not code membership.
+        #
+        # Values are exact configuration names supplied by the ShakeMap service,
+        # not local paths or FinDer profile names. Several keys may share one
+        # value. Names must be nonempty UTF-8 basenames of at most 255 bytes,
+        # without "/" or control characters, and cannot be "." or "..".
+        #
+        # Keep this mapping nonempty. Valid locations with no mapped code use
+        # "global". This table does not define arbitrary region geometries or
+        # subregions; that is a limitation of the current country-based lookup.
+        "regional-configurations": {
+            "al": "albania",
+            "be": "belgium",
+            "hr": "croatia",
+            "fr": "france",
+            "gr": "greece",
+            "it": "italy",
+            "ro": "romania",
+            "si": "slovenia",
+            "ch": "switzerland",
         },
-
-        # Shapefile for country borders. Pre-downloaded from Natural Earth:
-        # https://www.naturalearthdata.com/http//www.naturalearthdata.com/download/110m/cultural/ne_110m_admin_0_countries.zip
-        "country-borders-shapefile": "extern/ne_110m_admin_0_countries/ne_110m_admin_0_countries.shp"
     },
 
     # Configuration for the Seismic Portal WebSocket

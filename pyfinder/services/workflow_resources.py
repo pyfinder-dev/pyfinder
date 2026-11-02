@@ -19,14 +19,10 @@ def build_shakemap_boundary(configuration, database_path):
         timeout=settings.get("request-timeout-seconds", 30.0),
     )
 
-    # Validate settings before the listener is started or a scheduled item is
-    # assigned. Configuration is a service name, never a legacy local path or
-    # a FinDer profile inferred to be suitable for ShakeMap.
-    client.validate_submission(
-        "configuration-check", {},
-        configuration=settings.get("configuration", "global"),
-        overwrite=settings.get("overwrite", True),
-    )
+    # Syntax validation stays lightweight. Country data is loaded lazily when
+    # a selected solution needs routing, independently of FinDer's profiles.
+    from pyfinder.services.shakemap_settings import validate_regional_configurations
+    validate_regional_configurations(settings)
 
     inputs = PreparedShakeMapInputs(settings.get("input-directory"))
     workflow = ShakeMapWorkflow(database_path, client)

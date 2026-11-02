@@ -30,7 +30,7 @@ class ShakeMapSettingsTests(unittest.TestCase):
         configured = continuous_shakemap_configuration(pyfinderconfig, environment={})
         self.assertEqual(configured, expected)
         self.assertFalse(configured["shakemap"]["service-enabled"])
-        configured["shakemap"]["configuration"] = "changed"
+        configured["shakemap"]["regional-configurations"]["ch"] = "changed"
         self.assertEqual(pyfinderconfig, expected)
 
     def test_enablement_reuses_global_and_overwrite_defaults_without_io(self):
@@ -41,7 +41,7 @@ class ShakeMapSettingsTests(unittest.TestCase):
                 pyfinderconfig, environment=self.enabled_environment()
             )
         self.assertTrue(configured["shakemap"]["service-enabled"])
-        self.assertEqual(configured["shakemap"]["configuration"], "global")
+        self.assertEqual(configured["shakemap"]["regional-configurations"]["ch"], "switzerland")
         self.assertTrue(configured["shakemap"]["overwrite"])
         database.assert_not_called()
         request.assert_not_called()
@@ -49,14 +49,13 @@ class ShakeMapSettingsTests(unittest.TestCase):
 
     def test_explicit_regional_timeout_and_archive_choice_survive_verbatim(self):
         environment = self.enabled_environment() | {
-            "PYFINDER_SHAKEMAP_CONFIGURATION": "switzerland",
             "PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS": "12.5",
             "PYFINDER_SHAKEMAP_OVERWRITE": "false",
         }
         settings = continuous_shakemap_configuration(
             pyfinderconfig, environment=environment
         )["shakemap"]
-        self.assertEqual(settings["configuration"], "switzerland")
+        self.assertEqual(settings["regional-configurations"]["ch"], "switzerland")
         self.assertEqual(settings["request-timeout-seconds"], 12.5)
         self.assertFalse(settings["overwrite"])
         self.assertEqual(settings["input-directory"], self.root)
@@ -66,7 +65,6 @@ class ShakeMapSettingsTests(unittest.TestCase):
             "PYFINDER_SHAKEMAP_ENABLED": ["", "True", "1"],
             "PYFINDER_SHAKEMAP_OVERWRITE": ["yes", "0"],
             "PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS": ["", "nan", "inf", "0", "-1"],
-            "PYFINDER_SHAKEMAP_CONFIGURATION": ["", "../global"],
             "PYFINDER_SHAKEMAP_INPUT_DIRECTORY": ["", "relative", self.root + "/missing"],
             "PYFINDER_SHAKEMAP_URL": ["", "ftp://host", "https://user:private-password@host"],
         }
@@ -87,6 +85,61 @@ class ShakeMapSettingsTests(unittest.TestCase):
             with self.subTest(missing=missing), self.assertRaises(RuntimeBootstrapError) as error:
                 continuous_shakemap_configuration(pyfinderconfig, environment=environment)
             self.assertIn(missing, str(error.exception))
+
+    def test_catalog_validation_allows_shared_profiles_and_rejects_incomplete_routing(self):
+        configured = deepcopy(pyfinderconfig)
+        configured["shakemap"]["regional-configurations"] = {"it": "shared", "ch": "shared"}
+        self.assertEqual(continuous_shakemap_configuration(configured, environment={}), configured)
+        for catalog in ({}, {"CH": "switzerland"}, {"ch": "../switzerland"}, None):
+            configured["shakemap"]["regional-configurations"] = catalog
+            with self.subTest(catalog=catalog), self.assertRaises(RuntimeBootstrapError):
+                continuous_shakemap_configuration(configured, environment={})
+        configured = deepcopy(pyfinderconfig)
+        configured["shakemap"]["configuration"] = "global"
+        warnings = []
+        result = continuous_shakemap_configuration(
+            configured,
+            environment={},
+            warning_handler=warnings.append,
+        )
+        self.assertEqual(result, pyfinderconfig)
+        self.assertIn("shakemap.configuration is obsolete and ignored", warnings[0])
+
+    def test_obsolete_settings_warn_and_are_ignored_without_hiding_active_errors(self):
+        configured = deepcopy(pyfinderconfig)
+        for key in (
+            "configuration",
+            "use-region-specific-shakemap-config",
+            "region-specific-shakemap-config",
+            "country-borders-shapefile",
+        ):
+            configured["shakemap"][key] = "private-obsolete-value"
+
+        warnings = []
+        environment = self.enabled_environment() | {
+            "PYFINDER_SHAKEMAP_CONFIGURATION": "private-obsolete-value",
+        }
+        result = continuous_shakemap_configuration(
+            configured,
+            environment=environment,
+            warning_handler=warnings.append,
+        )
+        self.assertTrue(result["shakemap"]["service-enabled"])
+        self.assertEqual(
+            result["shakemap"]["regional-configurations"],
+            pyfinderconfig["shakemap"]["regional-configurations"],
+        )
+        self.assertEqual(len(warnings), 5)
+        self.assertNotIn("private-obsolete-value", " ".join(warnings))
+        self.assertNotIn("configuration", result["shakemap"])
+
+        environment["PYFINDER_SHAKEMAP_OVERWRITE"] = "invalid"
+        with self.assertRaisesRegex(RuntimeBootstrapError, "PYFINDER_SHAKEMAP_OVERWRITE"):
+            continuous_shakemap_configuration(
+                configured,
+                environment=environment,
+                warning_handler=warnings.append,
+            )
 
     def test_symlink_input_root_is_rejected_without_resolving_into_configuration(self):
         alias = Path(self.root) / "alias"

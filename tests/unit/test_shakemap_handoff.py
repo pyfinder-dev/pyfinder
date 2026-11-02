@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 import fcntl
 import os
+import logging
 import stat
 import tempfile
 import threading
@@ -14,6 +15,8 @@ from xml.etree import ElementTree
 from pyfinder.eventcontext import EventContext, EventContextError
 from pyfinder.findermanager import FinDerManager
 from pyfinder.services.shakemap_inputs import PreparedShakeMapInputs
+from pyfinder.pyfinderconfig import pyfinderconfig
+from pyfinder.utils.regionlocator import RegionLocator, _country_records
 from tests.unit.test_shakemap_inputs import make_solution
 
 
@@ -27,7 +30,79 @@ class ManagerShakeMapHandoffTests(unittest.TestCase):
         )
         manager.metadata = {"current_delay": 5}
         manager.entry_kind = FinDerManager.ALERT_BACKED
+        manager.configuration = deepcopy(pyfinderconfig)
+        manager.logger = logging.getLogger("test.shakemap.selection")
         return manager
+
+    def test_service_profile_uses_solution_location_independently_of_finder_name(self):
+        manager = self.manager()
+        solution = make_solution()
+        for finder_name in ("switzerland-alpine", "switzerland-foreland", "other-model"):
+            manager.finder_configuration_name = finder_name
+            self.assertEqual(manager.select_shakemap_configuration(solution), "switzerland")
+        # Upstream context remains Swiss while the selected output moves to Italy.
+        solution.event.latitude, solution.event.longitude = 42.0, 13.0
+        self.assertEqual(manager.select_shakemap_configuration(solution), "italy")
+        solution.event.latitude, solution.event.longitude = 37.0, 36.0
+        self.assertEqual(manager.select_shakemap_configuration(solution), "global")
+        manager.configuration["shakemap"]["regional-configurations"]["tr"] = "italy"
+        self.assertEqual(manager.select_shakemap_configuration(solution), "italy")
+
+    def test_actual_packaged_country_identifiers_work_away_from_checkout(self):
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                self.assertEqual(RegionLocator().get_region(46.8, 8.2), "ch")
+                self.assertEqual(RegionLocator().get_region(48.8, 2.3), "fr")
+                self.assertIsNone(RegionLocator().get_region(0, -140))
+            finally:
+                os.chdir(previous)
+
+    def test_parallel_solutions_select_without_mutating_shared_configuration(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        swiss, italian = self.manager(), self.manager()
+        italian.configuration = swiss.configuration
+        before = deepcopy(swiss.configuration)
+        solutions = [make_solution(), make_solution()]
+        solutions[1].event.latitude, solutions[1].event.longitude = 42.0, 13.0
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda pair: pair[0].select_shakemap_configuration(pair[1]),
+                                        zip((swiss, italian), solutions)))
+        self.assertEqual(results, ["switzerland", "italy"])
+        self.assertEqual(swiss.configuration, before)
+
+    def test_boundary_ambiguity_unknown_territory_and_invalid_coordinates(self):
+        from shapely.geometry import box
+
+        locator = RegionLocator()
+        records = (("ch", box(0, 0, 1, 1)), ("it", box(1, 0, 2, 1)),
+                   (None, box(3, 0, 4, 1)))
+        with patch("pyfinder.utils.regionlocator._country_records", return_value=records):
+            self.assertEqual(locator.get_region(0.5, 0), "ch")
+            self.assertIsNone(locator.get_region(0.5, 1))
+            self.assertIsNone(locator.get_region(0.5, 3.5))
+            self.assertIsNone(locator.get_region(0.5, 8))
+        for lat, lon in ((True, 0), (None, 0), (91, 0), (0, 181), (float("nan"), 0)):
+            with self.subTest(lat=lat, lon=lon), self.assertRaisesRegex(ValueError, "requires finite"):
+                locator.get_region(lat, lon)
+        with patch("pyfinder.utils.regionlocator._country_records", side_effect=ValueError("missing country data")):
+            with self.assertRaisesRegex(ValueError, "missing country data"):
+                locator.get_region(46, 7)
+
+    def test_country_cache_reuses_materialized_data_and_reports_broken_resource(self):
+        _country_records.cache_clear()
+        self.addCleanup(_country_records.cache_clear)
+        import geopandas
+        with patch("geopandas.read_file", wraps=geopandas.read_file) as read:
+            RegionLocator().get_region(46.8, 8.2)
+            RegionLocator().get_region(42, 13)
+        read.assert_called_once()
+        _country_records.cache_clear()
+        with patch("geopandas.read_file", side_effect=OSError("missing companion")):
+            with self.assertRaisesRegex(ValueError, "packaged ShakeMap country boundaries"):
+                RegionLocator().get_region(46, 7)
 
     def test_selected_solution_identity_and_physical_time_are_preserved(self):
         manager = self.manager()

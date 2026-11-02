@@ -2,7 +2,9 @@
 
 from copy import deepcopy
 import logging
+from pathlib import Path
 import signal
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -11,6 +13,7 @@ from unittest import mock
 from pyfinder import cli, start_monitoring
 from pyfinder.services import seismiclistener
 from pyfinder.services.seismiclistener import EMSCListener
+from pyfinder.runtime import RuntimeBootstrapError
 
 
 class DeferredThread:
@@ -65,6 +68,25 @@ class ContinuousLifecycleTests(unittest.TestCase):
         start_monitoring._scheduler = None
         start_monitoring._shutdown_event = None
         start_monitoring._launcher_logger = None
+
+    def test_obsolete_warning_is_written_to_owned_log_before_active_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process_log = Path(directory) / "continuous.log"
+            context = SimpleNamespace(
+                process_log_path=process_log,
+                isolated_configuration=deepcopy,
+            )
+            with mock.patch.dict("os.environ", {
+                "PYFINDER_SHAKEMAP_CONFIGURATION": "private-obsolete-value",
+                "PYFINDER_SHAKEMAP_REQUEST_TIMEOUT_SECONDS": "invalid",
+            }), mock.patch.object(start_monitoring, "FollowUpScheduler") as scheduler:
+                with self.assertRaisesRegex(RuntimeBootstrapError, "TIMEOUT_SECONDS"):
+                    start_monitoring.start_services(runtime_context=context)
+
+            text = process_log.read_text()
+            self.assertIn("PYFINDER_SHAKEMAP_CONFIGURATION is obsolete and ignored", text)
+            self.assertNotIn("private-obsolete-value", text)
+            scheduler.assert_not_called()
 
     def test_installed_continuous_signal_shutdown_uses_owned_order(self):
         events = []
