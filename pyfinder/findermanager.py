@@ -30,20 +30,26 @@ from pyfinder.pyfinderconfig import (
     EMSC_FELT_REPORT_SERVICE,
     ESM_SHAKEMAP_SERVICE,
     RRSM_PEAK_MOTION_SERVICE,
+    USGS_SHAKEMAP_SERVICE,
+    USGS_DYFI_SERVICE,
     pyfinderconfig,
 )
 from pyfinder.service_priority import resolve_service_priority
+from pyfinder.services.eventid_mapping import EventIDMapper, EventIDMappingError
 from pyfinder.utils import customlogger
 from paramws.clients import (
     EMSCFeltReportClient,
     ESMShakeMapClient,
     RRSMPeakMotionClient,
+    USGSComCatClient,
 )
 from pyfinder.finderutils import FinderSolution
 from pyfinder.utils.dataformatter import (
     EMSCFeltReportDataFormatter,
     ESMShakeMapDataFormatter,
     RRSMPeakMotionDataFormatter,
+    USGSShakeMapDataFormatter,
+    USGSDYFIDataFormatter,
 )
 from pyfinder.utils.station_merger import StationMerger
 from pyfinder.utils.shakemap import ShakeMapExporter
@@ -324,6 +330,8 @@ class FinDerManager:
                 ESM_SHAKEMAP_SERVICE,
                 RRSM_PEAK_MOTION_SERVICE,
                 EMSC_FELT_REPORT_SERVICE,
+                USGS_SHAKEMAP_SERVICE,
+                USGS_DYFI_SERVICE,
             ):
                 self.logger.critical(
                     "Unsupported enabled observation service %r was skipped",
@@ -501,14 +509,158 @@ class FinDerManager:
         acquired["scientific_value"] = scientific_value
         return acquired
 
-    def _acquire_enabled_providers(self, event_id):
-        """Attempt every recognized enabled provider exactly once."""
+    def _acquire_usgs_products(self, event_id, services):
+        """Share one association and one ComCat query across selected products."""
+        products = {
+            USGS_SHAKEMAP_SERVICE: "shakemap",
+            USGS_DYFI_SERVICE: "dyfi",
+        }
         acquired = {}
-        for service_name in self._configured_enabled_services():
-            acquired[service_name] = self._acquire_provider(
-                service_name,
-                event_id,
+        for service in services:
+            outcome = self._new_provider_outcome()
+            outcome.update(workflow_event_id=event_id, product=products[service])
+            acquired[service] = {
+                "event_context": None,
+                "scientific_value": None,
+                "outcome": outcome,
+            }
+
+        # Mapping is deliberately scoped to this attempt. A missing association
+        # now must not prevent an existing later schedule or retry finding it.
+        try:
+            association = EventIDMapper().resolve(event_id)
+        except EventIDMappingError as error:
+            for service, result in acquired.items():
+                result["outcome"]["mapping_status_code"] = error.status_code
+                self._record_provider_failure(
+                    service, result["outcome"], "eventid-" + error.reason, str(error)
+                )
+            return acquired
+
+        for result in acquired.values():
+            result["outcome"].update(
+                query_event_id=association.usgs_id,
+                association_misfit=association.misfit,
+                association_method="EMSC EventID preferred estimated association",
             )
+        self.logger.info(
+            "EventID associated workflow %s with USGS %s (estimated misfit %s)",
+            event_id,
+            association.usgs_id,
+            association.misfit,
+        )
+
+        client = None
+        query_error = None
+        try:
+            client = USGSComCatClient()
+            options = {"event_id": association.usgs_id}
+            if len(services) == 1:
+                options["producttype"] = products[services[0]]
+            query_result = client.query(**options)
+        except Exception as error:
+            # ParamWS attempts each requested product independently, and may
+            # raise after retaining the other product. Its public getters are
+            # the supported way to recover that usable partial result.
+            query_error = f"ComCat construction or query raised {error!r}"
+            try:
+                query_result = (
+                    (None, client.get_event_data(), client.get_datasets())
+                    if client is not None
+                    else (None, None, {})
+                )
+            except Exception as recovery_error:
+                query_error += f"; partial results unavailable: {recovery_error!r}"
+                query_result = (None, None, {})
+
+        if not isinstance(query_result, tuple) or len(query_result) != 3:
+            for service, result in acquired.items():
+                self._record_provider_failure(
+                    service,
+                    result["outcome"],
+                    "invalid-result",
+                    "ComCat query did not return the expected three-item tuple",
+                )
+            return acquired
+
+        status_code, event_candidate, datasets = query_result
+        for result in acquired.values():
+            outcome = result["outcome"]
+            outcome["status_code"] = status_code
+            if query_error:
+                self._append_diagnostic(outcome, query_error)
+            elif status_code != 200:
+                self._append_diagnostic(
+                    outcome, f"ComCat aggregate status {status_code!r}"
+                )
+
+        # An unrelated ComCat event must never contribute observations. This
+        # identity gate is separate from scientific context completeness: once
+        # identity is confirmed, usable datasets can survive missing metadata.
+        try:
+            canonical_id = EventContext.confirm_usgs_identity(
+                event_candidate, query_event_id=association.usgs_id
+            )
+        except (EventContextError, ProviderModelAccessError) as error:
+            for service, result in acquired.items():
+                self._record_provider_failure(
+                    service, result["outcome"], "identity-unconfirmed", str(error)
+                )
+            return acquired
+
+        context = None
+        context_diagnostic = None
+        try:
+            context = EventContext.from_usgs_model(
+                event_candidate,
+                query_event_id=association.usgs_id,
+                workflow_event_id=event_id,
+            )
+        except (EventContextError, ProviderModelAccessError) as error:
+            context_diagnostic = str(error)
+            self.logger.error("USGS event context is unusable: %s", error)
+
+        for service, result in acquired.items():
+            outcome = result["outcome"]
+            outcome.update(
+                canonical_event_id=canonical_id,
+                event_context_usable=context is not None,
+                context_diagnostic=context_diagnostic,
+            )
+            result["event_context"] = context
+            value = (
+                datasets.get(products[service])
+                if isinstance(datasets, Mapping)
+                else None
+            )
+            if value is None:
+                self._record_provider_failure(
+                    service,
+                    outcome,
+                    "exception" if query_error else "invalid-result",
+                    f"ComCat product {products[service]!r} is unavailable",
+                )
+            else:
+                result["scientific_value"] = value
+        return acquired
+
+    def _acquire_enabled_providers(self, event_id):
+        """Attempt every enabled provider, sharing the two USGS product calls."""
+        services = self._configured_enabled_services()
+        usgs_services = [
+            service
+            for service in services
+            if service in (USGS_SHAKEMAP_SERVICE, USGS_DYFI_SERVICE)
+        ]
+        usgs_results = None
+        acquired = {}
+        for service_name in services:
+            if service_name in usgs_services:
+                if usgs_results is None:
+                    usgs_results = self._acquire_usgs_products(event_id, usgs_services)
+                acquired[service_name] = usgs_results[service_name]
+            else:
+                acquired[service_name] = self._acquire_provider(service_name, event_id)
         return acquired
 
     def _select_on_demand_context(self, acquired, service_priority):
@@ -546,6 +698,25 @@ class FinDerManager:
             return formatter.extract_raw_stations(
                 event_data=event_context,
                 amplitudes=value,
+            )
+
+        if service_name == USGS_SHAKEMAP_SERVICE:
+            formatter = USGSShakeMapDataFormatter(
+                logger=self.logger, configuration=self.configuration,
+            )
+            return formatter.extract_raw_stations(
+                event_data=event_context,
+                amplitudes=value,
+            )
+
+        if service_name == USGS_DYFI_SERVICE:
+            formatter = USGSDYFIDataFormatter(
+                logger=self.logger,
+                configuration=self.configuration,
+            )
+            return formatter.extract_raw_stations(
+                event_data=event_context,
+                felt_reports=value,
             )
 
         if service_name == EMSC_FELT_REPORT_SERVICE:
@@ -842,15 +1013,32 @@ class FinDerManager:
             callback = getattr(self, "evidence_callback", None)
             if callback is not None:
                 def capture_inputs(files):
-                    # Retain only display metadata already owned by the manager.
-                    # Raw provider payloads, credentials and scientific settings
-                    # never enter the terminal message's earthquake summary.
+                    # Retain earthquake display metadata and, when requested,
+                    # the normalized USGS evidence already owned by this run.
+                    # Credentials and unrelated provider payloads are excluded.
                     names = ("origin_time", "latitude", "longitude", "depth",
                              "magnitude", "magnitude_type", "region", "current_delay",
                              "minutes_until_next_update", "nominal_next_delay",
                              "scheduled_for_utc", "execution_started_at_utc",
                              "ESM_status", "RRSM_status")
                     context = {name: self.metadata[name] for name in names if name in self.metadata}
+                    usgs_outcomes = {
+                        service: outcome
+                        for service, outcome in self.metadata.get("provider_outcomes", {}).items()
+                        if service in (USGS_SHAKEMAP_SERVICE, USGS_DYFI_SERVICE)
+                    }
+                    if usgs_outcomes:
+                        # FinDer consumes points and cannot retain DYFI areas.
+                        # Keep the selected observations and association evidence
+                        # in the existing captured context before that conversion
+                        # loses provider units, geometry, and representative method.
+                        context["usgs_provider_outcomes"] = usgs_outcomes
+                        context["usgs_observations"] = [
+                            record for record in _amplitude_data
+                            if record.get("source") in (
+                                USGS_SHAKEMAP_SERVICE, USGS_DYFI_SERVICE,
+                            )
+                        ]
                     callback({**files, "event-context.json": json.dumps(context).encode()})
 
                 finder_executable.evidence_callback = capture_inputs

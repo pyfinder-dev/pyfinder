@@ -7,6 +7,7 @@ from pyfinder.pyfinderconfig import (
     EMSC_FELT_REPORT_SERVICE,
     ESM_SHAKEMAP_SERVICE,
     RRSM_PEAK_MOTION_SERVICE,
+    USGS_DYFI_SERVICE,
 )
 from pyfinder.utils.station_merger import StationMerger
 
@@ -56,6 +57,20 @@ class StationMergerTests(unittest.TestCase):
             logger=logger,
         )
         return merger.merge(available_results), logger
+
+    def test_dyfi_cells_are_not_deduplicated_as_instrumental_stations(self):
+        first = measurement(
+            source="USGS_DYFI", network="DY", station="0001", provider_unit="MMI"
+        )
+        second = dict(first, pga=20.0, provider_value=6.0)
+        first["provider_geometry"] = {"type": "Point", "coordinates": [12, 45]}
+        merged, logger = self.merge(
+            {USGS_DYFI_SERVICE: [first, second]},
+            priority=[USGS_DYFI_SERVICE],
+        )
+        self.assertEqual(merged, [first, second])
+        self.assertIs(merged[0], first)
+        logger.warning.assert_not_called()
 
     def test_empty_and_all_empty_mappings_return_empty_lists(self):
         merged, logger = self.merge({})

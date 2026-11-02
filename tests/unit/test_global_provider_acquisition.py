@@ -16,6 +16,8 @@ from pyfinder.pyfinderconfig import (
     EMSC_FELT_REPORT_SERVICE,
     ESM_SHAKEMAP_SERVICE,
     RRSM_PEAK_MOTION_SERVICE,
+    USGS_SHAKEMAP_SERVICE,
+    USGS_DYFI_SERVICE,
     pyfinderconfig,
 )
 from pyfinder.service_priority import resolve_service_priority
@@ -29,6 +31,8 @@ SHIPPED_PRIORITY = [
     ESM_SHAKEMAP_SERVICE,
     RRSM_PEAK_MOTION_SERVICE,
     EMSC_FELT_REPORT_SERVICE,
+    USGS_SHAKEMAP_SERVICE,
+    USGS_DYFI_SERVICE,
 ]
 
 

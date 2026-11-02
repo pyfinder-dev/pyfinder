@@ -5,6 +5,8 @@ from .base import BaseDataFormatter
 from .emsc_felt_report import EMSCFeltReportDataFormatter
 from .esm_shakemap import ESMShakeMapDataFormatter
 from .finder_input import FinDerInputFormatter
+from .usgs_shakemap import USGSShakeMapDataFormatter
+from .usgs_dyfi import USGSDYFIDataFormatter
 from .rrsm_peak_motion import (
     RRSM_PEAKMOTION_PGA_MAX,
     RRSM_PEAKMOTION_PGA_MIN,
@@ -20,6 +22,8 @@ __all__ = [
     "EMSCFeltReportDataFormatter",
     "ESMShakeMapDataFormatter",
     "FinDerInputFormatter",
+    "USGSShakeMapDataFormatter",
+    "USGSDYFIDataFormatter",
     "RRSM_PEAKMOTION_PGA_MAX",
     "RRSM_PEAKMOTION_PGA_MIN",
     "RRSM_PEAKMOTION_PGV_BROADBAND_MAX",

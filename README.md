@@ -12,6 +12,7 @@ FinDer-backed workflows run inside the PyFinder application container.
 
 - [Installation and runtime](#installation-and-runtime)
 - [Quick Start](#quick-start)
+- [Observation providers and USGS event association](#observation-providers-and-usgs-event-association)
 - [Current execution boundaries](#current-execution-boundaries)
 - [Sequence Diagram](#sequence-diagram)
 - [Terminal email alerts](#terminal-email-alerts)
@@ -107,6 +108,89 @@ Use `playback --event-ids` for a specific event. `--verbosity` controls applicat
 logging; it does not change calculation behavior.
 
 ---
+
+## Observation providers and USGS event association
+
+ESM ShakeMap and RRSM Peak Motion remain enabled by default. To include USGS
+station amplitudes and DYFI felt reports, add `USGS_SHAKEMAP_SERVICE` and
+`USGS_DYFI_SERVICE` to `pyfinderconfig["general"]["services-enabled"]` in
+`pyfinder/pyfinderconfig.py`. Keep ESM and RRSM in the list if they should
+continue contributing. These are maintained application settings, not additional
+CLI or Make commands. From the deployment checkout, rebuild with
+`make build COMPONENT=pyfinder`. A running container still uses its installed
+image: stop it and deliberately recreate the canonical caller using the
+[deployment guide](../pyfinder-deploy/README.md), preserving mounted runtime
+and any needed container-only files. Restarting an old container does not
+install the new settings.
+
+Either product may be enabled independently. Their configuration names are
+`USGS_ShakeMap` and `USGS_DYFI`.
+
+The shipped `services-priority` places USGS ShakeMap and then USGS DYFI after
+ESM, RRSM, and EMSC felt reports. Thus enabling USGS preserves established
+providers' preference for playback event metadata and duplicate instrumental
+stations. To change that preference, reorder `services-priority`; if supplying
+an entirely custom list, include every enabled source. Membership and priority
+are separate settings.
+
+For each attempt that enables a USGS source, PyFinder asks the
+[EMSC EventID service](https://www.seismicportal.eu/eventid/) for the preferred
+USGS association of the original **UNID** (for example `20230206_0000008`). UNID
+is distinct from the numeric EMSC event-page ID. This is an estimated association
+based on event parameters, not a guaranteed identity crosswalk. The service's
+default matching parameters were tested for earthquakes above magnitude 4.5;
+smaller or newly reported events may have no match. PyFinder retains the service's
+misfit and does not introduce a local matching threshold or ranking algorithm.
+
+One association lookup and one ParamWS ComCat query serve both enabled products.
+PyFinder validates the returned ComCat ID against the query ID or ComCat's own
+confirmed aliases. The original EMSC workflow ID, scheduled times, and FinDer
+and downstream ShakeMap calculation IDs remain unchanged. Continuous runs still
+use their persisted EMSC origin metadata; playback uses the configured provider
+priority. USGS GeoJSON origin milliseconds are converted to explicit UTC time
+when adapting a candidate provider context.
+
+A missing association, timeout, malformed response, or conflicting preferred
+IDs makes only the dependent USGS sources unavailable. Existing providers can
+still contribute; the normal scheduler decides whether an insufficient attempt
+needs retrying. No association result is permanently cached. A usable USGS
+product survives failure of the other product, and later scheduled attempts may
+find data that was not yet published.
+
+USGS ShakeMap station PGA is normalized from its declared units, with its own
+source provenance. DYFI MMI is converted using the existing Worden relation;
+it is not relabeled as EMSC EMS-98. A DYFI grid cell uses its polygon centroid as
+a representative location, retaining its original geometry and coordinate
+method with the normalized observation. The centroid is a planar approximation
+for the small cell, handles holes and date-line crossings, and is not a geodesic
+calculation. Supplied Point geometry keeps its coordinates. Invalid polygons
+and unsupported geometry, including MultiPolygon, are skipped with a diagnostic.
+It is an area report, not an instrumental station or an exact respondent
+location. Felt cells are not deduplicated as instrumental stations. DYFI uses
+the existing Allen felt-intensity filter before Worden conversion.
+
+Provider outcome metadata and logs distinguish the original workflow ID, mapped
+query ID, returned canonical ID, association misfit, product, and failure reason.
+Normalized records retain source, original value and units, plus DYFI area
+provenance. The existing captured `event-context.json` retains selected USGS
+observations and their acquisition outcomes alongside the FinDer input evidence.
+It contains the USGS observations surviving normalization and merging, not every
+fetched or rejected row. If an attempt stops before FinDer input capture, inspect
+its provider diagnostics and logs. This association changes observation acquisition
+only; the separate ShakeMap calculation service and its configuration fallback
+policy are unchanged.
+
+**Current timestamp limitation:** observation normalizers share a helper that
+interprets supported `Z` timestamps in the process's local timezone. Run the
+application process in UTC until that helper is corrected. The ComCat adapter's
+explicit UTC conversion does not fix this later step; host-timezone-independent
+observation timestamps are not yet guaranteed.
+
+Offline tests and independent source audits cover the USGS integration. They do
+not establish live-provider availability, installation in the application image,
+or a successful full-chain playback with these sources. After enabling them and
+rebuilding, verify the installed caller and perform an explicit playback through
+the configured deployment before relying on USGS operationally.
 
 ## Current execution boundaries
 

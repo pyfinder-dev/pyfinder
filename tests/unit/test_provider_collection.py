@@ -1,10 +1,12 @@
 """Offline tests for configured independent observation collection."""
 
 import atexit
+import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -23,6 +25,8 @@ try:
         EMSC_FELT_REPORT_SERVICE,
         ESM_SHAKEMAP_SERVICE,
         RRSM_PEAK_MOTION_SERVICE,
+        USGS_SHAKEMAP_SERVICE,
+        USGS_DYFI_SERVICE,
     )
 finally:
     if _original_paramws_log_file is None:
@@ -107,6 +111,287 @@ class ProviderCollectionTests(unittest.TestCase):
         if service_name == ESM_SHAKEMAP_SERVICE:
             return code, event, {"station_amplitudes": value}
         return code, event, {"peak_motion": value}
+
+    @staticmethod
+    def usgs_event(*, canonical_id="us-query", aliases=None, magnitude=5.6):
+        # Use the dependency's real public event model, including its native
+        # epoch-millisecond timestamp and optional ComCat alias field.
+        from paramws.clients import ShakeMapEventData
+
+        return ShakeMapEventData(
+            {
+                "id": canonical_id,
+                "ids": aliases,
+                "time": 1675646278250,
+                "lat": 37.2,
+                "lon": 37.1,
+                "depth": 10,
+                "mag": magnitude,
+                "magType": "mww",
+            }
+        )
+
+    @staticmethod
+    def usgs_association():
+        return SimpleNamespace(source_id=EVENT_ID, usgs_id="us-query", misfit=0.07)
+
+    def test_disabled_usgs_does_not_map_or_query(self):
+        manager = self.manager(enabled=[])
+        with (
+            mock.patch.object(findermanager, "EventIDMapper") as mapper,
+            mock.patch.object(findermanager, "USGSComCatClient") as client,
+        ):
+            self.assertEqual(manager._acquire_enabled_providers(EVENT_ID), {})
+        mapper.assert_not_called()
+        client.assert_not_called()
+
+    def test_both_usgs_products_share_mapping_and_preserve_original_identity(self):
+        manager = self.manager(
+            enabled=[
+                USGS_SHAKEMAP_SERVICE,
+                ESM_SHAKEMAP_SERVICE,
+                USGS_DYFI_SERVICE,
+            ]
+        )
+        stations, felt = object(), object()
+        event = self.usgs_event(
+            canonical_id="ci-canonical", aliases=",us-query,ci-canonical,"
+        )
+        with (
+            mock.patch.object(findermanager, "EventIDMapper") as mapper,
+            mock.patch.object(findermanager, "USGSComCatClient") as client,
+            mock.patch.object(findermanager, "ESMShakeMapClient") as esm,
+        ):
+            mapper.return_value.resolve.return_value = self.usgs_association()
+            client.return_value.query.return_value = (
+                200,
+                event,
+                {"shakemap": stations, "dyfi": felt},
+            )
+            esm.return_value.query.return_value = self.usable_result(
+                ESM_SHAKEMAP_SERVICE
+            )
+            acquired = manager._acquire_enabled_providers(EVENT_ID)
+
+        mapper.return_value.resolve.assert_called_once_with(EVENT_ID)
+        client.return_value.query.assert_called_once_with(event_id="us-query")
+        esm.return_value.query.assert_called_once_with(event_id=EVENT_ID)
+        self.assertIs(acquired[USGS_SHAKEMAP_SERVICE]["scientific_value"], stations)
+        self.assertIs(acquired[USGS_DYFI_SERVICE]["scientific_value"], felt)
+        context = acquired[USGS_SHAKEMAP_SERVICE]["event_context"]
+        self.assertEqual(context.get_event_id(), EVENT_ID)
+        self.assertEqual(context.get_origin_time(), "2023-02-06T01:17:58.250000Z")
+        self.assertEqual(event.get_event_id(), "ci-canonical")
+        outcome = acquired[USGS_DYFI_SERVICE]["outcome"]
+        self.assertEqual(outcome["query_event_id"], "us-query")
+        self.assertEqual(outcome["canonical_event_id"], "ci-canonical")
+        self.assertEqual(outcome["workflow_event_id"], EVENT_ID)
+        self.assertEqual(outcome["product"], "dyfi")
+        manager._store_provider_outcomes(acquired)
+        self.assertIs(manager.metadata["provider_outcomes"][USGS_DYFI_SERVICE], outcome)
+
+    def test_usgs_context_preserves_workflow_handoff_in_both_modes(self):
+        alert_context = EventContext.from_provider_model(
+            ProviderEvent(),
+            requested_event_id=EVENT_ID,
+        )
+        for mode in (
+            findermanager.FinDerManager.ALERT_BACKED,
+            findermanager.FinDerManager.ON_DEMAND,
+        ):
+            with self.subTest(mode=mode):
+                manager = self.manager(
+                    enabled=[USGS_DYFI_SERVICE],
+                    priority=[USGS_DYFI_SERVICE],
+                    entry_kind=mode,
+                    event_context=(
+                        alert_context
+                        if mode == findermanager.FinDerManager.ALERT_BACKED
+                        else None
+                    ),
+                )
+                manager.metadata["current_delay"] = 15
+                captured = []
+                manager.evidence_callback = captured.append
+                records = [
+                    {
+                        "network": "XX",
+                        "station": "STA",
+                        "location": "",
+                        "channel": "HNE",
+                        "source": USGS_DYFI_SERVICE,
+                        "provider_unit": "MMI",
+                        "provider_geometry": {"type": "Point", "coordinates": [37.1, 37.2]},
+                        "coordinate_method": "provider_point",
+                    }
+                ]
+                with (
+                    mock.patch.object(findermanager, "EventIDMapper") as mapper,
+                    mock.patch.object(findermanager, "USGSComCatClient") as client,
+                    mock.patch.object(
+                        manager, "_normalize_provider", return_value=records
+                    ) as normalize,
+                    mock.patch.object(finderexec, "FinDerExecutable") as executable,
+                ):
+                    mapper.return_value.resolve.return_value = self.usgs_association()
+                    client.return_value.query.return_value = (
+                        200,
+                        self.usgs_event(),
+                        {"dyfi": object()},
+                    )
+                    executable.return_value.execute.side_effect = RuntimeError(
+                        "FinDer boundary"
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "FinDer boundary"):
+                        manager.process_event(EVENT_ID)
+
+                executable.return_value.evidence_callback({})
+                evidence = json.loads(captured[0]["event-context.json"])
+                self.assertEqual(evidence["usgs_observations"], records)
+                self.assertEqual(
+                    evidence["usgs_provider_outcomes"][USGS_DYFI_SERVICE]["query_event_id"],
+                    "us-query",
+                )
+                used_context = executable.return_value.execute.call_args.kwargs[
+                    "event_data"
+                ]
+                self.assertEqual(used_context.get_event_id(), EVENT_ID)
+                if mode == findermanager.FinDerManager.ALERT_BACKED:
+                    self.assertIs(used_context, alert_context)
+                else:
+                    self.assertEqual(
+                        used_context.get_origin_time(), "2023-02-06T01:17:58.250000Z"
+                    )
+                self.assertIs(normalize.call_args.args[1], used_context)
+                self.assertEqual(
+                    executable.return_value.execute.call_args.kwargs[
+                        "augmented_event_id"
+                    ],
+                    "provider-event_t00015",
+                )
+                with mock.patch.object(findermanager, "ShakeMapExporter") as exporter:
+                    exporter.return_value.export_all.return_value = {}
+                    calculation_id, _files = manager.prepare_shakemap(object())
+                self.assertEqual(calculation_id, "provider-event_t00015")
+
+    def test_single_usgs_product_selects_only_that_product(self):
+        for service, product in (
+            (USGS_SHAKEMAP_SERVICE, "shakemap"),
+            (USGS_DYFI_SERVICE, "dyfi"),
+        ):
+            with self.subTest(product=product):
+                manager = self.manager(enabled=[service])
+                with (
+                    mock.patch.object(findermanager, "EventIDMapper") as mapper,
+                    mock.patch.object(findermanager, "USGSComCatClient") as client,
+                ):
+                    mapper.return_value.resolve.return_value = self.usgs_association()
+                    client.return_value.query.return_value = (
+                        200,
+                        self.usgs_event(),
+                        {product: object()},
+                    )
+                    acquired = manager._acquire_enabled_providers(EVENT_ID)
+                client.return_value.query.assert_called_once_with(
+                    event_id="us-query", producttype=product
+                )
+                self.assertIsNotNone(acquired[service]["event_context"])
+
+    def test_usgs_partial_product_survives_dependency_exception(self):
+        manager = self.manager(enabled=[USGS_SHAKEMAP_SERVICE, USGS_DYFI_SERVICE])
+        felt = object()
+        with (
+            mock.patch.object(findermanager, "EventIDMapper") as mapper,
+            mock.patch.object(findermanager, "USGSComCatClient") as client,
+        ):
+            mapper.return_value.resolve.return_value = self.usgs_association()
+            client.return_value.query.side_effect = TimeoutError(
+                "station product timed out"
+            )
+            client.return_value.get_event_data.return_value = self.usgs_event()
+            client.return_value.get_datasets.return_value = {
+                "shakemap": None,
+                "dyfi": felt,
+            }
+            acquired = manager._acquire_enabled_providers(EVENT_ID)
+        self.assertIs(acquired[USGS_DYFI_SERVICE]["scientific_value"], felt)
+        self.assertEqual(
+            acquired[USGS_SHAKEMAP_SERVICE]["outcome"]["failure_kind"], "exception"
+        )
+        self.assertIn(
+            "station product timed out",
+            acquired[USGS_DYFI_SERVICE]["outcome"]["diagnostic"],
+        )
+
+    def test_unconfirmed_usgs_identity_cannot_supply_any_product(self):
+        manager = self.manager(enabled=[USGS_SHAKEMAP_SERVICE, USGS_DYFI_SERVICE])
+        with (
+            mock.patch.object(findermanager, "EventIDMapper") as mapper,
+            mock.patch.object(findermanager, "USGSComCatClient") as client,
+        ):
+            mapper.return_value.resolve.return_value = self.usgs_association()
+            client.return_value.query.return_value = (
+                200,
+                self.usgs_event(canonical_id="other", aliases=",other,"),
+                {"shakemap": object(), "dyfi": object()},
+            )
+            acquired = manager._acquire_enabled_providers(EVENT_ID)
+        for result in acquired.values():
+            self.assertIsNone(result["scientific_value"])
+            self.assertIsNone(result["event_context"])
+            self.assertEqual(result["outcome"]["failure_kind"], "identity-unconfirmed")
+
+    def test_incomplete_usgs_metadata_preserves_identity_confirmed_observations(self):
+        manager = self.manager(enabled=[USGS_SHAKEMAP_SERVICE])
+        stations = object()
+        with (
+            mock.patch.object(findermanager, "EventIDMapper") as mapper,
+            mock.patch.object(findermanager, "USGSComCatClient") as client,
+        ):
+            mapper.return_value.resolve.return_value = self.usgs_association()
+            client.return_value.query.return_value = (
+                200,
+                self.usgs_event(magnitude=None),
+                {"shakemap": stations},
+            )
+            result = manager._acquire_enabled_providers(EVENT_ID)[USGS_SHAKEMAP_SERVICE]
+        self.assertIs(result["scientific_value"], stations)
+        self.assertIsNone(result["event_context"])
+        self.assertIn("magnitude", result["outcome"]["context_diagnostic"])
+
+    def test_mapping_failure_is_isolated_and_later_attempt_can_resolve(self):
+        manager = self.manager(enabled=[USGS_SHAKEMAP_SERVICE, ESM_SHAKEMAP_SERVICE])
+        for reason in ("no_match", "timeout", "invalid_response", "ambiguous_response"):
+            with (
+                self.subTest(reason=reason),
+                mock.patch.object(findermanager, "EventIDMapper") as mapper,
+                mock.patch.object(findermanager, "USGSComCatClient") as client,
+                mock.patch.object(findermanager, "ESMShakeMapClient") as esm,
+            ):
+                mapper.return_value.resolve.side_effect = [
+                    findermanager.EventIDMappingError(
+                        reason, "association unavailable"
+                    ),
+                    self.usgs_association(),
+                ]
+                esm.return_value.query.return_value = self.usable_result(
+                    ESM_SHAKEMAP_SERVICE
+                )
+                client.return_value.query.return_value = (
+                    200,
+                    self.usgs_event(),
+                    {"shakemap": object()},
+                )
+                first = manager._acquire_enabled_providers(EVENT_ID)
+                client.assert_not_called()
+                self.assertIsNotNone(first[ESM_SHAKEMAP_SERVICE]["scientific_value"])
+                self.assertEqual(
+                    first[USGS_SHAKEMAP_SERVICE]["outcome"]["failure_kind"],
+                    "eventid-" + reason,
+                )
+                second = manager._acquire_enabled_providers(EVENT_ID)
+                self.assertIsNotNone(second[USGS_SHAKEMAP_SERVICE]["scientific_value"])
+                self.assertEqual(mapper.return_value.resolve.call_count, 2)
 
     def test_dispatch_uses_unique_enabled_membership_and_skips_unsupported(self):
         manager = self.manager(enabled=[

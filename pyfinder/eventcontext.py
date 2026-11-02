@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
 
 from pyfinder.utils.timeutils import get_epoch_time
@@ -99,6 +100,74 @@ class EventContext:
                 required=False,
             ),
             source_label="provider",
+        )
+
+    @classmethod
+    def confirm_usgs_identity(cls, event_model, *, query_event_id):
+        """Require the queried USGS ID or an alias confirmed by ComCat itself.
+
+        EventID's estimated association is the query target. ComCat may return
+        a different preferred ID, but only its own comma-separated alias list
+        can justify that difference. This check also protects dataset use when
+        the event's other metadata is incomplete.
+        """
+        canonical_id = cls._event_identifier(
+            cls._provider_value(event_model, ("get_event_id",), "event identifier"),
+            "USGS canonical event ID",
+        )
+        query_id = cls._event_identifier(query_event_id, "USGS query event ID")
+        if canonical_id == query_id:
+            return canonical_id
+
+        try:
+            aliases = event_model.get("ids")
+        except _PUBLIC_MODEL_ACCESS_ERRORS as error:
+            raise ProviderModelAccessError(
+                "USGS alias metadata is unreadable"
+            ) from error
+
+        if not isinstance(aliases, str) or query_id not in {
+            alias.strip() for alias in aliases.split(",") if alias.strip()
+        }:
+            raise EventContextError(
+                f"USGS returned event {canonical_id!r} without confirming "
+                f"queried ID {query_id!r} in its aliases"
+            )
+        return canonical_id
+
+    @classmethod
+    def from_usgs_model(cls, event_model, *, query_event_id, workflow_event_id):
+        """Copy a confirmed ComCat event under the unchanged EMSC workflow ID."""
+        cls.confirm_usgs_identity(event_model, query_event_id=query_event_id)
+        workflow_id = cls._event_identifier(workflow_event_id, "workflow event ID")
+
+        # GeoJSON time is milliseconds since the Unix epoch. The dependency
+        # deliberately retains that native representation; only this adapter
+        # converts it to the UTC string used by PyFinder's common context.
+        origin_ms = cls._number(
+            cls._provider_value(event_model, ("get_origin_time",), "origin time"),
+            "USGS origin time in milliseconds",
+        )
+        try:
+            origin = datetime.fromtimestamp(origin_ms / 1000, timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            magnitude_type = event_model.get("magType")
+        except (OverflowError, OSError, *_PUBLIC_MODEL_ACCESS_ERRORS) as error:
+            raise EventContextError(
+                "USGS origin or magnitude metadata is unusable"
+            ) from error
+
+        return cls._from_values(
+            event_id=workflow_id,
+            expected_event_id=workflow_id,
+            latitude=cls._provider_value(event_model, ("get_latitude",), "latitude"),
+            longitude=cls._provider_value(event_model, ("get_longitude",), "longitude"),
+            magnitude=cls._provider_value(event_model, ("get_magnitude",), "magnitude"),
+            depth=cls._provider_value(event_model, ("get_depth",), "depth"),
+            origin_time=origin,
+            magnitude_type=magnitude_type,
+            source_label="USGS association",
         )
 
     @classmethod

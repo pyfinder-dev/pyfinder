@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Utility classes for merging normalized observations from web services."""
 import logging
-from typing import List, Mapping, Sequence, TypedDict
+from typing import List, Mapping, Sequence, TypedDict, NotRequired
 
-from pyfinder.pyfinderconfig import EMSC_FELT_REPORT_SERVICE
+from pyfinder.pyfinderconfig import EMSC_FELT_REPORT_SERVICE, USGS_DYFI_SERVICE
 
 
 InstrumentalIdentity = tuple[str, str, str, str]
@@ -24,6 +24,11 @@ class RawStationMeasurement(TypedDict):
     source: str  # "ESM" or "RRSM" etc.
     provider_value: float
     provider_unit: str
+    # Felt-grid locations are representative points. Keep their original area
+    # with the record so downstream evidence can distinguish them from stations.
+    provider_geometry: NotRequired[dict]
+    coordinate_method: NotRequired[str]
+    provider_observation_id: NotRequired[str | None]
 
 
 class StationMerger:
@@ -55,7 +60,7 @@ class StationMerger:
             )
 
             for station in available_results[service_name]:
-                if service_name == EMSC_FELT_REPORT_SERVICE:
+                if service_name in (EMSC_FELT_REPORT_SERVICE, USGS_DYFI_SERVICE):
                     merged.append(station)
                     continue
 

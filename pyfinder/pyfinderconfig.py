@@ -15,11 +15,15 @@ ESM_SHAKEMAP_SERVICE = "ESM_ShakeMap"
 RRSM_PEAK_MOTION_SERVICE = "RRSM_PeakMotion"
 RRSM_SHAKEMAP_SERVICE = "RRSM_ShakeMap"
 EMSC_FELT_REPORT_SERVICE = "EMSC_FeltReport"
+USGS_SHAKEMAP_SERVICE = "USGS_ShakeMap"
+USGS_DYFI_SERVICE = "USGS_DYFI"
 
 SHIPPED_SERVICE_PRIORITY = (
     ESM_SHAKEMAP_SERVICE,
     RRSM_PEAK_MOTION_SERVICE,
     EMSC_FELT_REPORT_SERVICE,
+    USGS_SHAKEMAP_SERVICE,
+    USGS_DYFI_SERVICE,
 )
 
 
@@ -27,6 +31,9 @@ pyfinderconfig = {
     "general": {
         # Enabled services are a membership list. Their order does not express
         # scientific preference; that is owned separately by services-priority.
+        # USGS_SHAKEMAP_SERVICE and USGS_DYFI_SERVICE are opt-in. Their
+        # shipped priority follows the existing sources; enable them here
+        # and adjust services-priority only when a different rank is intended.
         "services-enabled": [
             ESM_SHAKEMAP_SERVICE,
             RRSM_PEAK_MOTION_SERVICE,
