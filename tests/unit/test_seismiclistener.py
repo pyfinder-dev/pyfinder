@@ -288,18 +288,23 @@ class SeismicListenerProcessingTests(unittest.TestCase):
             seismiclistener,
             "parse_normalized_iso8601",
             side_effect=ValueError("current parser rejected timestamp"),
-        ) as parser:
+        ) as parser, self.assertLogs(self.logger, level="WARNING") as captured:
             self.process()
 
         parser.assert_called_once()
         self.handoff.assert_not_called()
-        self.assertIn("Malformed EMSC message", self.log_stream.getvalue())
+        self.assertEqual(captured.records[0].levelno, logging.WARNING)
+        self.assertIn("current parser rejected timestamp", captured.records[0].getMessage())
 
     def test_downstream_exception_is_contained_without_retry(self):
-        failing_handoff = mock.Mock(side_effect=RuntimeError("downstream failed"))
-        self.process(handoff=failing_handoff)
+        error = RuntimeError("downstream failed")
+        failing_handoff = mock.Mock(side_effect=error)
+        with self.assertLogs(self.logger, level="ERROR") as captured:
+            self.process(handoff=failing_handoff)
         failing_handoff.assert_called_once()
-        self.assertIn("EMSC handoff failure", self.log_stream.getvalue())
+        self.assertIs(captured.records[0].exc_info[1], error)
+        self.assertIn("20260805_0000001", captured.records[0].getMessage())
+        self.assertIn("create", captured.records[0].getMessage())
 
     def test_accepted_messages_do_not_construct_or_validate_policies(self):
         from pyfinder.services import querypolicy
@@ -359,10 +364,8 @@ class SeismicListenerProcessingTests(unittest.TestCase):
                 self.assertEqual(snapshot["depth"], 12.5)
                 self.assertEqual(snapshot["agency"], "EMSC")
                 diagnostic = self.log_stream.getvalue()[log_start:]
-                self.assertIn("EMSC {0} alert".format(action), diagnostic)
-                self.assertNotIn("New event", diagnostic)
-                self.assertNotIn("Starting to register", diagnostic)
-                self.assertNotIn("Updated event", diagnostic)
+                self.assertIn("event-3", diagnostic)
+                self.assertIn(action, diagnostic)
 
     def test_eventtracker_failure_is_contained_and_later_alert_continues(self):
         from pyfinder.services import eventtracker
@@ -381,8 +384,9 @@ class SeismicListenerProcessingTests(unittest.TestCase):
             tracker, object(), self.logger
         )
 
-        self.process(self.make_message(action="create"), handoff=handoff)
-        self.process(self.make_message(action="update"), handoff=handoff)
+        with self.assertLogs(self.logger, level="INFO") as captured:
+            self.process(self.make_message(action="create"), handoff=handoff)
+            self.process(self.make_message(action="update"), handoff=handoff)
 
         self.assertEqual(tracker.apply_emsc_alert.call_count, 2)
         self.assertEqual(
@@ -392,8 +396,12 @@ class SeismicListenerProcessingTests(unittest.TestCase):
             ],
             ["create", "update"],
         )
-        self.assertIn("EMSC handoff failure", self.log_stream.getvalue())
-        self.assertIn("Accepted EMSC handoff", self.log_stream.getvalue())
+        errors = [record for record in captured.records if record.levelno == logging.ERROR]
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0].exc_info[1], eventtracker.ScheduleRegistrationError)
+        self.assertIn("20260805_0000001", errors[0].getMessage())
+        self.assertEqual(captured.records[-1].levelno, logging.INFO)
+        self.assertIn("update", captured.records[-1].getMessage())
 
     def test_later_messages_continue_after_malformed_rejected_and_failed(self):
         sequenced_handoff = mock.Mock(
@@ -414,24 +422,29 @@ class SeismicListenerProcessingTests(unittest.TestCase):
         )
 
     def test_logging_outcomes_are_operator_distinguishable(self):
-        self.process()
-        self.process("{bad JSON")
-        self.process(self.make_message(action="delete"))
-        self.process(
-            self.make_message(flynn_region="Switzerland"),
-            target_regions=["Italy"],
-        )
-        self.process(
-            self.make_message(),
-            handoff=mock.Mock(side_effect=RuntimeError("handoff failed")),
-        )
+        error = RuntimeError("handoff failed")
+        with self.assertLogs(self.logger, level="INFO") as captured:
+            self.process()
+            self.process("{bad JSON")
+            self.process(self.make_message(action="delete"))
+            self.process(
+                self.make_message(flynn_region="Switzerland"),
+                target_regions=["Italy"],
+            )
+            self.process(self.make_message(), handoff=mock.Mock(side_effect=error))
 
-        records = self.log_stream.getvalue()
-        self.assertIn("Accepted EMSC handoff", records)
-        self.assertIn("Malformed EMSC message", records)
-        self.assertIn("Unsupported EMSC action", records)
-        self.assertIn("EMSC filter rejection", records)
-        self.assertIn("EMSC handoff failure", records)
+        # Operators need distinct outcomes and useful context, not fixed prose.
+        records = captured.records
+        self.assertEqual(
+            [record.levelno for record in records],
+            [logging.INFO, logging.WARNING, logging.INFO, logging.INFO, logging.ERROR],
+        )
+        self.assertEqual(len({record.getMessage() for record in records}), 5)
+        for record in (records[0], records[2], records[3], records[4]):
+            self.assertIn("20260805_0000001", record.getMessage())
+        self.assertIn("delete", records[2].getMessage())
+        self.assertIn("Switzerland", records[3].getMessage())
+        self.assertIs(records[4].exc_info[1], error)
 
     def test_import_has_no_operational_resource_side_effects(self):
         original_directory = os.getcwd()

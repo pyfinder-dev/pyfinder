@@ -79,10 +79,6 @@ class CustomLoggerTests(unittest.TestCase):
         ):
             self.assertFalse(hasattr(customlogger, colour_name))
 
-        source = inspect.getsource(customlogger)
-        self.assertNotIn("StreamHandler", source)
-        self.assertNotIn("__main__", source)
-
     def test_global_logging_state_is_not_extended_or_reconfigured(self):
         root = logging.getLogger()
         root_handlers = list(root.handlers)

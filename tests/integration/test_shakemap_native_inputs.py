@@ -122,7 +122,7 @@ class ShakeMapNativeInputTests(unittest.TestCase):
         ).export_all()
         completed = subprocess.run(
             ["docker", "exec", "-i", "shakemap-docker",
-             "/usr/local/bin/python", "-c", _NATIVE_READER],
+             "python", "-c", _NATIVE_READER],
             input=json.dumps({name: base64.b64encode(content).decode("ascii")
                               for name, content in files.items()}),
             capture_output=True, text=True, check=False, timeout=60,

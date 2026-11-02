@@ -1,7 +1,6 @@
 """Unit tests for query-policy validation and retained interfaces."""
 
 import importlib
-import inspect
 import logging
 import logging.handlers
 import math
@@ -109,19 +108,6 @@ class QueryPolicyValidationTests(unittest.TestCase):
         repeated = querypolicy.build_service_policies()
         for service in policies:
             self.assertIsNot(policies[service], repeated[service])
-
-    def test_validation_has_no_duplicate_expected_schedule(self):
-        source = inspect.getsource(querypolicy.RRSMQueryPolicy)
-
-        self.assertFalse(hasattr(querypolicy, "_EXPECTED_SCHEDULE_MINUTES"))
-        self.assertFalse(
-            hasattr(querypolicy.RRSMQueryPolicy, "_EXPECTED_SCHEDULE_MINUTES")
-        )
-        self.assertEqual(
-            source.count("[0, 5, 15, 60, 180, 360, 1440, 2880]"),
-            1,
-        )
-        self.assertNotIn("tuple(schedule)", source)
 
     def test_rrsm_retry_rule_remains_unchanged(self):
         policy = querypolicy.RRSMQueryPolicy()

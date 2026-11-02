@@ -126,7 +126,8 @@ class ShakeMapSettingsTests(unittest.TestCase):
             warning_handler=warnings.append,
         )
         self.assertEqual(result, pyfinderconfig)
-        self.assertIn("shakemap.configuration is obsolete and ignored", warnings[0])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("shakemap.configuration", warnings[0])
 
     def test_obsolete_settings_warn_and_are_ignored_without_hiding_active_errors(self):
         configured = deepcopy(pyfinderconfig)

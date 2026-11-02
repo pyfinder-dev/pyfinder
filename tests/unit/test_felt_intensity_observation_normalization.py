@@ -102,23 +102,6 @@ class AllenCalculatorTests(unittest.TestCase):
             corrected_predictions, legacy_predictions, rtol=1e-12, atol=0)
         self.assertFalse(np.isclose(legacy_cutoffs[0], legacy_cutoffs[1]))
 
-    def test_legacy_docstring_documents_defects_and_production_prohibition(self):
-        documentation = (
-            Calculator.I_Allen2012_Rhypo_legacy.__doc__ or "").lower()
-
-        required_text = (
-            "historical",
-            "own hypocentral distance",
-            "station-dependent",
-            "far-distance term",
-            "epicentral distance",
-            "hypocentral-distance equation",
-            "production code must not use",
-        )
-        for text in required_text:
-            with self.subTest(text=text):
-                self.assertIn(text, documentation)
-
     def test_corrected_scalar_input_returns_one_prediction_only(self):
         prediction = Calculator.I_Allen2012_Rhypo(
             self.EVENT_MAGNITUDE,

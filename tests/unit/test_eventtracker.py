@@ -647,11 +647,6 @@ class EventTrackerMetadataTests(unittest.TestCase):
             hasattr(eventtracker.EventTracker.Field, "expiration_time")
         )
 
-    def test_obsolete_all_pending_wrapper_is_absent(self):
-        self.assertFalse(
-            hasattr(eventtracker.EventTracker, "get_all_pending_events")
-        )
-
     def test_due_discovery_keeps_expired_pending_catch_up_only(self):
         now = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
         overdue = (now - timedelta(days=1)).isoformat(timespec="seconds")

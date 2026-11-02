@@ -170,7 +170,8 @@ class RegionalCoverageTests(unittest.TestCase):
         self.assertEqual(locator.get_configuration(47, 9), "east-model")
         with self.assertLogs(self.logger, level="WARNING") as messages:
             self.assertEqual(locator.get_configuration(47, 8), "global")
-        self.assertIn("conflicting configurations", " ".join(messages.output))
+        for profile in ("west-model", "east-model"):
+            self.assertIn(profile, " ".join(messages.output))
 
         catalog["CH / east"]["configuration"] = "west-model"
         self.assertEqual(
@@ -207,7 +208,8 @@ class RegionalCoverageTests(unittest.TestCase):
         (self.resources / "later.wkt").write_text("not WKT")
         with self.assertLogs(self.logger, level="WARNING") as messages:
             self.assertEqual(locator.get_configuration(1, 1), "global")
-        self.assertIn("unusable WKT", " ".join(messages.output))
+        self.assertIn("Files supplied later", " ".join(messages.output))
+        self.assertIn(str(self.resources / "later.wkt"), " ".join(messages.output))
 
         (self.resources / "later.wkt").write_text(
             "POLYGON ((0 0, 1 1, 1 0, 0 1, 0 0))"
