@@ -111,18 +111,39 @@ logging; it does not change calculation behavior.
 
 ## Regional ShakeMap selection
 
-PyFinder selects a ShakeMap service profile for each calculation from the selected
-FinDer solution's location. Configure `shakemap["regional-configurations"]` in
-`pyfinder/pyfinderconfig.py` with country codes and service profile names. The
-catalog is independent of FinDer computational configurations; several FinDer
-profiles may use one ShakeMap profile, and countries may share a service name.
+PyFinder selects a ShakeMap service profile from the selected FinDer solution's
+location, using the same coordinates it exports in `event.xml`. Configure
+`shakemap["regional-configurations"]` in `pyfinder/pyfinderconfig.py` with arbitrary
+human region labels. Each entry declares a packaged WKT coverage file and its
+service profile name. Labels and profile names do not impose national boundaries.
 
-A unique country polygon match uses its mapped profile. Unmapped countries,
-offshore locations, unidentified countries and ambiguous shared borders use
-`global`. Invalid coordinates or missing/broken packaged country data fail the
-preparation instead of silently selecting global. A mapped unavailable regional
-profile is attempted first; only a confirmed eligible configuration failure
-allows one explicit global recovery. Both outcomes remain visible.
+A region may cover Switzerland, Italy and Germany together, split a CH-labelled
+area into separate configurations, or contain disjoint `MULTIPOLYGON` areas.
+Several regions may share one service profile. FinDer's computational regions and
+configuration names remain independent.
+
+Matching areas are resolved to service profiles before ambiguity is assessed:
+adjacent/overlapping areas using the same profile select it once. Different
+matching profiles produce a warning and use `global`; no priority order is
+inferred. Valid locations outside all registered WKT areas also use `global`.
+Invalid solution coordinates remain errors. Missing or unusable optional WKT
+resources log the region label, file and correction, then conservatively use
+global for that calculation; the service processes remain running.
+
+The independent files live in `pyfinder/extern/shakemap_regional_wkt/`. They must
+contain valid WGS84 longitude/latitude `POLYGON` or `MULTIPOLYGON` geometry. The nine
+initial seeds preserve the previous footprints; their
+[provenance](docs/shakemap-region-coverage.md) is recorded separately.
+Edit/add resources and rebuild/redeploy the caller for intended regional coverage.
+Only explicitly registered files are used. Runtime selection does not read a
+country-code database or copy FinDer's WKT resources.
+
+A selected native profile is attempted even if service discovery reports it
+missing. Only its confirmed eligible configuration failure permits one explicit
+global recovery; both outcomes remain visible. Native scientific assets remain
+service-owned; use its supported provisioning or image-installation paths when
+those files are supplied. Their presence, compatibility and scientific
+qualification are separate from caller coverage selection.
 
 The process-wide `PYFINDER_SHAKEMAP_CONFIGURATION` override and old local-profile
 settings are obsolete: PyFinder warns and ignores them without interrupting

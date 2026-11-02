@@ -86,7 +86,7 @@ class SchedulerShakeMapTests(unittest.TestCase):
             tracker=tracker,
             service_policies={"RRSM": RRSMQueryPolicy()},
             finder_config_selector=SelectorDouble(),
-            configuration={"shakemap": {"regional-configurations": {"ch": "global"}, "overwrite": True}},
+            configuration={"shakemap": {"regional-configurations": {"Shared Swiss coverage": {"wkt": "switzerland.wkt", "configuration": "global"}}, "overwrite": True}},
             logger=logging.getLogger("test.scheduler.shakemap"),
             shakemap_workflow=workflow,
             shakemap_inputs=PreparedShakeMapInputs(self.inputs),
@@ -126,7 +126,7 @@ class SchedulerShakeMapTests(unittest.TestCase):
         before = scheduler.shakemap_workflow.prepared_scheduled_submissions(attempt_ids=[token])
         self.assertEqual(before[0]["configuration"], "global")
         self.assertIsNone(scheduler.shakemap_workflow.get(token))
-        scheduler.configuration["shakemap"]["regional-configurations"]["ch"] = "switzerland"
+        scheduler.configuration["shakemap"]["regional-configurations"]["Shared Swiss coverage"]["configuration"] = "switzerland"
         manager = scheduler._finder_manager_class
         with patch.object(manager, "select_shakemap_configuration", side_effect=AssertionError("must retain preparation")), \
              patch.object(manager, "prepare_shakemap", side_effect=AssertionError("must retain bytes")), \
@@ -366,14 +366,14 @@ class SchedulerShakeMapTests(unittest.TestCase):
         self.assertEqual(_build_shakemap_boundary({}, None), (None, None))
         settings = {
             "service-enabled": True, "service-url": "http://fake:8000",
-            "input-directory": str(self.inputs), "regional-configurations": {"ch": "italy"},
+            "input-directory": str(self.inputs), "regional-configurations": {"Shared Swiss coverage": {"wkt": "switzerland.wkt", "configuration": "italy"}},
         }
         workflow, inputs = _build_shakemap_boundary({"shakemap": settings}, self.path)
         self.addCleanup(workflow.close)
         self.assertIsInstance(inputs, PreparedShakeMapInputs)
         self.assertEqual(workflow.unresolved(), [])
         with self.assertRaises(ValueError):
-            _build_shakemap_boundary({"shakemap": {**settings, "regional-configurations": {"ch": "old/path"}}}, self.path)
+            _build_shakemap_boundary({"shakemap": {**settings, "regional-configurations": {"Shared Swiss coverage": {"wkt": "switzerland.wkt", "configuration": "old/path"}}}}, self.path)
 
 
 if __name__ == "__main__":

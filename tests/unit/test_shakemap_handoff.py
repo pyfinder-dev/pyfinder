@@ -16,7 +16,7 @@ from pyfinder.eventcontext import EventContext, EventContextError
 from pyfinder.findermanager import FinDerManager
 from pyfinder.services.shakemap_inputs import PreparedShakeMapInputs
 from pyfinder.pyfinderconfig import pyfinderconfig
-from pyfinder.utils.regionlocator import RegionLocator, _country_records
+from pyfinder.utils.regionlocator import RegionLocator, _region_geometry
 from tests.unit.test_shakemap_inputs import make_solution
 
 
@@ -45,17 +45,18 @@ class ManagerShakeMapHandoffTests(unittest.TestCase):
         self.assertEqual(manager.select_shakemap_configuration(solution), "italy")
         solution.event.latitude, solution.event.longitude = 37.0, 36.0
         self.assertEqual(manager.select_shakemap_configuration(solution), "global")
-        manager.configuration["shakemap"]["regional-configurations"]["tr"] = "italy"
-        self.assertEqual(manager.select_shakemap_configuration(solution), "italy")
 
-    def test_actual_packaged_country_identifiers_work_away_from_checkout(self):
+    def test_packaged_wkt_selection_works_away_from_checkout_without_country_data(self):
         previous = Path.cwd()
+        catalog = pyfinderconfig["shakemap"]["regional-configurations"]
         with tempfile.TemporaryDirectory() as directory:
             try:
                 os.chdir(directory)
-                self.assertEqual(RegionLocator().get_region(46.8, 8.2), "ch")
-                self.assertEqual(RegionLocator().get_region(48.8, 2.3), "fr")
-                self.assertIsNone(RegionLocator().get_region(0, -140))
+                with patch("geopandas.read_file", side_effect=AssertionError("no country lookup")):
+                    locator = RegionLocator(catalog)
+                    self.assertEqual(locator.get_configuration(46.8, 8.2), "switzerland")
+                    self.assertEqual(locator.get_configuration(48.8, 2.3), "france")
+                    self.assertEqual(locator.get_configuration(0, -140), "global")
             finally:
                 os.chdir(previous)
 
@@ -72,37 +73,6 @@ class ManagerShakeMapHandoffTests(unittest.TestCase):
                                         zip((swiss, italian), solutions)))
         self.assertEqual(results, ["switzerland", "italy"])
         self.assertEqual(swiss.configuration, before)
-
-    def test_boundary_ambiguity_unknown_territory_and_invalid_coordinates(self):
-        from shapely.geometry import box
-
-        locator = RegionLocator()
-        records = (("ch", box(0, 0, 1, 1)), ("it", box(1, 0, 2, 1)),
-                   (None, box(3, 0, 4, 1)))
-        with patch("pyfinder.utils.regionlocator._country_records", return_value=records):
-            self.assertEqual(locator.get_region(0.5, 0), "ch")
-            self.assertIsNone(locator.get_region(0.5, 1))
-            self.assertIsNone(locator.get_region(0.5, 3.5))
-            self.assertIsNone(locator.get_region(0.5, 8))
-        for lat, lon in ((True, 0), (None, 0), (91, 0), (0, 181), (float("nan"), 0)):
-            with self.subTest(lat=lat, lon=lon), self.assertRaisesRegex(ValueError, "requires finite"):
-                locator.get_region(lat, lon)
-        with patch("pyfinder.utils.regionlocator._country_records", side_effect=ValueError("missing country data")):
-            with self.assertRaisesRegex(ValueError, "missing country data"):
-                locator.get_region(46, 7)
-
-    def test_country_cache_reuses_materialized_data_and_reports_broken_resource(self):
-        _country_records.cache_clear()
-        self.addCleanup(_country_records.cache_clear)
-        import geopandas
-        with patch("geopandas.read_file", wraps=geopandas.read_file) as read:
-            RegionLocator().get_region(46.8, 8.2)
-            RegionLocator().get_region(42, 13)
-        read.assert_called_once()
-        _country_records.cache_clear()
-        with patch("geopandas.read_file", side_effect=OSError("missing companion")):
-            with self.assertRaisesRegex(ValueError, "packaged ShakeMap country boundaries"):
-                RegionLocator().get_region(46, 7)
 
     def test_selected_solution_identity_and_physical_time_are_preserved(self):
         manager = self.manager()
@@ -143,6 +113,131 @@ class ManagerShakeMapHandoffTests(unittest.TestCase):
         manager.entry_kind = FinDerManager.ON_DEMAND
         identity, _ = manager.prepare_shakemap(make_solution())
         self.assertEqual(identity, "earthquake_t00005")
+
+
+class RegionalCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.resources = self.root / "extern" / "shakemap_regional_wkt"
+        self.resources.mkdir(parents=True)
+        patcher = patch("pyfinder.utils.regionlocator.resources.files", return_value=self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        _region_geometry.cache_clear()
+        self.addCleanup(_region_geometry.cache_clear)
+        self.logger = logging.getLogger("test.shakemap.regional-coverage")
+
+    def write_region(self, filename, geometry):
+        (self.resources / filename).write_text(geometry.wkt)
+
+    def test_arbitrary_cross_border_and_disjoint_regions_share_a_profile(self):
+        from shapely.geometry import MultiPolygon, box
+
+        self.write_region("central.wkt", box(6, 36, 16, 55))
+        self.write_region("disjoint.wkt", MultiPolygon([
+            box(-2, -2, 0, 0),
+            box(3, 3, 4, 4),
+        ]))
+        catalog = {
+            "CH + Italy + Germany": {
+                "wkt": "central.wkt",
+                "configuration": "shared-central",
+            },
+            "Two separate offshore areas": {
+                "wkt": "disjoint.wkt",
+                "configuration": "shared-central",
+            },
+        }
+        locator = RegionLocator(catalog, logger=self.logger)
+        for latitude, longitude in ((46.8, 8.2), (42, 13), (52, 13), (-1, -1), (3.5, 3.5)):
+            with self.subTest(latitude=latitude, longitude=longitude):
+                self.assertEqual(locator.get_configuration(latitude, longitude), "shared-central")
+        self.assertEqual(locator.get_configuration(1, 1), "global")
+
+    def test_split_areas_same_profile_border_and_conflicting_overlap(self):
+        from shapely.geometry import box
+
+        self.write_region("west.wkt", box(6, 46, 8, 48))
+        self.write_region("east.wkt", box(8, 46, 10, 48))
+        catalog = {
+            "CH / west": {"wkt": "west.wkt", "configuration": "west-model"},
+            "CH / east": {"wkt": "east.wkt", "configuration": "east-model"},
+        }
+        locator = RegionLocator(catalog, logger=self.logger)
+        self.assertEqual(locator.get_configuration(47, 7), "west-model")
+        self.assertEqual(locator.get_configuration(47, 9), "east-model")
+        with self.assertLogs(self.logger, level="WARNING") as messages:
+            self.assertEqual(locator.get_configuration(47, 8), "global")
+        self.assertIn("conflicting configurations", " ".join(messages.output))
+
+        catalog["CH / east"]["configuration"] = "west-model"
+        self.assertEqual(
+            RegionLocator(catalog).get_configuration(47, 8),
+            "west-model",
+        )
+        self.write_region("overlap.wkt", box(7, 46, 9, 48))
+        catalog["Central overlapping area"] = {
+            "wkt": "overlap.wkt",
+            "configuration": "west-model",
+        }
+        self.assertEqual(RegionLocator(catalog).get_configuration(47, 8), "west-model")
+        catalog["Central overlapping area"]["configuration"] = "different-model"
+        with self.assertLogs(self.logger, level="WARNING"):
+            self.assertEqual(
+                RegionLocator(catalog, logger=self.logger).get_configuration(47, 8),
+                "global",
+            )
+
+    def test_missing_or_corrupt_optional_wkt_warns_global_and_can_be_restored(self):
+        from shapely.geometry import box
+
+        self.write_region("valid.wkt", box(0, 0, 2, 2))
+        catalog = {
+            "Available area": {"wkt": "valid.wkt", "configuration": "regional"},
+            "Files supplied later": {"wkt": "later.wkt", "configuration": "other"},
+        }
+        locator = RegionLocator(catalog, logger=self.logger)
+        with self.assertLogs(self.logger, level="WARNING") as messages:
+            self.assertEqual(locator.get_configuration(1, 1), "global")
+        self.assertIn("Files supplied later", " ".join(messages.output))
+        self.assertIn(str(self.resources / "later.wkt"), " ".join(messages.output))
+
+        (self.resources / "later.wkt").write_text("not WKT")
+        with self.assertLogs(self.logger, level="WARNING") as messages:
+            self.assertEqual(locator.get_configuration(1, 1), "global")
+        self.assertIn("unusable WKT", " ".join(messages.output))
+
+        (self.resources / "later.wkt").write_text(
+            "POLYGON ((0 0, 1 1, 1 0, 0 1, 0 0))"
+        )
+        with self.assertLogs(self.logger, level="WARNING"):
+            self.assertEqual(locator.get_configuration(1, 1), "global")
+
+        self.write_region("later.wkt", box(5, 5, 6, 6))
+        self.assertEqual(locator.get_configuration(1, 1), "regional")
+
+    def test_invalid_solution_coordinates_still_error_and_successes_are_cached(self):
+        from shapely.geometry import box
+
+        self.write_region("valid.wkt", box(0, 0, 2, 2))
+        locator = RegionLocator({
+            "Any human label": {"wkt": "valid.wkt", "configuration": "regional"},
+        })
+        for lat, lon in ((True, 0), (None, 0), (91, 0), (0, 181), (float("nan"), 0)):
+            with self.subTest(lat=lat, lon=lon), self.assertRaisesRegex(ValueError, "requires finite"):
+                locator.get_configuration(lat, lon)
+
+        def read_text(path, **kwargs):
+            with path.open(encoding=kwargs.get("encoding")) as stream:
+                return stream.read()
+
+        # Preserve the actual file read while observing cache use.
+        with patch.object(Path, "read_text", autospec=True, side_effect=read_text) as read:
+            self.assertEqual(locator.get_configuration(1, 1), "regional")
+            self.assertEqual(locator.get_configuration(1.5, 1.5), "regional")
+        read.assert_called_once()
 
 
 class PreparedShakeMapInputsTests(unittest.TestCase):

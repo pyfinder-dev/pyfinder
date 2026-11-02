@@ -8,7 +8,6 @@ from copy import deepcopy
 from collections.abc import Mapping
 import logging
 import os
-import re
 
 from pyfinder.runtime import RuntimeBootstrapError
 from pyfinder.services.shakemap_client import ShakeMapClient
@@ -29,31 +28,51 @@ ENVIRONMENT_SETTINGS = {
 def validate_regional_configurations(settings):
     """Validate routing syntax without importing geography or contacting a service."""
     # Check the catalog itself before examining entries. This keeps an absent
-    # routing policy distinct from a malformed country code or service name.
+    # routing policy distinct from a malformed region entry or service name.
     catalog = settings.get("regional-configurations")
     if not isinstance(catalog, Mapping) or not catalog:
         raise ValueError(
             "shakemap.regional-configurations must be a nonempty "
-            "country-to-service-profile mapping"
+            "region-to-geometry-and-service-profile mapping"
         )
 
     if type(settings.get("overwrite", True)) is not bool:
         raise ValueError("PYFINDER_SHAKEMAP_OVERWRITE must be a boolean")
 
-    for country, profile in catalog.items():
+    for label, region in catalog.items():
         if (
-            not isinstance(country, str)
-            or re.fullmatch(r"[a-z]{2}", country) is None
+            not isinstance(label, str)
+            or not label.strip()
+            or not label.isprintable()
         ):
             raise ValueError(
-                "shakemap.regional-configurations requires lowercase "
-                "two-letter country codes"
+                "shakemap.regional-configurations requires nonempty, "
+                "printable region labels"
+            )
+
+        if not isinstance(region, Mapping) or set(region) != {"wkt", "configuration"}:
+            raise ValueError(
+                "Each shakemap.regional-configurations entry must declare "
+                "wkt and configuration"
+            )
+
+        filename = region["wkt"]
+        if (
+            not isinstance(filename, str)
+            or not filename.endswith(".wkt")
+            or "/" in filename
+            or "\\" in filename
+            or not filename.isprintable()
+        ):
+            raise ValueError(
+                "Regional wkt must name a .wkt file in the packaged "
+                "shakemap_regional_wkt directory, without path separators"
             )
 
         ShakeMapClient.validate_submission(
             "configuration-check",
             {},
-            configuration=profile,
+            configuration=region["configuration"],
             overwrite=settings.get("overwrite", True),
         )
 

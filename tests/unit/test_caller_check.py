@@ -42,7 +42,7 @@ class CallerCheckTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["settings"]["regional_configurations"]["ch"], "switzerland")
+        self.assertEqual(result["settings"]["regional_configurations"]["switzerland"]["configuration"], "switzerland")
         self.assertEqual(result["settings"]["input_directory"], str(self.inputs))
         self.assertEqual(configuration, before)
         self.assertEqual(list(self.inputs.iterdir()), [])
@@ -117,7 +117,7 @@ class CallerCheckTests(unittest.TestCase):
         result = json.loads(completed.stdout)
         self.assertEqual(len(result["warnings"]), 1)
         self.assertNotIn("private-obsolete-value", completed.stdout + completed.stderr)
-        self.assertEqual(result["settings"]["regional_configurations"]["ch"], "switzerland")
+        self.assertEqual(result["settings"]["regional_configurations"]["switzerland"]["configuration"], "switzerland")
         self.assertEqual(list(self.inputs.iterdir()), [])
 
 

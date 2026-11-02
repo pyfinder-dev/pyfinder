@@ -269,17 +269,15 @@ class FinDerManager:
         # Its location, rather than an upstream alert or FinDer profile name,
         # is also the location written into the exported event.xml.
         event = copy(solution.get_event())
-        country = RegionLocator(logger=self.logger).get_region(
+        selected = RegionLocator(
+            self.configuration["shakemap"]["regional-configurations"],
+            logger=self.logger,
+        ).get_configuration(
             event.get_latitude(),
             event.get_longitude(),
         )
-
-        selected = self.configuration["shakemap"]["regional-configurations"].get(
-            country, "global"
-        )
         self.logger.info(
-            "ShakeMap selected-solution country=%s configuration=%s",
-            country or "unmatched",
+            "ShakeMap selected-solution configuration=%s",
             selected,
         )
         return selected

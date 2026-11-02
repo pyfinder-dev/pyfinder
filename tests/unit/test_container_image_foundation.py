@@ -13,6 +13,7 @@ ENTRYPOINT = PROJECT_ROOT / "scripts/pyfinder-entrypoint"
 BASE_IMAGE = "ghcr.io/sceylan/finder-base:gmt5"
 RESOURCE_DIRECTORIES = (
     Path("pyfinder/extern/finder_regional_wkt"),
+    Path("pyfinder/extern/shakemap_regional_wkt"),
     Path("pyfinder/extern/ne_110m_admin_0_countries"),
 )
 OS_METADATA_NAMES = frozenset((".DS_Store", "Thumbs.db", "desktop.ini"))

@@ -71,30 +71,54 @@ pyfinderconfig = {
         # web services are used.
         "use-amplitude-from-finder-output": False,
 
-        # Map a location-lookup code (key) to a ShakeMap service profile (value).
-        # The current locator returns lowercase two-letter codes from the
-        # packaged country polygons, such as "ch", "it" and "de". Keys are not
-        # arbitrary region labels: they must match a code returned by that
-        # lookup. Validation checks the two-letter format, not code membership.
+        # Each key is a human region label, not a country code or FinDer ID.
+        # The WKT file defines its actual coverage in WGS84 lon/lat coordinates;
+        # labels do not impose national boundaries. A region may cross borders,
+        # be one of several subregions, or contain disjoint MULTIPOLYGON areas.
         #
-        # Values are exact configuration names supplied by the ShakeMap service,
-        # not local paths or FinDer profile names. Several keys may share one
-        # value. Names must be nonempty UTF-8 basenames of at most 255 bytes,
-        # without "/" or control characters, and cannot be "." or "..".
-        #
-        # Keep this mapping nonempty. Valid locations with no mapped code use
-        # "global". This table does not define arbitrary region geometries or
-        # subregions; that is a limitation of the current country-based lookup.
+        # configuration is the exact ShakeMap service profile for that area.
+        # Several areas may share it, independently of FinDer's configurations.
+        # The WKT basename resolves under extern/shakemap_regional_wkt; adding or
+        # editing these packaged resources requires a caller rebuild/redeploy.
+        # Keep the catalog nonempty. Uncovered or conflicting coverage uses
+        # global; missing/unusable optional WKT logs a warning and uses global.
         "regional-configurations": {
-            "al": "albania",
-            "be": "belgium",
-            "hr": "croatia",
-            "fr": "france",
-            "gr": "greece",
-            "it": "italy",
-            "ro": "romania",
-            "si": "slovenia",
-            "ch": "switzerland",
+            "albania": {
+                "wkt": "albania.wkt",
+                "configuration": "albania",
+            },
+            "belgium": {
+                "wkt": "belgium.wkt",
+                "configuration": "belgium",
+            },
+            "croatia": {
+                "wkt": "croatia.wkt",
+                "configuration": "croatia",
+            },
+            "france": {
+                "wkt": "france.wkt",
+                "configuration": "france",
+            },
+            "greece": {
+                "wkt": "greece.wkt",
+                "configuration": "greece",
+            },
+            "italy": {
+                "wkt": "italy.wkt",
+                "configuration": "italy",
+            },
+            "romania": {
+                "wkt": "romania.wkt",
+                "configuration": "romania",
+            },
+            "slovenia": {
+                "wkt": "slovenia.wkt",
+                "configuration": "slovenia",
+            },
+            "switzerland": {
+                "wkt": "switzerland.wkt",
+                "configuration": "switzerland",
+            },
         },
     },
 

@@ -339,13 +339,40 @@ ownership; unrelated REST writers do not participate in the PyFinder lock.
 
 Each automatic request selects a service profile from the selected FinDer
 solution's location, matching the coordinates exported in `event.xml`.
-`shakemap.regional-configurations` maps country codes to service profile names.
-FinDer computational profiles remain independent: Swiss Alpine and Foreland may
-both use `switzerland`, and mapping values need not be unique. The packaged
-country polygons use boundary-inclusive coverage. Offshore/unmatched locations,
-unknown country identifiers and ambiguous shared-country borders use `global`;
-invalid coordinates or broken country resources fail rather than silently
-selecting a model. A nonempty catalog is required.
+`shakemap.regional-configurations` is an independent region catalog:
+
+```python
+"regional-configurations": {
+    "Central shared area": {
+        "wkt": "central-europe.wkt",
+        "configuration": "central-model",
+    },
+    "CH western subregion": {
+        "wkt": "western-area.wkt",
+        "configuration": "western-model",
+    },
+}
+```
+
+Keys are printable human labels, not country codes or FinDer names. `wkt` names a
+file in packaged `extern/shakemap_regional_wkt/`; `configuration` is the exact
+native service profile. Coverage may cross national borders, split an area, or
+use disjoint `MULTIPOLYGON` geometry. Several entries can share a profile. The
+examples name proposed files, not additional supplied scientific data.
+
+Only a nonempty, syntactically valid catalog is required at startup. WKT reads
+are lazy and successful geometry is cached. Any missing/unusable registered file
+makes coverage incomplete: the calculation logs its label/path/problem and uses
+global instead of selecting from a partial catalog. Restore/correct the resource
+and rebuild/redeploy the caller; service processes need not be stopped just
+because optional regional files are unavailable.
+
+Boundary-inclusive matching resolves service profiles first. Multiple matching
+areas with one shared profile select it once; conflicting profiles warn and use
+global. No matching geometry uses global. Invalid solution coordinates remain an
+error. Geometry must be valid WGS84 lon/lat `POLYGON` or `MULTIPOLYGON`; no repair,
+reprojection, nearest-country assignment or implicit priority is performed.
+FinDer computational profiles remain unchanged and independent.
 
 The service executes exactly that requested profile. It has no fallback; caller
 recovery uses a distinct API submission. A missing service profile is still

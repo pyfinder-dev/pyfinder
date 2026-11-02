@@ -30,7 +30,8 @@ class ShakeMapSettingsTests(unittest.TestCase):
         configured = continuous_shakemap_configuration(pyfinderconfig, environment={})
         self.assertEqual(configured, expected)
         self.assertFalse(configured["shakemap"]["service-enabled"])
-        configured["shakemap"]["regional-configurations"]["ch"] = "changed"
+        catalog = configured["shakemap"]["regional-configurations"]
+        catalog["switzerland"]["configuration"] = "changed"
         self.assertEqual(pyfinderconfig, expected)
 
     def test_enablement_reuses_global_and_overwrite_defaults_without_io(self):
@@ -41,7 +42,10 @@ class ShakeMapSettingsTests(unittest.TestCase):
                 pyfinderconfig, environment=self.enabled_environment()
             )
         self.assertTrue(configured["shakemap"]["service-enabled"])
-        self.assertEqual(configured["shakemap"]["regional-configurations"]["ch"], "switzerland")
+        self.assertEqual(
+            configured["shakemap"]["regional-configurations"]["switzerland"]["configuration"],
+            "switzerland",
+        )
         self.assertTrue(configured["shakemap"]["overwrite"])
         database.assert_not_called()
         request.assert_not_called()
@@ -55,7 +59,10 @@ class ShakeMapSettingsTests(unittest.TestCase):
         settings = continuous_shakemap_configuration(
             pyfinderconfig, environment=environment
         )["shakemap"]
-        self.assertEqual(settings["regional-configurations"]["ch"], "switzerland")
+        self.assertEqual(
+            settings["regional-configurations"]["switzerland"]["configuration"],
+            "switzerland",
+        )
         self.assertEqual(settings["request-timeout-seconds"], 12.5)
         self.assertFalse(settings["overwrite"])
         self.assertEqual(settings["input-directory"], self.root)
@@ -88,9 +95,25 @@ class ShakeMapSettingsTests(unittest.TestCase):
 
     def test_catalog_validation_allows_shared_profiles_and_rejects_incomplete_routing(self):
         configured = deepcopy(pyfinderconfig)
-        configured["shakemap"]["regional-configurations"] = {"it": "shared", "ch": "shared"}
+        configured["shakemap"]["regional-configurations"] = {
+            "CH + IT + Germany": {
+                "wkt": "combined.wkt",
+                "configuration": "shared",
+            },
+            "CH-2": {
+                "wkt": "other.wkt",
+                "configuration": "shared",
+            },
+        }
         self.assertEqual(continuous_shakemap_configuration(configured, environment={}), configured)
-        for catalog in ({}, {"CH": "switzerland"}, {"ch": "../switzerland"}, None):
+        for catalog in (
+            {},
+            {"CH": "switzerland"},
+            {"CH": {"wkt": "../other.wkt", "configuration": "switzerland"}},
+            {"CH": {"wkt": "other.wkt", "configuration": "../switzerland"}},
+            {"": {"wkt": "other.wkt", "configuration": "switzerland"}},
+            None,
+        ):
             configured["shakemap"]["regional-configurations"] = catalog
             with self.subTest(catalog=catalog), self.assertRaises(RuntimeBootstrapError):
                 continuous_shakemap_configuration(configured, environment={})

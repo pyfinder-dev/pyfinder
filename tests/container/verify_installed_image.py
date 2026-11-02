@@ -379,26 +379,46 @@ def main():
         "ParamWS created a log outside its mounted process directory",
     )
 
-    # Exercise real packaged geography outside a source checkout. This verifies
-    # installed resources and regional routing, not native country-model science.
+    # Exercise independent packaged WKT outside a source checkout. These seed
+    # footprints verify caller routing, not the native profiles' scientific use.
     from pyfinder.utils.regionlocator import RegionLocator
     from pyfinder.findermanager import FinDerManager
     from pyfinder.finderutils import FinderEvent, FinderSolution
     from pyfinder.services.shakemap_settings import validate_regional_configurations
 
     validate_regional_configurations(pyfinderconfig["shakemap"])
-    locator = RegionLocator()
-    require(locator.get_region(48.8, 2.3) == "fr", "France country identifier failed")
-    require(locator.get_region(0, -140) is None, "offshore location did not use global coverage")
+    # Keep verification fixtures independent of an operator's active catalog.
+    # A valid custom catalog may legitimately rename profiles or cover offshore
+    # points. These shipped seed polygons test only the installed selector/data.
+    verification_catalog = {
+        "First installed seed area": {
+            "wkt": "switzerland.wkt",
+            "configuration": "installed-shared-profile",
+        },
+        "Second independent seed area": {
+            "wkt": "italy.wkt",
+            "configuration": "installed-shared-profile",
+        },
+    }
+    locator = RegionLocator(verification_catalog)
+    require(
+        locator.get_configuration(0, -140) == "global",
+        "uncovered location did not use global coverage",
+    )
     manager = object.__new__(FinDerManager)
     manager.configuration = deepcopy(pyfinderconfig)
+    manager.configuration["shakemap"]["regional-configurations"] = verification_catalog
     manager.logger = logging.getLogger("installed-regional-selection")
-    for latitude, longitude, expected in ((46.8, 8.2, "switzerland"), (42, 13, "italy")):
-        solution = FinderSolution(event=FinderEvent(latitude=latitude, longitude=longitude))
+    for latitude, longitude in ((46.8, 8.2), (42, 13)):
+        solution = FinderSolution(
+            event=FinderEvent(latitude=latitude, longitude=longitude),
+        )
         for finder_name in ("independent-model-a", "independent-model-b"):
             manager.finder_configuration_name = finder_name
-            require(manager.select_shakemap_configuration(solution) == expected,
-                    "installed ShakeMap selection followed the wrong regional catalog")
+            require(
+                manager.select_shakemap_configuration(solution) == "installed-shared-profile",
+                "installed ShakeMap selection followed the wrong regional catalog",
+            )
 
     event_data = ControlledEvent()
     observations = [

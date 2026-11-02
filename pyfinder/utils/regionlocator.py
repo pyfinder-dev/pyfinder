@@ -1,78 +1,56 @@
-"""Locate countries for ShakeMap without coupling them to FinDer regions."""
+"""Select ShakeMap service configurations from independent registered regions."""
 
 from functools import lru_cache
 from importlib import resources
 import logging
 import math
-import re
 
 
-@lru_cache(maxsize=1)
-def _country_records():
-    """Read the packaged shapefile family once and retain only in-memory data."""
-    import geopandas
+@lru_cache(maxsize=None)
+def _region_geometry(filename):
+    """Cache valid packaged WKT geometry; failed reads remain retryable."""
+    from shapely import from_wkt
 
-    directory = resources.files("pyfinder").joinpath(
-        "extern", "ne_110m_admin_0_countries"
+    resource = resources.files("pyfinder").joinpath(
+        "extern", "shakemap_regional_wkt", filename,
     )
     try:
-        # Keep the whole directory materialized while GDAL reads its companion
-        # files. No cached path may outlive a temporary package extraction.
-        with resources.as_file(directory) as path:
-            countries = geopandas.read_file(path / "ne_110m_admin_0_countries.shp")
+        geometry = from_wkt(resource.read_text(encoding="utf-8"))
+        if (
+            geometry is None
+            or geometry.is_empty
+            or not geometry.is_valid
+            or geometry.geom_type not in {"Polygon", "MultiPolygon"}
+        ):
+            raise ValueError("expected a nonempty, valid POLYGON or MULTIPOLYGON")
 
-        if countries.crs is None or countries.crs.to_epsg() != 4326:
-            raise ValueError("country data must use EPSG:4326")
+        west, south, east, north = geometry.bounds
+        if not (
+            -180 <= west <= east <= 180
+            and -90 <= south <= north <= 90
+        ):
+            raise ValueError("WKT coordinates must be WGS84 longitude/latitude")
 
-        if not {"ISO_A2", "ISO_A2_EH", "geometry"}.issubset(countries.columns):
-            raise ValueError("country identifier or geometry fields are missing")
-
-        records = []
-        for row in countries.itertuples(index=False):
-            geometry = row.geometry
-            if (
-                geometry is None
-                or geometry.is_empty
-                or not geometry.is_valid
-                or geometry.geom_type not in {"Polygon", "MultiPolygon"}
-            ):
-                raise ValueError("country data contains an unusable polygon")
-
-            code = next(
-                (
-                    value.lower()
-                    for value in (row.ISO_A2, row.ISO_A2_EH)
-                    if isinstance(value, str)
-                    and re.fullmatch(r"[A-Za-z]{2}", value)
-                ),
-                None,
-            )
-            # Some disputed territories have no two-letter identifier in either
-            # field. Keep their polygons, so those locations honestly use global.
-            records.append((code, geometry))
-
-        if not records:
-            raise ValueError("country data contains no polygons")
-
-        return tuple(records)
+        return geometry
     except Exception as error:
-        raise ValueError(
-            "Cannot load packaged ShakeMap country boundaries: "
-            f"{error}; verify the installed country shapefile and its companion files"
-        ) from error
+        raise ValueError(f"{resource}: {error}") from error
 
 
 class RegionLocator:
-    """Use unambiguous country coverage; offshore and shared borders use global."""
+    """Resolve coverage to a profile without depending on country or FinDer IDs."""
 
-    def __init__(self, *, logger=None):
+    def __init__(self, catalog, *, logger=None):
         self.logger = logger or logging.getLogger(__name__)
+        self.regions = tuple(
+            (label, region["wkt"], region["configuration"])
+            for label, region in catalog.items()
+        )
 
-    def get_region(self, lat, lon):
+    def get_configuration(self, lat, lon):
         from shapely.geometry import Point
 
-        # Reject unusable coordinates before loading the packaged data. A bad
-        # solution must not be reported as an ordinary lack of regional coverage.
+        # A malformed solution is not ordinary lack of coverage. Validate it
+        # before reading optional regional resources or choosing global.
         coordinates = []
         for value, label, limit in ((lat, "latitude", 90), (lon, "longitude", 180)):
             try:
@@ -91,26 +69,62 @@ class RegionLocator:
             coordinates.append(number)
 
         point = Point(coordinates[1], coordinates[0])
+        profiles = set()
+        matched_labels = []
+        incomplete_coverage = False
 
-        # Cached records are never modified by concurrent workers. Repeated
-        # features for one country do not create a false border conflict.
-        matches = {
-            code
-            for code, geometry in _country_records()
-            if geometry.covers(point)
-        }
-        if len(matches) == 1 and None not in matches:
-            return matches.pop()
+        for label, filename, profile in self.regions:
+            try:
+                geometry = _region_geometry(filename)
+            except ValueError as error:
+                # A missing polygon could cover this point. Continuing with
+                # another region would pretend the partial catalog is complete.
+                # Log the exact resource, use global for this attempt and leave
+                # services running so corrected files can be used after redeploy.
+                self.logger.warning(
+                    "ShakeMap region %s has unusable WKT %s: %s. "
+                    "Restore/correct the registered file and rebuild the caller; "
+                    "this calculation uses global.",
+                    label,
+                    filename,
+                    error,
+                )
+                incomplete_coverage = True
+                continue
 
-        reason = (
-            "no country coverage"
-            if not matches else
-            "ambiguous or unidentified country coverage"
-        )
-        self.logger.info(
-            "ShakeMap country lookup uses global: %s at latitude=%s longitude=%s",
-            reason,
-            coordinates[0],
-            coordinates[1],
-        )
-        return None
+            if geometry.covers(point):
+                # Regions are coverage areas, not priority slots. Adjacent or
+                # overlapping areas may deliberately share one service profile.
+                profiles.add(profile)
+                matched_labels.append(label)
+
+        if incomplete_coverage:
+            return "global"
+
+        if len(profiles) == 1:
+            selected = profiles.pop()
+            self.logger.info(
+                "ShakeMap matching regions=%s configuration=%s",
+                matched_labels,
+                selected,
+            )
+            return selected
+
+        if profiles:
+            self.logger.warning(
+                "ShakeMap regions %s select conflicting configurations %s at "
+                "latitude=%s longitude=%s; this calculation uses global.",
+                matched_labels,
+                sorted(profiles),
+                coordinates[0],
+                coordinates[1],
+            )
+        else:
+            self.logger.info(
+                "No registered ShakeMap region covers latitude=%s longitude=%s; "
+                "this calculation uses global.",
+                coordinates[0],
+                coordinates[1],
+            )
+
+        return "global"
