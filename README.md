@@ -152,7 +152,7 @@ warnings are retained in the owning continuous or playback process log, and the
 source settings check includes them as separate warning metadata. Invalid
 supported settings still fail validation. The service's per-request configuration field
 and manual `shake-in-docker` selection remain supported. See the
-[adapter guide](docs/shakemap-adapter.md) and
+[adapter configuration](docs/shakemap-adapter.md#workflow-configuration-and-input-ownership) and
 [deployment migration instructions](../pyfinder-deploy/README.md#upgrade-the-caller)
 for coordinated settings/image updates. Existing prepared requests retain their
 selected profile and inputs across restart; this change requires no queue reset.

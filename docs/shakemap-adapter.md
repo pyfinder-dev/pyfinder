@@ -262,9 +262,11 @@ external records. It does not wait for native calculations to finish.
 
 ## Workflow configuration and input ownership
 
-Continuous and playback startup read these environment variables. They override
-a private copy of the packaged settings; no package file needs editing. Supplying
-an endpoint alone does not enable work. Playback requires the adapter to be
+Continuous and playback startup read these connection and enablement variables.
+They override a private copy of the packaged settings, so changing these values
+requires no package-file edit. The regional routing catalog is a separate source
+setting, described below. Supplying an endpoint alone does not enable work.
+Playback requires the adapter to be
 enabled because every selected schedule runs the full chain; a missing prerequisite
 is a startup error, not permission to stop after FinDer.
 
@@ -478,7 +480,7 @@ operator corrective actions are documented in the
 [configuration runbook](../../shakemap-docker/docs/configuration.md).
 
 
-### Read-only caller checks
+## Read-only caller checks
 
 The deployment repository's `make check` reports caller settings alongside
 service and profile diagnostics. Its caller settings check can also be run
@@ -498,11 +500,14 @@ A pass is not proof of the installed image or a successful native calculation.
 
 The report exposes the regional routing catalog, fixed global default and
 selected-solution coordinate source. It does not claim an event has selected a
-profile before a calculation exists. A diagnosed missing or invalid region never
-changes the submitted profile: PyFinder submits that region first
-and attempts `global` only after the exact accepted calculation confirms an
-eligible regional configuration failure. Service health, name discovery and a
-static settings check do not guarantee global fallback success.
+profile before a calculation exists. A missing native service profile or its
+datasets does not change the initial request: PyFinder submits that selected
+profile first. It requests `global` separately only after the exact accepted
+calculation confirms a configuration failure that permits recovery. Missing
+caller coverage WKT is different: without complete routing geometry, PyFinder
+logs the problem and chooses `global` before submission. Service health, name
+discovery and a static settings check do not guarantee that a later global
+calculation succeeds.
 
 `scripts/verify-pyfinder-image.sh --help` describes the separate active image
 verification. Running that helper without arguments creates and removes an
