@@ -19,7 +19,7 @@ os.environ["PARAMWS_LOG_FILE"] = str(
     Path(_PARAMWS_LOG_DIRECTORY.name) / "paramws.log")
 try:
     from pyfinder.eventcontext import EventContext
-    from pyfinder.pyfinderconfig import ESM_SHAKEMAP_SERVICE, pyfinderconfig
+    from pyfinder.pyfinderconfig import ESM_SHAKEMAP_SERVICE
     from pyfinder.utils.calculator import Calculator
     from pyfinder.utils import dataformatter
     from pyfinder.utils.dataformatter import ESMShakeMapDataFormatter
@@ -111,12 +111,6 @@ class ESMObservationNormalizationTests(unittest.TestCase):
     @staticmethod
     def _warning_messages(logger):
         return [str(call.args[0]) for call in logger.warning.call_args_list]
-
-    def test_shipped_component_selection_is_maximum_all(self):
-        self.assertEqual(
-            pyfinderconfig["general"]["component-selection"],
-            "maximum-all",
-        )
 
     def test_timestamp_comes_from_authoritative_event_context(self):
         context = EventContext.from_alert_mapping(

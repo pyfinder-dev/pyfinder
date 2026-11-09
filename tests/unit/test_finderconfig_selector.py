@@ -676,18 +676,27 @@ class FinderConfigSelectorTests(unittest.TestCase):
 
     def test_default_builder_uses_only_explicit_catalog_entries(self):
         accepted_wkt = {
-            "swiss_alpine.wkt":
+            "first.wkt":
                 "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
-            "swiss_foreland.wkt":
+            "second.wkt":
                 "POLYGON ((2 2, 3 2, 3 3, 2 3, 2 2))",
-            "italy.wkt":
-                "POLYGON ((4 4, 5 4, 5 5, 4 5, 4 4))",
         }
         for filename, content in accepted_wkt.items():
             self.write_wkt(filename, content)
         self.write_wkt("unregistered.wkt", "not WKT")
 
+        # The builder must honor this explicit registration order without
+        # discovering other files, regardless of the application's catalog.
+        profiles = importlib.import_module("pyfinder.finderconfigs.profiles")
+        registered = (
+            self.regional_profile("first-model", "first.wkt"),
+            self.regional_profile("second-model", "second.wkt"),
+        )
         with mock.patch.object(
+            profiles, "GLOBAL_PROFILE", self.global_profile,
+        ), mock.patch.object(
+            profiles, "REGIONAL_PROFILES", registered,
+        ), mock.patch.object(
             Path,
             "iterdir",
             side_effect=AssertionError("selector must not scan WKT directory"),
@@ -715,16 +724,15 @@ class FinderConfigSelectorTests(unittest.TestCase):
 
         decision = selector.resolve(latitude=0.5, longitude=0.5)
 
-        self.assertEqual(decision.configuration_name, "switzerland-alpine")
+        self.assertEqual(decision.configuration_name, "first-model")
         self.assertEqual(
             tuple(
                 profile.wkt_filename
                 for profile, _geometry, _crs in selector._regional_geometries
             ),
             (
-                "swiss_alpine.wkt",
-                "swiss_foreland.wkt",
-                "italy.wkt",
+                "first.wkt",
+                "second.wkt",
             ),
         )
 

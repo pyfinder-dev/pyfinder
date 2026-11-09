@@ -8,49 +8,22 @@ import unittest
 from unittest import mock
 
 from pyfinder import pyfinderconfig as configuration_module
+from pyfinder import service_priority
 from pyfinder.pyfinderconfig import (
     EMSC_FELT_REPORT_SERVICE,
     ESM_SHAKEMAP_SERVICE,
     RRSM_PEAK_MOTION_SERVICE,
-    USGS_SHAKEMAP_SERVICE,
-    USGS_DYFI_SERVICE,
     pyfinderconfig,
 )
 from pyfinder.service_priority import resolve_service_priority
 
 
-SHIPPED_ENABLED = [
-    ESM_SHAKEMAP_SERVICE,
-    RRSM_PEAK_MOTION_SERVICE,
-]
-SHIPPED_PRIORITY = [
-    ESM_SHAKEMAP_SERVICE,
-    RRSM_PEAK_MOTION_SERVICE,
-    EMSC_FELT_REPORT_SERVICE,
-    USGS_SHAKEMAP_SERVICE,
-    USGS_DYFI_SERVICE,
-]
-
-
 class GlobalProviderConfigurationTests(unittest.TestCase):
-    def test_shipped_enabled_membership_and_priority_are_exact(self):
-        general = pyfinderconfig["general"]
-
-        self.assertEqual(general["services-enabled"], SHIPPED_ENABLED)
-        self.assertEqual(general["services-priority"], SHIPPED_PRIORITY)
-        self.assertNotIn("services", general)
-
     def test_corrected_felt_constant_exists_without_misspelled_alias(self):
         self.assertEqual(EMSC_FELT_REPORT_SERVICE, "EMSC_FeltReport")
         self.assertFalse(
             hasattr(configuration_module, "EMSC_FEELT_REPORT_SERVICE")
         )
-
-    def test_felt_service_has_priority_without_enabled_membership(self):
-        general = pyfinderconfig["general"]
-
-        self.assertIn(EMSC_FELT_REPORT_SERVICE, general["services-priority"])
-        self.assertNotIn(EMSC_FELT_REPORT_SERVICE, general["services-enabled"])
 
 
 class ServicePriorityResolverTests(unittest.TestCase):
@@ -71,10 +44,16 @@ class ServicePriorityResolverTests(unittest.TestCase):
         logger.critical.assert_not_called()
 
     def test_each_malformed_category_logs_critical_and_uses_shipped_order(self):
+        # Exercise fallback behavior with test-owned values so editing the
+        # project's provider priority does not require changing this test.
+        fallback_priority = (
+            RRSM_PEAK_MOTION_SERVICE,
+            ESM_SHAKEMAP_SERVICE,
+        )
         malformed_priorities = {
             "missing": None,
             "empty": [],
-            "not-list": tuple(SHIPPED_PRIORITY),
+            "not-list": fallback_priority,
             "duplicate-containing": [
                 ESM_SHAKEMAP_SERVICE,
                 RRSM_PEAK_MOTION_SERVICE,
@@ -89,10 +68,14 @@ class ServicePriorityResolverTests(unittest.TestCase):
                 )
                 logger = logging.Logger(self.id() + "." + category)
 
-                with self.assertLogs(
-                    logger,
-                    level=logging.CRITICAL,
-                ) as captured:
+                with (
+                    mock.patch.object(
+                        service_priority,
+                        "SHIPPED_SERVICE_PRIORITY",
+                        fallback_priority,
+                    ),
+                    self.assertLogs(logger, level=logging.CRITICAL) as captured,
+                ):
                     if category == "missing":
                         resolved = resolve_service_priority(logger=logger)
                     else:
@@ -101,7 +84,7 @@ class ServicePriorityResolverTests(unittest.TestCase):
                             logger=logger,
                         )
 
-                self.assertEqual(resolved, SHIPPED_PRIORITY)
+                self.assertEqual(resolved, list(fallback_priority))
                 self.assertEqual(
                     pyfinderconfig["general"]["services-enabled"],
                     enabled_before,

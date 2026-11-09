@@ -31,12 +31,15 @@ pyfinderconfig = {
     "general": {
         # Enabled services are a membership list. Their order does not express
         # scientific preference; that is owned separately by services-priority.
-        # USGS_SHAKEMAP_SERVICE and USGS_DYFI_SERVICE are opt-in. Their
-        # shipped priority follows the existing sources; enable them here
-        # and adjust services-priority only when a different rank is intended.
+        # EMSC felt reports and global DYFI reports supplement the instrumental
+        # sources. Available reports still depend on event association,
+        # publication and filtering; enablement does not guarantee observations.
+        # USGS ShakeMap station data remains opt-in.
         "services-enabled": [
             ESM_SHAKEMAP_SERVICE,
             RRSM_PEAK_MOTION_SERVICE,
+            EMSC_FELT_REPORT_SERVICE,
+            USGS_DYFI_SERVICE,
         ],
 
         # This order is shared by event-context selection and cross-source

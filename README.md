@@ -159,23 +159,30 @@ selected profile and inputs across restart; this change requires no queue reset.
 
 ## Observation providers and USGS event association
 
-ESM ShakeMap and RRSM Peak Motion remain enabled by default. To include USGS
-station amplitudes and DYFI felt reports, add `USGS_SHAKEMAP_SERVICE` and
-`USGS_DYFI_SERVICE` to `pyfinderconfig["general"]["services-enabled"]` in
-`pyfinder/pyfinderconfig.py`. Keep ESM and RRSM in the list if they should
-continue contributing. These are maintained application settings, not additional
-CLI or Make commands. From the deployment checkout, rebuild with
+ESM ShakeMap, RRSM Peak Motion, EMSC felt reports and USGS DYFI are enabled by
+default.
+With the shipped settings, each normal attempt includes DYFI as a global
+observation source, including events outside European service coverage. This
+does not guarantee usable reports: event association, publication and scientific
+filtering can still leave an event without observations.
+
+USGS ShakeMap station amplitudes remain opt-in. Add
+`USGS_SHAKEMAP_SERVICE` to `pyfinderconfig["general"]["services-enabled"]` in
+`pyfinder/pyfinderconfig.py` to include the station amplitudes. These are
+maintained application settings, not additional CLI or Make commands. From the
+deployment checkout, rebuild with
 `make build COMPONENT=pyfinder`. A running container still uses its installed
 image: stop it and deliberately recreate the canonical caller using the
 [deployment guide](../pyfinder-deploy/README.md), preserving mounted runtime
 and any needed container-only files. Restarting an old container does not
 install the new settings.
 
-Either product may be enabled independently. Their configuration names are
-`USGS_ShakeMap` and `USGS_DYFI`.
+Provider membership is configurable: add or remove the corresponding service
+constant in `services-enabled` to enable or disable a source. The USGS
+configuration names are `USGS_ShakeMap` and `USGS_DYFI`.
 
 The shipped `services-priority` places USGS ShakeMap and then USGS DYFI after
-ESM, RRSM, and EMSC felt reports. Thus enabling USGS preserves established
+ESM, RRSM, and EMSC felt reports. Thus the default DYFI source preserves established
 providers' preference for playback event metadata and duplicate instrumental
 stations. To change that preference, reorder `services-priority`; if supplying
 an entirely custom list, include every enabled source. Membership and priority

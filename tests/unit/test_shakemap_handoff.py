@@ -15,12 +15,43 @@ from xml.etree import ElementTree
 from pyfinder.eventcontext import EventContext, EventContextError
 from pyfinder.findermanager import FinDerManager
 from pyfinder.services.shakemap_inputs import PreparedShakeMapInputs
-from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.utils.regionlocator import RegionLocator, _region_geometry
 from tests.unit.test_shakemap_inputs import make_solution
 
 
 class ManagerShakeMapHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        resources = self.root / "extern" / "shakemap_regional_wkt"
+        resources.mkdir(parents=True)
+        # These small coverage fixtures exercise the real resource reader and
+        # geometry selector independently of the operator's routing catalog.
+        (resources / "north-test.wkt").write_text(
+            "POLYGON ((6 45, 9 45, 9 48, 6 48, 6 45))"
+        )
+        (resources / "south-test.wkt").write_text(
+            "POLYGON ((12 40, 15 40, 15 44, 12 44, 12 40))"
+        )
+        self.catalog = {
+            "Northern coverage": {
+                "wkt": "north-test.wkt",
+                "configuration": "north-model",
+            },
+            "Southern coverage": {
+                "wkt": "south-test.wkt",
+                "configuration": "south-model",
+            },
+        }
+        patcher = patch(
+            "pyfinder.utils.regionlocator.resources.files", return_value=self.root,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        _region_geometry.cache_clear()
+        self.addCleanup(_region_geometry.cache_clear)
+
     def manager(self, origin="2026-08-10T08:15:30.250000Z"):
         # Construction bypasses profile selection, provider clients and logging;
         # the handoff needs only the authoritative context and persisted delay.
@@ -30,32 +61,33 @@ class ManagerShakeMapHandoffTests(unittest.TestCase):
         )
         manager.metadata = {"current_delay": 5}
         manager.entry_kind = FinDerManager.ALERT_BACKED
-        manager.configuration = deepcopy(pyfinderconfig)
+        manager.configuration = {
+            "shakemap": {"regional-configurations": deepcopy(self.catalog)},
+        }
         manager.logger = logging.getLogger("test.shakemap.selection")
         return manager
 
     def test_service_profile_uses_solution_location_independently_of_finder_name(self):
         manager = self.manager()
         solution = make_solution()
-        for finder_name in ("switzerland-alpine", "switzerland-foreland", "other-model"):
+        for finder_name in ("first-finder-model", "second-finder-model", "other-model"):
             manager.finder_configuration_name = finder_name
-            self.assertEqual(manager.select_shakemap_configuration(solution), "switzerland")
-        # Upstream context remains Swiss while the selected output moves to Italy.
+            self.assertEqual(manager.select_shakemap_configuration(solution), "north-model")
+        # Upstream context remains northern while the selected output moves south.
         solution.event.latitude, solution.event.longitude = 42.0, 13.0
-        self.assertEqual(manager.select_shakemap_configuration(solution), "italy")
+        self.assertEqual(manager.select_shakemap_configuration(solution), "south-model")
         solution.event.latitude, solution.event.longitude = 37.0, 36.0
         self.assertEqual(manager.select_shakemap_configuration(solution), "global")
 
-    def test_packaged_wkt_selection_works_away_from_checkout_without_country_data(self):
+    def test_registered_wkt_selection_works_away_from_checkout_without_country_data(self):
         previous = Path.cwd()
-        catalog = pyfinderconfig["shakemap"]["regional-configurations"]
         with tempfile.TemporaryDirectory() as directory:
             try:
                 os.chdir(directory)
                 with patch("geopandas.read_file", side_effect=AssertionError("no country lookup")):
-                    locator = RegionLocator(catalog)
-                    self.assertEqual(locator.get_configuration(46.8, 8.2), "switzerland")
-                    self.assertEqual(locator.get_configuration(48.8, 2.3), "france")
+                    locator = RegionLocator(self.catalog)
+                    self.assertEqual(locator.get_configuration(46.8, 8.2), "north-model")
+                    self.assertEqual(locator.get_configuration(42, 13), "south-model")
                     self.assertEqual(locator.get_configuration(0, -140), "global")
             finally:
                 os.chdir(previous)
@@ -63,16 +95,16 @@ class ManagerShakeMapHandoffTests(unittest.TestCase):
     def test_parallel_solutions_select_without_mutating_shared_configuration(self):
         from concurrent.futures import ThreadPoolExecutor
 
-        swiss, italian = self.manager(), self.manager()
-        italian.configuration = swiss.configuration
-        before = deepcopy(swiss.configuration)
+        northern, southern = self.manager(), self.manager()
+        southern.configuration = northern.configuration
+        before = deepcopy(northern.configuration)
         solutions = [make_solution(), make_solution()]
         solutions[1].event.latitude, solutions[1].event.longitude = 42.0, 13.0
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(lambda pair: pair[0].select_shakemap_configuration(pair[1]),
-                                        zip((swiss, italian), solutions)))
-        self.assertEqual(results, ["switzerland", "italy"])
-        self.assertEqual(swiss.configuration, before)
+                                        zip((northern, southern), solutions)))
+        self.assertEqual(results, ["north-model", "south-model"])
+        self.assertEqual(northern.configuration, before)
 
     def test_selected_solution_identity_and_physical_time_are_preserved(self):
         manager = self.manager()

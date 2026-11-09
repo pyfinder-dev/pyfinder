@@ -31,20 +31,20 @@ def load_finderconfig_modules():
 
 
 def named_configurations():
-    """Return the four source mappings in their accepted runtime-name order."""
+    """Inspect named source definitions independently of catalog registration."""
 
-    globalconfig, switzerland, italy, profiles = load_finderconfig_modules()
+    globalconfig, switzerland, italy, _profiles = load_finderconfig_modules()
     return (
-        (profiles.GLOBAL_PROFILE.name, globalconfig.GLOBAL_CONFIG),
+        ("GLOBAL_CONFIG", globalconfig.GLOBAL_CONFIG),
         (
-            profiles.REGIONAL_PROFILES[0].name,
+            "SWITZERLAND_ALPINE_CONFIG",
             switzerland.SWITZERLAND_ALPINE_CONFIG,
         ),
         (
-            profiles.REGIONAL_PROFILES[1].name,
+            "SWITZERLAND_FORELAND_CONFIG",
             switzerland.SWITZERLAND_FORELAND_CONFIG,
         ),
-        (profiles.REGIONAL_PROFILES[2].name, italy.ITALY_CONFIG),
+        ("ITALY_CONFIG", italy.ITALY_CONFIG),
     )
 
 
@@ -135,34 +135,6 @@ class FinderConfigProfileTests(unittest.TestCase):
         self.assertEqual(tuple(module.__name__ for module in imported),
                          FINDERCONFIG_MODULES)
 
-    def test_catalog_has_exact_runtime_names_and_ordered_wkt_mappings(self):
-        profiles = importlib.import_module("pyfinder.finderconfigs.profiles")
-
-        self.assertEqual(
-            (
-                profiles.GLOBAL_PROFILE.name,
-                *(profile.name for profile in profiles.REGIONAL_PROFILES),
-            ),
-            (
-                "global",
-                "switzerland-alpine",
-                "switzerland-foreland",
-                "italy",
-            ),
-        )
-        self.assertEqual(
-            tuple(
-                (profile.wkt_filename, profile.name)
-                for profile in profiles.REGIONAL_PROFILES
-            ),
-            (
-                ("swiss_alpine.wkt", "switzerland-alpine"),
-                ("swiss_foreland.wkt", "switzerland-foreland"),
-                ("italy.wkt", "italy"),
-            ),
-        )
-        self.assertIsNone(profiles.GLOBAL_PROFILE.wkt_filename)
-
     def test_named_configurations_share_the_current_ordered_global_key_set(self):
         configurations = named_configurations()
         expected_keys = tuple(configurations[0][1])
@@ -216,6 +188,8 @@ class FinderConfigProfileTests(unittest.TestCase):
     def test_profiles_have_no_service_or_provider_definition(self):
         profiles = importlib.import_module("pyfinder.finderconfigs.profiles")
 
+        self.assertEqual(profiles.GLOBAL_PROFILE.name, "global")
+        self.assertIsNone(profiles.GLOBAL_PROFILE.wkt_filename)
         self.assertEqual(
             tuple(field.name for field in fields(profiles.FinderConfigProfile)),
             ("name", "configuration", "wkt_filename"),
@@ -237,32 +211,6 @@ class FinderConfigProfileTests(unittest.TestCase):
                 if "service" in key.lower() or "provider" in key.lower()
             }
             self.assertEqual(forbidden_configuration_keys, set())
-
-    def test_unrelated_wkt_resources_are_not_registered(self):
-        profiles = importlib.import_module("pyfinder.finderconfigs.profiles")
-        resource_root = (
-            Path(__file__).resolve().parents[2]
-            / "pyfinder"
-            / "extern"
-            / "finder_regional_wkt"
-        )
-        pool_filenames = {path.name for path in resource_root.glob("*.wkt")}
-        registered_filenames = {
-            profile.wkt_filename for profile in profiles.REGIONAL_PROFILES
-        }
-        expected_filenames = {
-            "swiss_alpine.wkt",
-            "swiss_foreland.wkt",
-            "italy.wkt",
-        }
-
-        self.assertEqual(registered_filenames, expected_filenames)
-        self.assertTrue(expected_filenames.issubset(pool_filenames))
-        self.assertTrue(
-            (pool_filenames - expected_filenames).isdisjoint(
-                registered_filenames
-            )
-        )
 
 
 if __name__ == "__main__":

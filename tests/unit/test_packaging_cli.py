@@ -16,7 +16,6 @@ from unittest import mock
 import zipfile
 
 from pyfinder import __version__, cli
-from pyfinder.finderconfigs import profiles
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -263,29 +262,6 @@ threading.Thread.start = reject_operation
                 )
                 self.assertFalse(name.endswith(forbidden_suffixes))
                 self.assertFalse(name.startswith("tests/"))
-
-    def test_unregistered_wkt_files_are_packaged_but_not_activated(self):
-        packaged_wkt_names = {
-            Path(name).name
-            for name in self.wheel_names
-            if name.startswith("pyfinder/extern/finder_regional_wkt/")
-            and name.endswith(".wkt")
-        }
-        registered_wkt_names = {
-            profile.wkt_filename for profile in profiles.REGIONAL_PROFILES
-        }
-
-        self.assertTrue(registered_wkt_names < packaged_wkt_names)
-        self.assertIn("australia.wkt", packaged_wkt_names)
-        self.assertNotIn("australia.wkt", registered_wkt_names)
-        self.assertEqual(
-            tuple(profile.name for profile in profiles.REGIONAL_PROFILES),
-            (
-                "switzerland-alpine",
-                "switzerland-foreland",
-                "italy",
-            ),
-        )
 
     def test_installed_console_help_runs_outside_the_repository(self):
         script_path = self.installed_target / "bin" / "pyfinder"

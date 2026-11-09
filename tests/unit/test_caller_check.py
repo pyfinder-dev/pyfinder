@@ -10,7 +10,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.services.shakemap_settings import check_configuration
 from pyfinder.services.shakemap_diagnostics import regional_fallback_policy
 
@@ -23,6 +22,21 @@ class CallerCheckTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.inputs = Path(self.directory.name).resolve()
+        self.configuration = {
+            "shakemap": {
+                "service-enabled": False,
+                "service-url": None,
+                "input-directory": None,
+                "request-timeout-seconds": 30.0,
+                "overwrite": True,
+                "regional-configurations": {
+                    "Diagnostic coverage": {
+                        "wkt": "coverage.wkt",
+                        "configuration": "diagnostic-model",
+                    },
+                },
+            },
+        }
         self.environment = {
             "PYFINDER_SHAKEMAP_ENABLED": "true",
             "PYFINDER_SHAKEMAP_URL": "http://service.invalid:8080",
@@ -30,7 +44,7 @@ class CallerCheckTests(unittest.TestCase):
         }
 
     def test_host_mount_mapping_preserves_requested_profile_without_runtime_writes(self):
-        configuration = deepcopy(pyfinderconfig)
+        configuration = deepcopy(self.configuration)
         before = deepcopy(configuration)
         with mock.patch("pyfinder.runtime.bootstrap_process", side_effect=AssertionError("no bootstrap")), \
              mock.patch("socket.create_connection", side_effect=AssertionError("no network")), \
@@ -42,7 +56,10 @@ class CallerCheckTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["settings"]["regional_configurations"]["switzerland"]["configuration"], "switzerland")
+        self.assertEqual(
+            result["settings"]["regional_configurations"],
+            configuration["shakemap"]["regional-configurations"],
+        )
         self.assertEqual(result["settings"]["input_directory"], str(self.inputs))
         self.assertEqual(configuration, before)
         self.assertEqual(list(self.inputs.iterdir()), [])
@@ -51,13 +68,13 @@ class CallerCheckTests(unittest.TestCase):
         self.assertEqual(result["fallback"]["global_success"], "unverified")
 
     def test_disabled_full_chain_is_explicitly_blocked(self):
-        result = check_configuration(pyfinderconfig, environment={})
+        result = check_configuration(self.configuration, environment={})
         self.assertEqual(result["status"], "blocked")
         self.assertFalse(result["settings"]["enabled"])
         self.assertIn("disabled", result["checks"][0]["reason"])
 
     def test_obsolete_settings_are_nonblocking_warning_metadata(self):
-        configured = deepcopy(pyfinderconfig)
+        configured = deepcopy(self.configuration)
         configured["shakemap"]["configuration"] = "private-obsolete-value"
         environment = self.environment | {
             "PYFINDER_SHAKEMAP_CONFIGURATION": "private-obsolete-value",
@@ -77,7 +94,7 @@ class CallerCheckTests(unittest.TestCase):
             "PYFINDER_SHAKEMAP_URL": "http://private-user:private-secret@host",
         }
         result = check_configuration(
-            pyfinderconfig, environment=environment, input_directory=self.inputs,
+            self.configuration, environment=environment, input_directory=self.inputs,
         )
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["settings"], {})
@@ -87,7 +104,7 @@ class CallerCheckTests(unittest.TestCase):
     def test_missing_input_path_is_not_created_or_reported_ready(self):
         missing = self.inputs / "not-created"
         result = check_configuration(
-            pyfinderconfig, environment=self.environment, input_directory=missing,
+            self.configuration, environment=self.environment, input_directory=missing,
         )
         self.assertEqual(result["status"], "blocked")
         self.assertIn("PYFINDER_SHAKEMAP_INPUT_DIRECTORY", result["checks"][0]["reason"])
@@ -117,7 +134,6 @@ class CallerCheckTests(unittest.TestCase):
         result = json.loads(completed.stdout)
         self.assertEqual(len(result["warnings"]), 1)
         self.assertNotIn("private-obsolete-value", completed.stdout + completed.stderr)
-        self.assertEqual(result["settings"]["regional_configurations"]["switzerland"]["configuration"], "switzerland")
         self.assertEqual(list(self.inputs.iterdir()), [])
 
 

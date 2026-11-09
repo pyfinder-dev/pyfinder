@@ -7,7 +7,6 @@ import unittest
 from unittest import mock
 
 from pyfinder import cli
-from pyfinder.pyfinderconfig import pyfinderconfig
 from pyfinder.runtime import RuntimeBootstrapError
 from pyfinder.services.shakemap_settings import continuous_shakemap_configuration
 
@@ -17,6 +16,23 @@ class ShakeMapSettingsTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = str(Path(self.temporary.name).resolve())
+        # Settings behavior must not depend on the operator's region labels,
+        # profile choices or enabled-service defaults.
+        self.configuration = {
+            "shakemap": {
+                "service-enabled": False,
+                "service-url": None,
+                "input-directory": None,
+                "request-timeout-seconds": 30.0,
+                "overwrite": True,
+                "regional-configurations": {
+                    "Test coverage": {
+                        "wkt": "test.wkt",
+                        "configuration": "test-model",
+                    },
+                },
+            },
+        }
 
     def enabled_environment(self):
         return {
@@ -26,25 +42,25 @@ class ShakeMapSettingsTests(unittest.TestCase):
         }
 
     def test_absence_preserves_disabled_defaults_and_independent_copy(self):
-        expected = deepcopy(pyfinderconfig)
-        configured = continuous_shakemap_configuration(pyfinderconfig, environment={})
+        expected = deepcopy(self.configuration)
+        configured = continuous_shakemap_configuration(self.configuration, environment={})
         self.assertEqual(configured, expected)
         self.assertFalse(configured["shakemap"]["service-enabled"])
         catalog = configured["shakemap"]["regional-configurations"]
-        catalog["switzerland"]["configuration"] = "changed"
-        self.assertEqual(pyfinderconfig, expected)
+        catalog["Test coverage"]["configuration"] = "changed"
+        self.assertEqual(self.configuration, expected)
 
     def test_enablement_reuses_global_and_overwrite_defaults_without_io(self):
         with mock.patch("sqlite3.connect") as database, mock.patch(
             "urllib.request.OpenerDirector.open"
         ) as request:
             configured = continuous_shakemap_configuration(
-                pyfinderconfig, environment=self.enabled_environment()
+                self.configuration, environment=self.enabled_environment()
             )
         self.assertTrue(configured["shakemap"]["service-enabled"])
         self.assertEqual(
-            configured["shakemap"]["regional-configurations"]["switzerland"]["configuration"],
-            "switzerland",
+            configured["shakemap"]["regional-configurations"],
+            self.configuration["shakemap"]["regional-configurations"],
         )
         self.assertTrue(configured["shakemap"]["overwrite"])
         database.assert_not_called()
@@ -57,11 +73,11 @@ class ShakeMapSettingsTests(unittest.TestCase):
             "PYFINDER_SHAKEMAP_OVERWRITE": "false",
         }
         settings = continuous_shakemap_configuration(
-            pyfinderconfig, environment=environment
+            self.configuration, environment=environment
         )["shakemap"]
         self.assertEqual(
-            settings["regional-configurations"]["switzerland"]["configuration"],
-            "switzerland",
+            settings["regional-configurations"],
+            self.configuration["shakemap"]["regional-configurations"],
         )
         self.assertEqual(settings["request-timeout-seconds"], 12.5)
         self.assertFalse(settings["overwrite"])
@@ -80,7 +96,7 @@ class ShakeMapSettingsTests(unittest.TestCase):
                 with self.subTest(variable=variable, value=value):
                     with self.assertRaises(RuntimeBootstrapError) as error:
                         continuous_shakemap_configuration(
-                            pyfinderconfig, environment={variable: value}
+                            self.configuration, environment={variable: value}
                         )
                     self.assertIn(variable, str(error.exception))
                     self.assertNotIn("private-password", str(error.exception))
@@ -90,11 +106,11 @@ class ShakeMapSettingsTests(unittest.TestCase):
             environment = self.enabled_environment()
             del environment[missing]
             with self.subTest(missing=missing), self.assertRaises(RuntimeBootstrapError) as error:
-                continuous_shakemap_configuration(pyfinderconfig, environment=environment)
+                continuous_shakemap_configuration(self.configuration, environment=environment)
             self.assertIn(missing, str(error.exception))
 
     def test_catalog_validation_allows_shared_profiles_and_rejects_incomplete_routing(self):
-        configured = deepcopy(pyfinderconfig)
+        configured = deepcopy(self.configuration)
         configured["shakemap"]["regional-configurations"] = {
             "CH + IT + Germany": {
                 "wkt": "combined.wkt",
@@ -117,7 +133,7 @@ class ShakeMapSettingsTests(unittest.TestCase):
             configured["shakemap"]["regional-configurations"] = catalog
             with self.subTest(catalog=catalog), self.assertRaises(RuntimeBootstrapError):
                 continuous_shakemap_configuration(configured, environment={})
-        configured = deepcopy(pyfinderconfig)
+        configured = deepcopy(self.configuration)
         configured["shakemap"]["configuration"] = "global"
         warnings = []
         result = continuous_shakemap_configuration(
@@ -125,12 +141,12 @@ class ShakeMapSettingsTests(unittest.TestCase):
             environment={},
             warning_handler=warnings.append,
         )
-        self.assertEqual(result, pyfinderconfig)
+        self.assertEqual(result, self.configuration)
         self.assertEqual(len(warnings), 1)
         self.assertIn("shakemap.configuration", warnings[0])
 
     def test_obsolete_settings_warn_and_are_ignored_without_hiding_active_errors(self):
-        configured = deepcopy(pyfinderconfig)
+        configured = deepcopy(self.configuration)
         for key in (
             "configuration",
             "use-region-specific-shakemap-config",
@@ -151,7 +167,7 @@ class ShakeMapSettingsTests(unittest.TestCase):
         self.assertTrue(result["shakemap"]["service-enabled"])
         self.assertEqual(
             result["shakemap"]["regional-configurations"],
-            pyfinderconfig["shakemap"]["regional-configurations"],
+            self.configuration["shakemap"]["regional-configurations"],
         )
         self.assertEqual(len(warnings), 5)
         self.assertNotIn("private-obsolete-value", " ".join(warnings))
@@ -173,7 +189,7 @@ class ShakeMapSettingsTests(unittest.TestCase):
         environment = self.enabled_environment()
         environment["PYFINDER_SHAKEMAP_INPUT_DIRECTORY"] = str(alias)
         with self.assertRaises(RuntimeBootstrapError):
-            continuous_shakemap_configuration(pyfinderconfig, environment=environment)
+            continuous_shakemap_configuration(self.configuration, environment=environment)
 
     def test_dispatch_leaves_settings_validation_to_workflow_composition(self):
         for command in (["playback", "--list"], ["playback", "--event-ids", "test"]):

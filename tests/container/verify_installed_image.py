@@ -290,8 +290,8 @@ def main():
         profile.wkt_filename for profile in profiles.REGIONAL_PROFILES
     )
     require(
-        registered_wkt_files and all(registered_wkt_files),
-        "installed profile catalog has no usable WKT registrations",
+        all(registered_wkt_files),
+        "a registered regional profile has no WKT resource name",
     )
     wkt_files = {
         path.name
@@ -301,11 +301,6 @@ def main():
     require(
         set(registered_wkt_files).issubset(wkt_files),
         "a registered WKT resource is absent or empty",
-    )
-    unregistered_wkt_files = wkt_files - set(registered_wkt_files)
-    require(
-        unregistered_wkt_files,
-        "the packaged WKT pool has no resource outside the profile catalog",
     )
     country_stem = "ne_110m_admin_0_countries"
     required_country_files = tuple(
